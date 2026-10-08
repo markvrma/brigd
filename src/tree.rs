@@ -126,7 +126,8 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
     if out.exists() {
         children.push(Node { kind: Kind::Output, label: "output.md".into(), path: out, children: vec![], stage: None, worktree: None });
     }
-    let mut subs: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    // dot dirs (.diff, the frozen diffs) are brigd's own, not subagents
+    let mut subs: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))).collect();
     subs.sort();
     for s in subs {
         children.push(dir_node(Kind::Subagent, &s.file_name().unwrap_or_default().to_string_lossy(), &s));
@@ -151,6 +152,9 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 
 /// What a Diff node shows: (path relative to the agent's cwd, `git diff` of it vs the agent's base).
 pub fn diff_view(key: &Path) -> Option<(String, String)> {
+    if let Some((_, rel, text)) = frozen(key) {
+        return Some((rel, text));
+    }
     let (cwd, base, rel, _) = VIEWS.lock().unwrap().get(key).cloned()?;
     let text = git(&cwd, &["diff", "--no-color", &base, "--", &rel]).unwrap_or_default();
     Some((rel, text))
@@ -158,7 +162,16 @@ pub fn diff_view(key: &Path) -> Option<(String, String)> {
 
 /// A Diff node's (added, removed) line counts vs the agent's base.
 pub fn diff_stat(key: &Path) -> Option<(String, String)> {
-    VIEWS.lock().unwrap().get(key).map(|v| v.3.clone())
+    frozen(key).map(|f| f.0).or_else(|| VIEWS.lock().unwrap().get(key).map(|v| v.3.clone()))
+}
+
+/// A finished agent's diff of one file, saved at the Diff node's path so that later changes
+/// to the file (by other agents) never alter it: "<added>\t<removed>\t<rel path>\n<patch>".
+fn frozen(key: &Path) -> Option<((String, String), String, String)> {
+    let s = fs::read_to_string(key).ok()?;
+    let (head, text) = s.split_once('\n')?;
+    let mut h = head.splitn(3, '\t');
+    Some(((h.next()?.into(), h.next()?.into()), h.next()?.into(), text.into()))
 }
 
 /// `git diff --numstat -z --no-renames` → path → (added, removed).
@@ -214,7 +227,7 @@ fn transcript_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
 /// and outside its brigd dir, that `git diff` vs its base still shows (so new untracked
 /// files don't). Git is asked at most every 3s per agent.
 fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
-    let files = transcript_files(home, cwd, dir);
+    let files = agent_files(home, cwd, dir);
     if files.is_empty() {
         return vec![];
     }
@@ -225,24 +238,51 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
         let listed = b.as_ref().and_then(|b| git(cwd, &["diff", "--numstat", "--no-renames", "--relative", "-z", b]));
         *entry = (Instant::now(), b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))));
     }
-    let Some((base, listed)) = entry.1.clone() else { return vec![] };
+    // no base/listing (git failed): only the already frozen diffs can show
+    let (base, listed) = entry.1.clone().unwrap_or_default();
     drop(names);
+    // Once the agent is done (output.md written) its diffs are saved and never recomputed.
+    let done = dir.join("output.md").exists();
     let mut views = VIEWS.lock().unwrap();
     files
         .into_iter()
         .filter(|f| !f.starts_with(dir)) // its own output.md already shows
         .filter_map(|file| {
+            let path = dir.join(".diff").join(file.strip_prefix("/").unwrap_or(&file));
+            let label = file.file_name()?.to_string_lossy().into_owned();
+            if path.is_file() {
+                return Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None });
+            }
             let stat = listed.get(&file)?.clone();
             let rel = file.strip_prefix(cwd).ok()?.to_string_lossy().into_owned();
-            let path = dir.join(".diff").join(file.strip_prefix("/").unwrap_or(&file));
+            if done {
+                let text = git(cwd, &["diff", "--no-color", &base, "--", &rel]);
+                let save = |t: String| fs::create_dir_all(path.parent()?).ok().and_then(|_| fs::write(&path, format!("{}\t{}\t{rel}\n{t}", stat.0, stat.1)).ok());
+                if text.and_then(save).is_some() {
+                    return Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None });
+                }
+            }
             views.insert(path.clone(), (cwd.into(), base.clone(), rel, stat));
-            let label = file.file_name()?.to_string_lossy().into_owned();
             Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None })
         })
         .collect()
 }
 
-/// Which of the agent's transcript files `revert` may touch, as paths relative to `cwd`:
+/// The paths under `## Files changed` (`- /abs/path` lines) in the agent's own output.md.
+fn reported_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(dir.join("output.md")) else { return vec![] };
+    let mut lines = text.lines().skip_while(|l| l.trim() != "## Files changed").skip(1).take_while(|l| !l.starts_with('#'));
+    lines.by_ref().filter_map(|l| l.trim().strip_prefix("- ")).map(|p| p.trim().trim_matches('`')).filter(|p| p.starts_with('/')).map(PathBuf::from).collect()
+}
+
+/// What the agent changed: its transcripts' files plus the ones it listed in its output.md.
+fn agent_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
+    let mut files = transcript_files(home, cwd, dir);
+    add(&mut files, reported_files(dir));
+    files
+}
+
+/// Which of the agent's changed files `revert` may touch, as paths relative to `cwd`:
 /// only inside the cwd (no `..`) and never its own brigd dir (output.md stays).
 fn revert_set(files: &[PathBuf], cwd: &Path, dir: &Path) -> Vec<String> {
     files
@@ -261,7 +301,7 @@ fn revert_set(files: &[PathBuf], cwd: &Path, dir: &Path) -> Vec<String> {
 pub fn revert(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Res<usize> {
     let base = base(cwd, repo, dir).ok_or("no base commit for this agent")?;
     let mut n = 0;
-    for rel in revert_set(&transcript_files(home, cwd, dir), cwd, dir) {
+    for rel in revert_set(&agent_files(home, cwd, dir), cwd, dir) {
         let in_base = git(cwd, &["cat-file", "-e", &format!("{base}:./{rel}")]).is_some();
         let abs = cwd.join(&rel);
         if in_base {
@@ -416,6 +456,21 @@ mod tests {
         assert_eq!(rel, "src/a.rs");
         assert!(text.contains("+two\n") && text.contains("+three\n"), "{text}");
         assert_eq!(diff_stat(&n[0].path), Some(("2".into(), "0".into())));
+        // output.md lists a file the transcript never named (a Bash edit); the agent is done: diffs freeze
+        fs::write(cwd.join("b.rs"), "b\n").unwrap();
+        g(&["add", "b.rs"]);
+        fs::write(dir.join("output.md"), format!("done\n## Files changed\n- {}\n- `{}`\n- rel/ignored\n\n## Other\n- /not/listed\n", a.display(), cwd.join("b.rs").display())).unwrap();
+        NAMES.lock().unwrap().clear();
+        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        assert_eq!(n.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["a.rs", "b.rs"]);
+        let before = diff_view(&n[0].path).unwrap();
+        // a later agent changes the file again, and the 3s git cache is stale: still the same diff
+        fs::write(&a, "one\nLATER\n").unwrap();
+        NAMES.lock().unwrap().clear();
+        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        assert_eq!((n.len(), diff_view(&n[0].path).unwrap(), diff_stat(&n[0].path)), (2, before.clone(), Some(("2".into(), "0".into()))));
+        assert!(!before.1.contains("LATER"));
+        assert!(dir_node(Kind::Agent, "a", &dir).children.iter().all(|c| c.kind != Kind::Subagent)); // .diff is not a subagent
         let _ = fs::remove_dir_all(&d);
     }
 

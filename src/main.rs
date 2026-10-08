@@ -731,7 +731,9 @@ fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
         thread_dir(thread).join("flowmap.json").display()
     );
     p += &format!(
-        "\n## Output\nWrite your final result to {}. brigd waits for that file; the stage cannot finish without it.\n",
+        "\n## Output\nWrite your final result to {}. brigd waits for that file; the stage cannot finish without it. \
+         End it with a `## Files changed` section: one `- /absolute/path` line per file you created, edited or deleted, by any means \
+         (Edit/Write, or a script or shell command). brigd shows exactly those as this agent's diffs.\n",
         output_path(thread, &a.name).display()
     );
     p
