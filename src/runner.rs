@@ -36,7 +36,7 @@ pub struct LiveAgent {
     /// ~/.brigd/threads/<thread>/<agent>
     pub dir: PathBuf,
     pub parser: Arc<Mutex<vt100::Parser>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
 }
@@ -49,7 +49,8 @@ impl LiveAgent {
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // so the reader sees EOF when the child exits
         let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let w = writer.clone();
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, SCROLLBACK)));
         let p = parser.clone();
         thread::spawn(move || {
@@ -58,7 +59,15 @@ impl LiveAgent {
                 if n == 0 {
                     break;
                 }
-                p.lock().unwrap().process(&buf[..n]);
+                let mut p = p.lock().unwrap();
+                p.process(&buf[..n]);
+                // A child that asks where the cursor is (ESC[6n; ratatui does, at startup, so a brigd
+                // run inside a brigd tab) gets an answer, or it waits seconds and fails.
+                // ponytail: a query split across two reads is missed.
+                if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
+                    let (r, c) = p.screen().cursor_position();
+                    let _ = w.lock().unwrap().write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
+                }
             }
         });
         Ok(LiveAgent {
@@ -67,7 +76,7 @@ impl LiveAgent {
             cwd: cwd.into(),
             dir: dir.into(),
             parser,
-            writer: Mutex::new(writer),
+            writer,
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
         })
@@ -235,6 +244,21 @@ mod tests {
         let a = LiveAgent::spawn(cmd, "t", "a", &tmp, &tmp).unwrap();
         for _ in 0..50 {
             if a.parser.lock().unwrap().screen().contents().contains("hi") {
+                return;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("screen: {:?}", a.parser.lock().unwrap().screen().contents());
+    }
+
+    #[test]
+    fn cursor_query_is_answered() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", r"stty raw -echo; printf '\033[6n'; dd bs=1 count=6 2>/dev/null | od -c | head -1"]);
+        let tmp = std::env::temp_dir();
+        let a = LiveAgent::spawn(cmd, "t", "a", &tmp, &tmp).unwrap();
+        for _ in 0..50 {
+            if a.parser.lock().unwrap().screen().contents().contains("033   [   1   ;   1   R") {
                 return;
             }
             thread::sleep(std::time::Duration::from_millis(100));
