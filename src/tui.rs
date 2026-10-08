@@ -10,6 +10,7 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self as ct, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,6 +19,7 @@ use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, fs};
@@ -99,6 +101,13 @@ struct App {
     tab_bar: Rect,
     tab_spans: Vec<(u16, u16)>,
     body: Rect,
+    hint: Rect,
+    /// Left-drag text selection: (rect it started in, anchor, cursor once dragged).
+    drag: Option<(Rect, Position, Option<Position>)>,
+    /// The last frame while dragging, to read the selected text from.
+    buf: Buffer,
+    /// Selected text waiting for the main loop to put on the clipboard.
+    clip: Option<String>,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until Mark quits.
@@ -122,6 +131,9 @@ pub fn run(open: Option<&str>) -> Res<()> {
                     Event::Mouse(m) => app.on_mouse(m),
                     Event::Paste(s) => app.on_paste(&s),
                     _ => {} // Resize: the next draw sees the new body size and resizes every PTY
+                }
+                if let Some(s) = app.clip.take() {
+                    copy_to_clipboard(&s);
                 }
             }
             if last.elapsed() >= REFRESH {
@@ -152,6 +164,45 @@ fn setup() -> io::Result<()> {
 fn teardown() {
     let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen, crossterm::cursor::Show);
     let _ = ct::disable_raw_mode();
+}
+
+/// OSC 52 for terminals that take it, pbcopy (in the background) for those that don't.
+fn copy_to_clipboard(s: &str) {
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64(s.as_bytes())).and_then(|_| out.flush());
+    if cfg!(target_os = "macos") {
+        let s = s.to_string();
+        std::thread::spawn(move || {
+            let _ = Command::new("pbcopy").stdin(Stdio::piped()).spawn().and_then(|mut c| {
+                c.stdin.take().unwrap().write_all(s.as_bytes())?;
+                c.wait()
+            });
+        });
+    }
+}
+
+fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    b.chunks(3)
+        .flat_map(|c| {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, &x)| n | ((x as u32) << (16 - 8 * i)));
+            (0..4).map(move |i| if i <= c.len() { T[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' })
+        })
+        .collect()
+}
+
+/// The cells from `a` to `b` in reading order, like a terminal selection, clamped to `r`.
+fn sel_rows(r: Rect, a: Position, b: Position) -> Vec<(u16, std::ops::RangeInclusive<u16>)> {
+    let clamp = |p: Position| Position { x: p.x.clamp(r.x, r.right() - 1), y: p.y.clamp(r.y, r.bottom() - 1) };
+    let (a, b) = (clamp(a), clamp(b));
+    let (a, b) = if (a.y, a.x) <= (b.y, b.x) { (a, b) } else { (b, a) };
+    (a.y..=b.y).map(|y| (y, if y == a.y { a.x } else { r.x }..=if y == b.y { b.x } else { r.right() - 1 })).collect()
+}
+
+// ponytail: wide chars read as their cell symbols; a CJK glyph may gain a trailing space.
+fn sel_text(buf: &Buffer, r: Rect, a: Position, b: Position) -> String {
+    let line = |(y, xs): (u16, std::ops::RangeInclusive<u16>)| xs.filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect::<String>().trim_end().to_string();
+    sel_rows(r, a, b).into_iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
 fn live_agents() -> Vec<Arc<LiveAgent>> {
@@ -667,6 +718,8 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // The sidebar is not among these, so a drag starting there selects nothing.
+                self.drag = [self.tab_bar, self.body, self.hint].into_iter().find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
                 } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
@@ -680,6 +733,20 @@ impl App {
                     }
                 } else if self.body.contains(at) && self.cur().is_some() {
                     self.focus_main = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(d) = &mut self.drag {
+                    d.2 = Some(at);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((r, a, Some(b))) = self.drag.take() {
+                    let t = sel_text(&self.buf, r, a, b);
+                    if !t.trim().is_empty() {
+                        self.flash(format!("copied {} chars", t.chars().count()));
+                        self.clip = Some(t);
+                    }
                 }
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -768,7 +835,7 @@ impl App {
         if body != self.body {
             resize_all(body);
         }
-        (self.screen, self.side, self.side_inner, self.tab_bar, self.body) = (f.area(), side, inner, bar, body);
+        (self.screen, self.side, self.side_inner, self.tab_bar, self.body, self.hint) = (f.area(), side, inner, bar, body, hint);
         f.render_widget(block, side);
 
         let h = inner.height as usize;
@@ -859,6 +926,15 @@ impl App {
             let r = m.rect.intersection(f.area());
             f.render_widget(Clear, r);
             f.render_widget(Paragraph::new(MENU_ITEM).style(Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)), r);
+        }
+
+        if let Some((r, a, Some(b))) = self.drag {
+            self.buf = f.buffer_mut().clone();
+            for (x, y) in sel_rows(r, a, b).into_iter().flat_map(|(y, xs)| xs.map(move |x| (x, y))) {
+                if let Some(c) = f.buffer_mut().cell_mut((x, y)) {
+                    c.modifier.toggle(Modifier::REVERSED);
+                }
+            }
         }
     }
 }
@@ -1139,5 +1215,38 @@ mod tests {
         app.on_mouse(click(30, 2));
         assert!(app.paused.is_empty());
         assert!(!has_live_stray(&node(Kind::Thread, "t", vec![]), "t"));
+    }
+
+    #[test]
+    fn drag_copies_selection() {
+        let mut app = App::default();
+        app.buf = Buffer::with_lines(["side|hello world  ", "side|second line  ", "side|third        "]);
+        (app.side, app.body) = (Rect::new(0, 0, 5, 3), Rect::new(5, 0, 13, 3));
+        let ev = |kind, x, y| MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
+        let (down, drag, up) = (MouseEventKind::Down(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::Up(MouseButton::Left));
+        app.on_mouse(ev(down, 11, 0));
+        app.on_mouse(ev(drag, 10, 1));
+        app.on_mouse(ev(up, 10, 1));
+        assert_eq!(app.clip.take().as_deref(), Some("world\nsecond"));
+        app.on_mouse(ev(down, 6, 2)); // backwards past the body's left edge: clamped
+        app.on_mouse(ev(drag, 0, 2));
+        app.on_mouse(ev(up, 0, 2));
+        assert_eq!(app.clip.take().as_deref(), Some("th"));
+        app.on_mouse(ev(down, 7, 1)); // a plain click copies nothing
+        app.on_mouse(ev(up, 7, 1));
+        assert!(app.clip.is_none());
+        assert_eq!((base64(b"Man"), base64(b"Ma"), base64(b"M")), ("TWFu".into(), "TWE=".into(), "TQ==".into()));
+    }
+
+    #[test]
+    fn sidebar_drag_selects_nothing() {
+        let mut app = App::default();
+        app.buf = Buffer::with_lines(["side|hello world  ", "side|second line  "]);
+        (app.side, app.body) = (Rect::new(0, 0, 5, 2), Rect::new(5, 0, 13, 2));
+        let ev = |kind, x, y| MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
+        app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 10, 1));
+        app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 10, 1));
+        assert!(app.drag.is_none() && app.clip.is_none());
     }
 }
