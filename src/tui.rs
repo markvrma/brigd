@@ -101,7 +101,12 @@ struct App {
     side: Rect,
     side_inner: Rect,
     tab_bar: Rect,
+    /// Columns of the tabs shown in the last draw, starting at tab `tab_first`.
     tab_spans: Vec<(u16, u16)>,
+    /// First tab shown in the bar (wheel-scrolled; follows the active tab when it changes).
+    tab_first: usize,
+    /// (space, active tab, tab count) at the last draw: a change makes the bar follow the active tab.
+    tab_seen: (PathBuf, usize, usize),
     body: Rect,
     hint: Rect,
     /// Left-drag text selection: (rect it started in, anchor, cursor once dragged).
@@ -210,6 +215,35 @@ fn sel_text(buf: &Buffer, r: Rect, a: Position, b: Position) -> String {
 fn live_agents() -> Vec<Arc<LiveAgent>> {
     let all: Vec<Arc<LiveAgent>> = runner::registry().lock().unwrap().values().cloned().collect();
     all.into_iter().filter(|a| a.alive()).collect()
+}
+
+/// The tabs `first..end` shown in `avail` columns, a ‹ / › marker costing one column each when tabs
+/// are hidden on that side. With `follow`, `first` moves just far enough that that tab is fully shown.
+fn tab_window(widths: &[u16], first: usize, follow: Option<usize>, avail: u16) -> (usize, usize) {
+    let n = widths.len();
+    let end_from = |first: usize| {
+        let room = avail.saturating_sub((first > 0) as u16);
+        let mut used = 0;
+        let mut end = first;
+        while end < n && used + widths[end] <= room {
+            used += widths[end];
+            end += 1;
+        }
+        // Not everything fits: the › marker takes a column, so drop what no longer fits.
+        while end < n && end > first && used + 1 > room {
+            end -= 1;
+            used -= widths[end];
+        }
+        end
+    };
+    let mut first = first.min(n.saturating_sub(1));
+    if let Some(a) = follow.filter(|&a| a < n) {
+        first = first.min(a);
+        while first < a && end_from(first) <= a {
+            first += 1;
+        }
+    }
+    (first, end_from(first))
 }
 
 fn resize_all(body: Rect) {
@@ -779,7 +813,7 @@ impl App {
                     self.focus_main = false; // a click shows the item but keeps j/k on the sidebar
                 } else if self.tab_bar.contains(at) {
                     if let Some(i) = self.tab_spans.iter().position(|&(a, b)| (a..b).contains(&m.column)) {
-                        self.tabs.entry(self.space.clone()).or_default().active = i;
+                        self.tabs.entry(self.space.clone()).or_default().active = self.tab_first + i;
                         self.focus_main = true;
                     }
                 } else if self.body.contains(at) && self.cur().is_some() {
@@ -800,9 +834,13 @@ impl App {
                     }
                 }
             }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                let d: i32 = if m.kind == MouseEventKind::ScrollUp { -3 } else { 3 };
-                if self.side.contains(at) {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                let back = matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft);
+                let d: i32 = if back { -3 } else { 3 };
+                if self.tab_bar.contains(at) {
+                    let last = self.tabs.get(&self.space).map_or(0, |t| t.list.len().saturating_sub(1));
+                    self.tab_first = if back { self.tab_first.saturating_sub(1) } else { (self.tab_first + 1).min(last) };
+                } else if self.side.contains(at) {
                     let max = max_offset(&self.rows, self.side_inner.height as usize) as i32;
                     self.offset = (self.offset as i32 + d).clamp(0, max.max(0)) as usize;
                 } else if self.body.contains(at) {
@@ -924,22 +962,39 @@ impl App {
         // Tab bar: space name, then one tab per opened agent/viewer in this space.
         let space = self.space.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let mut spans = vec![Span::styled(format!(" {space} "), Style::new().fg(pal::CRUST).bg(pal::MAUVE))];
-        let mut x = bar.x + space.chars().count() as u16 + 2;
-        self.tab_spans.clear();
+        let pill = space.chars().count() as u16 + 2;
         let tabs = self.tabs.get(&self.space);
-        for (i, t) in tabs.map(|t| t.list.as_slice()).unwrap_or_default().iter().enumerate() {
-            let (title, fg) = match t {
+        let active = tabs.map_or(0, |t| t.active);
+        let mut titles = vec![];
+        for t in tabs.map(|t| t.list.as_slice()).unwrap_or_default() {
+            titles.push(match t {
                 Tab::Term { agent, live, stage, .. } if !live.alive() => (format!(" {} (exited) ", tail(agent)), Some(stage_color(*stage))),
                 Tab::Term { agent, stage, .. } => (format!(" {} ", tail(agent)), Some(stage_color(*stage))),
                 Tab::View { title, .. } => (format!(" {title} "), None),
-            };
-            let w = title.chars().count() as u16;
-            self.tab_spans.push((x + 1, x + 1 + w));
-            x += 1 + w;
-            let active = tabs.is_some_and(|t| t.active == i);
+            });
+        }
+        let widths: Vec<u16> = titles.iter().map(|(t, _)| 1 + t.chars().count() as u16).collect(); // "│" + title
+        let seen = (self.space.clone(), active, titles.len());
+        let follow = self.tab_seen != seen;
+        self.tab_seen = seen;
+        let (first, end) = tab_window(&widths, self.tab_first, follow.then_some(active), bar.width.saturating_sub(pill));
+        self.tab_first = first;
+        self.tab_spans.clear();
+        let marker = |c| Span::styled(c, Style::new().fg(pal::OVERLAY0));
+        if first > 0 {
+            spans.push(marker("‹"));
+        }
+        let mut x = bar.x + pill + (first > 0) as u16;
+        for i in first..end {
+            let (title, fg) = &titles[i];
+            self.tab_spans.push((x + 1, x + widths[i]));
+            x += widths[i];
             spans.push(Span::raw("│"));
             let style = fg.map_or(Style::new(), |c| Style::new().fg(c));
-            spans.push(Span::styled(title, if active { style.add_modifier(Modifier::REVERSED | Modifier::BOLD) } else { style }));
+            spans.push(Span::styled(title.clone(), if tabs.is_some_and(|t| t.active == i) { style.add_modifier(Modifier::REVERSED | Modifier::BOLD) } else { style }));
+        }
+        if end < titles.len() {
+            spans.push(marker("›"));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), bar);
 
@@ -1228,6 +1283,32 @@ mod tests {
         assert_eq!((app.tabs[&PathBuf::new()].active, app.focus_main), (1, true));
         app.on_key(key(KeyCode::Char('˙'), KeyModifiers::NONE));
         assert_eq!(app.tabs[&PathBuf::new()].active, 0);
+    }
+
+    #[test]
+    fn tab_bar_follows_active_tab() {
+        let view = |n: usize| Tab::View { path: PathBuf::new(), title: format!("tab-number-{n}"), text: String::new(), scroll: 0, rel: None };
+        let mut app = App::default();
+        app.tabs.insert(PathBuf::new(), Tabs { list: (0..10).map(view).collect(), active: 0 });
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.tab_first, 0);
+        for _ in 0..9 {
+            app.on_key(key(KeyCode::Char('l'), KeyModifiers::ALT));
+        }
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.tab_first > 0);
+        let (a, b) = *app.tab_spans.last().unwrap();
+        assert_eq!(app.tab_first + app.tab_spans.len(), 10); // the last tab is shown, fully
+        assert!(b <= app.tab_bar.right() && b - a == "tab-number-9".len() as u16 + 2);
+        // Wheel over the bar scrolls it without moving the active tab; a click maps through the offset.
+        let wheel = |kind| MouseEvent { kind, column: 50, row: 0, modifiers: KeyModifiers::NONE };
+        app.on_mouse(wheel(MouseEventKind::ScrollUp));
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.tabs[&PathBuf::new()].active, 9);
+        let (a, _) = app.tab_spans[0];
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: a, row: 0, modifiers: KeyModifiers::NONE });
+        assert_eq!(app.tabs[&PathBuf::new()].active, app.tab_first);
     }
 
     #[test]
