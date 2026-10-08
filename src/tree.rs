@@ -2,11 +2,12 @@
 //! [output.md, subagent dirs → output.md …, changed files]. Also mirrors claude's
 //! subagent transcripts into <agent>/<subagent>/output.md.
 
+use crate::runner::Res;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -163,11 +164,9 @@ fn base(cwd: &Path, repo: &Path, dir: &Path) -> Option<String> {
     Some(git(cwd, &["merge-base", "HEAD", head.trim()])?.trim().to_string())
 }
 
-/// One Diff node per file the agent's session (and its subagents) changed, inside its cwd
-/// and outside its brigd dir, that `git diff` vs its base still shows (so new untracked
-/// files don't). Transcripts are parsed incrementally: only bytes appended since the last
-/// refresh; git is asked at most every 3s per agent.
-fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
+/// The files the agent's session (and its subagents) changed, per their transcripts, in
+/// first-change order. Parsed incrementally: only bytes appended since the last call.
+fn transcript_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
     let Ok(session) = fs::read_to_string(dir.join("session")) else { return vec![] };
     let session = session.trim();
     let mut logs: Vec<PathBuf> = fs::read_dir(subagents_dir(home, cwd, session)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "jsonl")).collect();
@@ -190,7 +189,14 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
         }
         add(&mut files, seen.clone());
     }
-    drop(parsed);
+    files
+}
+
+/// One Diff node per file the agent's session (and its subagents) changed, inside its cwd
+/// and outside its brigd dir, that `git diff` vs its base still shows (so new untracked
+/// files don't). Git is asked at most every 3s per agent.
+fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
+    let files = transcript_files(home, cwd, dir);
     if files.is_empty() {
         return vec![];
     }
@@ -215,6 +221,42 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
             Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None })
         })
         .collect()
+}
+
+/// Which of the agent's transcript files `revert` may touch, as paths relative to `cwd`:
+/// only inside the cwd (no `..`) and never its own brigd dir (output.md stays).
+fn revert_set(files: &[PathBuf], cwd: &Path, dir: &Path) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| !f.starts_with(dir))
+        .filter_map(|f| f.strip_prefix(cwd).ok())
+        .filter(|r| !r.as_os_str().is_empty() && r.components().all(|c| matches!(c, Component::Normal(_))))
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Puts back what the agent changed: each file its transcripts name (and only those, so
+/// other agents' files in a shared worktree are safe) goes back to its content at the
+/// agent's base commit, or is deleted if the base had no such file. Never touches the
+/// agent's own dir. Returns how many files differed and were reverted.
+pub fn revert(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Res<usize> {
+    let base = base(cwd, repo, dir).ok_or("no base commit for this agent")?;
+    let mut n = 0;
+    for rel in revert_set(&transcript_files(home, cwd, dir), cwd, dir) {
+        let in_base = git(cwd, &["cat-file", "-e", &format!("{base}:./{rel}")]).is_some();
+        let abs = cwd.join(&rel);
+        if in_base {
+            if git(cwd, &["diff", "--name-only", &base, "--", &rel]).is_some_and(|d| !d.trim().is_empty()) {
+                git(cwd, &["checkout", &base, "--", &rel]).ok_or_else(|| format!("git checkout {rel} failed"))?;
+                n += 1;
+            }
+        } else if abs.is_file() {
+            git(cwd, &["rm", "-q", "--cached", "--ignore-unmatch", "--", &rel]);
+            fs::remove_file(&abs).map_err(|e| format!("{rel}: {e}"))?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Appends the files in `new` not yet in `out`.
@@ -354,6 +396,48 @@ mod tests {
         let (rel, text) = diff_view(&n[0].path).unwrap();
         assert_eq!(rel, "src/a.rs");
         assert!(text.contains("+two\n") && text.contains("+three\n"), "{text}");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn revert_touches_only_agent_files() {
+        let d = tmp("revert");
+        let (home, cwd, dir) = (d.join("home"), d.join("repo"), d.join("agent"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let g = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&cwd).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap().status.success());
+        g(&["init", "-q"]);
+        for f in ["a.rs", "other.rs"] {
+            fs::write(cwd.join(f), "base\n").unwrap();
+        }
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+        fs::write(dir.join("base"), git(&cwd, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        fs::write(cwd.join("a.rs"), "agent\n").unwrap(); // committed by the agent, then edited again
+        g(&["commit", "-qam", "agent"]);
+        fs::write(cwd.join("a.rs"), "agent\nmore\n").unwrap();
+        fs::write(cwd.join("staged.rs"), "x\n").unwrap(); // new, git added
+        g(&["add", "staged.rs"]);
+        fs::write(cwd.join("new.rs"), "x\n").unwrap(); // new, untracked
+        fs::write(cwd.join("other.rs"), "someone else\n").unwrap(); // another agent's: not in the transcript
+        fs::write(dir.join("output.md"), "result").unwrap();
+        fs::write(dir.join("session"), "s1\n").unwrap();
+        let log = home.join(".claude/projects").join(slug(&cwd)).join("s1.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let edit = |f: &Path| serde_json::json!({"toolUseResult": {"filePath": f}}).to_string() + "\n";
+        let outside = d.join("elsewhere.rs");
+        fs::write(&outside, "keep\n").unwrap();
+        let files: Vec<PathBuf> = ["a.rs", "staged.rs", "new.rs"].iter().map(|f| cwd.join(f)).chain([dir.join("output.md"), outside.clone(), cwd.join("../escape")]).collect();
+        fs::write(&log, files.iter().map(|f| edit(f)).collect::<String>()).unwrap();
+        assert_eq!(revert_set(&files, &cwd, &dir), ["a.rs", "staged.rs", "new.rs"]); // no output.md, outside or `..`
+        assert_eq!(revert(&home, &cwd, &cwd, &dir).unwrap(), 3);
+        assert_eq!(fs::read_to_string(cwd.join("a.rs")).unwrap(), "base\n");
+        assert!(!cwd.join("staged.rs").exists() && !cwd.join("new.rs").exists());
+        assert_eq!(fs::read_to_string(cwd.join("other.rs")).unwrap(), "someone else\n");
+        assert_eq!(fs::read_to_string(dir.join("output.md")).unwrap(), "result");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
+        assert!(git(&cwd, &["ls-files"]).unwrap().lines().all(|l| l != "staged.rs"));
+        assert_eq!(revert(&home, &cwd, &cwd, &dir).unwrap(), 0); // nothing left to revert
         let _ = fs::remove_dir_all(&d);
     }
 

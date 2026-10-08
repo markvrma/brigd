@@ -164,6 +164,50 @@ fn set_agent(state: &Mutex<State>, agent: &str, status: &str) -> Res<()> {
     update(state, |s| s.agents.entry(agent.into()).or_default().status = status.into())
 }
 
+/// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
+/// files it changed to its base commit (tree::revert), keeps its dir and output.md, and
+/// marks it failed (state.json for a flow agent, the dir's `terminated` file for both).
+/// Returns how many files were reverted.
+fn terminate(thread: &str, agent: &str) -> Res<usize> {
+    let dir = thread_dir(thread).join(agent);
+    let (cwd, repo, state) = if Path::new(agent).starts_with(tree::STRAY) {
+        let cwd = PathBuf::from(fs::read_to_string(dir.join("cwd")).map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?.trim());
+        (cwd.clone(), cwd, None)
+    } else {
+        let (flow, state) = load(thread)?;
+        let a = flow.stages.iter().flatten().find(|a| a.name == agent).ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
+        let repo = PathBuf::from(&state.repo);
+        (tree::space_cwd(&root(), &repo, thread, a.worktree.as_deref().unwrap_or("")), repo, Some(state))
+    };
+    // First, so a supervise thread that sees the process die does not report it done.
+    fs::write(dir.join(runner::TERMINATED), "")?;
+    let pid = fs::read_to_string(dir.join("pid")).ok(); // a stray running in a terminal tab
+    if let Some(l) = runner::live(thread, agent) {
+        l.kill();
+    }
+    if let Some(pid) = &pid {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+    // Wait for the process to be gone so it cannot rewrite a file after the revert.
+    for i in 0..40 {
+        if !runner::live(thread, agent).is_some_and(|l| l.alive()) && !pid.as_ref().is_some_and(|p| runner::pid_alive(p)) {
+            break;
+        }
+        if i == 20 {
+            if let Some(pid) = &pid {
+                let _ = Command::new("kill").args(["-9", pid.trim()]).status(); // ignored SIGTERM
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = fs::remove_file(dir.join("pid"));
+    let n = tree::revert(&PathBuf::from(env::var("HOME").unwrap_or_default()), &cwd, &repo, &dir)?;
+    if let Some(state) = state {
+        set_agent(&Mutex::new(state), agent, "failed")?;
+    }
+    Ok(n)
+}
+
 /// Appends to ~/.brigd/threads/<thread>/FLOWPLAN, the plan followed by the live run log.
 /// execute never prints: the TUI owns the screen and shows this file.
 fn log(thread: &str, msg: &str) {
@@ -519,6 +563,10 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             sync();
         }
         let (alive, status) = (live.alive(), live.status());
+        if live.dir.join(runner::TERMINATED).exists() {
+            log(thread, &format!("{} terminated", a.name));
+            break false;
+        }
         if out.exists() && (!alive || status == "idle") {
             log(thread, &format!("{} done", a.name));
             break true;

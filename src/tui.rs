@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
@@ -49,6 +49,15 @@ enum Tab {
     View { path: PathBuf, title: String, text: String, scroll: u16, rel: Option<String> },
 }
 
+/// The right-click popup on an agent row: one "Terminate" item filling `rect`.
+struct Menu {
+    rect: Rect,
+    thread: String,
+    agent: String,
+}
+
+const MENU_ITEM: &str = " Terminate ";
+
 #[derive(Default)]
 struct Tabs {
     list: Vec<Tab>,
@@ -76,7 +85,15 @@ struct App {
     quit: bool,
     msg: Option<(String, Instant)>,
     ticks: u32,
+    menu: Option<Menu>,
+    /// Threads whose agents are paused (the button reads RESUME). In memory only.
+    paused: HashSet<String>,
+    /// Shell tab registry key -> the thread its $BRIGD_THREAD names (strays run inside these).
+    shell_thread: HashMap<(String, String), String>,
+    /// PAUSE/RESUME button rects from the last draw.
+    pause_btns: Vec<(Rect, String)>,
     // Layout from the last draw, for mouse hit tests.
+    screen: Rect,
     side: Rect,
     side_inner: Rect,
     tab_bar: Rect,
@@ -154,11 +171,12 @@ fn resize_all(body: Rect) {
     }
 }
 
-/// running / blocked / done / failed / off, from the live process and state.json.
-fn agent_glyph_status(live: Option<&Arc<LiveAgent>>, saved: &str) -> &'static str {
-    match live.filter(|l| l.alive()) {
-        Some(l) if l.status() == "blocked" => "blocked",
-        Some(_) if saved == "done" => "done",
+/// While the process lives its hook status wins (a done agent Mark types into is live
+/// again): running / blocked / idle. Once it exits: done / failed from state.json, else off.
+fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
+    match live {
+        Some("blocked") => "blocked",
+        Some("idle") => "idle",
         Some(_) => "running",
         None if saved == "done" => "done",
         None if saved == "failed" => "failed",
@@ -252,7 +270,7 @@ impl App {
                 let saved = state["agents"][&a.label]["status"].as_str().unwrap_or("");
                 let st = match reg.get(&key) {
                     l if key.1 != a.label && !l.is_some_and(|l| l.alive()) => stray_status(&a.path),
-                    l => agent_glyph_status(l, saved),
+                    l => agent_glyph_status(l.filter(|l| l.alive()).map(|l| l.status()).as_deref(), saved),
                 };
                 agents.insert(key, st);
             }
@@ -422,6 +440,9 @@ impl App {
         match LiveAgent::spawn(cmd, &thread, &name, &cwd, Path::new("")).map(runner::register) {
             Ok(live) => {
                 let _ = live.resize(self.body.height.max(1), self.body.width.max(1));
+                if let Some(t) = brigd_thread {
+                    self.shell_thread.insert((thread.clone(), name.clone()), t);
+                }
                 tabs.list.push(Tab::Term { thread, agent: name, stage: None, live });
                 tabs.active = tabs.list.len() - 1;
                 self.focus_main = true;
@@ -506,7 +527,46 @@ impl App {
         }
     }
 
+    /// Kills the agent, reverts its changes, keeps its output (crate::terminate), and says how it went.
+    /// PAUSE: ESC to every live agent of the thread (flow agents, and the shell tabs strays
+    /// run in). RESUME: "continue" + Enter to the same set.
+    fn toggle_pause(&mut self, thread: &str) {
+        let resume = self.paused.contains(thread);
+        let strays = self.tree.iter().any(|n| has_live_stray(n, thread));
+        let mut targets = live_agents().into_iter().filter(|a| a.thread == thread).collect::<Vec<_>>();
+        if strays {
+            // ponytail: a shell tab is matched to the thread by $BRIGD_THREAD, not to the exact claude inside it
+            let reg = runner::registry().lock().unwrap().clone();
+            let shells = reg.iter().filter(|(k, a)| a.alive() && self.shell_thread.get(*k).is_some_and(|t| t == thread));
+            targets.extend(shells.map(|(_, a)| a.clone()));
+        }
+        let bytes: &[u8] = if resume { b"continue\r" } else { b"\x1b" };
+        targets.iter().for_each(|a| {
+            let _ = a.write(bytes);
+        });
+        if resume {
+            self.paused.remove(thread);
+        } else {
+            self.paused.insert(thread.into());
+        }
+    }
+
+    fn terminate(&mut self, thread: &str, agent: &str) {
+        match crate::terminate(thread, agent) {
+            Ok(n) => self.flash(format!("terminated {agent}: reverted {n} file(s), output kept")),
+            Err(e) => self.flash(format!("terminate {agent}: {e}")),
+        }
+        self.refresh();
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
+        if let Some(m) = self.menu.take() {
+            // Enter picks the item; Esc or any other key just closes the menu.
+            if k.code == KeyCode::Enter {
+                self.terminate(&m.thread, &m.agent);
+            }
+            return;
+        }
         let ctrl_o = k.code == KeyCode::Char('o') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.confirm_quit {
             self.confirm_quit = false;
@@ -582,9 +642,34 @@ impl App {
 
     fn on_mouse(&mut self, m: MouseEvent) {
         let at = Position { x: m.column, y: m.row };
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            if let Some(menu) = self.menu.take() {
+                // A left click on the item picks it; any other click closes the menu (a right
+                // click on another agent row then opens that row's menu below).
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    if menu.rect.contains(at) {
+                        self.terminate(&menu.thread, &menu.agent);
+                    }
+                    return;
+                }
+            }
+        }
         match m.kind {
+            MouseEventKind::Down(MouseButton::Right) => {
+                let agent = hit(self.side_inner, self.offset, &self.rows, m.column, m.row).map(|(i, _)| i).filter(|&i| self.rows[i].kind == Kind::Agent);
+                if let Some(i) = agent {
+                    self.sel = i;
+                    let r = &self.rows[i];
+                    let (thread, agent) = (r.thread.clone(), tree::agent_id(&r.path, &r.label));
+                    let w = MENU_ITEM.len() as u16;
+                    let x = if self.screen.width == 0 { m.column } else { m.column.min(self.screen.right().saturating_sub(w)) };
+                    self.menu = Some(Menu { rect: Rect::new(x, m.row, w, 1), thread, agent });
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
+                if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
+                    self.toggle_pause(&t);
+                } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
                     self.sel = i;
                     self.activate(i, arrow);
                     self.focus_main = false; // a click shows the item but keeps j/k on the sidebar
@@ -643,6 +728,7 @@ impl App {
                 let st = self.agent_status.get(&(r.thread.clone(), tree::agent_id(&r.path, &r.label))).copied().unwrap_or("off");
                 let (g, style) = match st {
                     "running" => ("● ", Style::new().fg(Color::Green)),
+                    "idle" => ("◦ ", Style::new().fg(Color::Green)),
                     "blocked" => ("! ", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)),
                     "done" => ("✓ ", Style::new().fg(Color::Blue)),
                     "failed" => ("✗ ", Style::new().fg(Color::Red)),
@@ -682,7 +768,7 @@ impl App {
         if body != self.body {
             resize_all(body);
         }
-        (self.side, self.side_inner, self.tab_bar, self.body) = (side, inner, bar, body);
+        (self.screen, self.side, self.side_inner, self.tab_bar, self.body) = (f.area(), side, inner, bar, body);
         f.render_widget(block, side);
 
         let h = inner.height as usize;
@@ -692,6 +778,16 @@ impl App {
             f.render_widget(Paragraph::new("no threads yet\n\nbrigd <name> \"task\""), inner);
         } else {
             f.render_widget(Paragraph::new(lines), inner);
+        }
+
+        // PAUSE/RESUME at the right end of each visible thread row.
+        self.pause_btns.clear();
+        for (n, r) in self.rows.iter().enumerate().skip(self.offset).take(h).filter(|(_, r)| r.kind == Kind::Thread) {
+            let label = if self.paused.contains(&r.label) { " RESUME " } else { " PAUSE " };
+            let w = label.len() as u16;
+            let rect = Rect::new(inner.right().saturating_sub(w).max(inner.x), inner.y + (n - self.offset) as u16, w.min(inner.width), 1);
+            f.render_widget(Paragraph::new(label).style(Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)), rect);
+            self.pause_btns.push((rect, r.label.clone()));
         }
 
         // Tab bar: space name, then one tab per opened agent/viewer in this space.
@@ -758,7 +854,19 @@ impl App {
             _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · wheel scrollback"),
         };
         f.render_widget(Paragraph::new(Line::from(text).style(Style::new().fg(Color::Gray).bg(Color::Black))), hint);
+
+        if let Some(m) = &self.menu {
+            let r = m.rect.intersection(f.area());
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(MENU_ITEM).style(Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)), r);
+        }
     }
+}
+
+/// Does `thread` have a stray whose claude is still running?
+fn has_live_stray(n: &Node, thread: &str) -> bool {
+    let strays = |t: &Node| t.children.iter().filter(|c| c.kind == Kind::Folder).flat_map(|c| &c.children).any(|a| a.kind == Kind::Agent && !matches!(stray_status(&a.path), "off" | "done" | "failed"));
+    if n.kind == Kind::Thread { n.label == thread && strays(n) } else { n.children.iter().any(|c| has_live_stray(c, thread)) }
 }
 
 /// A stray tab shows "stray-1", not "stray agents/stray-1".
@@ -769,14 +877,15 @@ fn tail(agent: &str) -> &str {
 /// A stray running in a terminal tab is no LiveAgent: it is alive while the pid it saved
 /// (exec kept brigd's) runs; the pid file goes once it is gone. Status from its hooks.
 fn stray_status(dir: &Path) -> &'static str {
-    let Ok(pid) = fs::read_to_string(dir.join("pid")) else { return "off" };
-    let alive = std::process::Command::new("kill").args(["-0", pid.trim()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
-    if !alive {
+    // Gone: terminated by Mark (failed) or just exited (off).
+    let gone = || if dir.join(runner::TERMINATED).exists() { "failed" } else { "off" };
+    let Ok(pid) = fs::read_to_string(dir.join("pid")) else { return gone() };
+    if !runner::pid_alive(&pid) {
         let _ = fs::remove_file(dir.join("pid"));
-        return "off";
+        return gone();
     }
     let cwd = fs::read_to_string(dir.join("cwd")).unwrap_or_default();
-    if runner::read_status(dir, Path::new(cwd.trim())) == "blocked" { "blocked" } else { "running" }
+    agent_glyph_status(Some(&runner::read_status(dir, Path::new(cwd.trim()))), "")
 }
 
 /// The first `term-<n>` not in `taken`.
@@ -892,6 +1001,15 @@ mod tests {
     }
 
     #[test]
+    fn live_status_beats_saved() {
+        assert_eq!(agent_glyph_status(Some("working"), "done"), "running");
+        assert_eq!(agent_glyph_status(Some("idle"), "done"), "idle");
+        assert_eq!(agent_glyph_status(Some("blocked"), "failed"), "blocked");
+        assert_eq!(agent_glyph_status(None, "done"), "done");
+        assert_eq!(agent_glyph_status(None, ""), "off");
+    }
+
+    #[test]
     fn keys_to_bytes() {
         let none = KeyModifiers::NONE;
         assert_eq!(key_bytes(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false), [3]);
@@ -971,6 +1089,28 @@ mod tests {
     }
 
     #[test]
+    fn right_click_opens_terminate_menu() {
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
+        let tree = node(Kind::Space, "repo", vec![node(Kind::Thread, "t", vec![node(Kind::Agent, "a", vec![])])]);
+        let mut app = App::default();
+        flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut app.rows);
+        (app.side_inner, app.screen) = (Rect::new(1, 1, 98, 10), Rect::new(0, 0, 100, 20));
+        let click = |b, x, y| MouseEvent { kind: MouseEventKind::Down(b), column: x, row: y, modifiers: KeyModifiers::NONE };
+        app.on_mouse(click(MouseButton::Right, 5, 1)); // the space row: no menu
+        assert!(app.menu.is_none());
+        app.on_mouse(click(MouseButton::Right, 5, 3)); // the agent row
+        let m = app.menu.as_ref().unwrap();
+        assert_eq!((m.thread.as_str(), m.agent.as_str(), m.rect.y), ("t", "a", 3));
+        app.on_mouse(click(MouseButton::Left, 50, 8)); // elsewhere: closes, opens nothing
+        assert!(app.menu.is_none() && app.tabs.is_empty());
+        app.on_mouse(click(MouseButton::Right, 5, 3));
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.menu.is_none());
+        app.on_mouse(click(MouseButton::Right, 97, 3)); // at the screen edge: the menu is shifted left
+        assert_eq!(app.menu.as_ref().unwrap().rect.right(), 100);
+    }
+
+    #[test]
     fn sidebar_click_keeps_focus() {
         let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
         let tree = node(Kind::Space, "repo", vec![node(Kind::Output, "nope.md", vec![])]);
@@ -984,5 +1124,20 @@ mod tests {
         assert_eq!(app.sel, 0); // j/k moved the sidebar selection
         app.on_mouse(click(50, 5)); // the body
         assert!(app.focus_main);
+    }
+
+    #[test]
+    fn pause_button_toggles() {
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
+        let mut app = App::default();
+        app.pause_btns = vec![(Rect::new(28, 2, 7, 1), "t".into())];
+        let click = |x, y| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
+        app.on_mouse(click(5, 2)); // beside the button: nothing
+        assert!(app.paused.is_empty());
+        app.on_mouse(click(30, 2));
+        assert!(app.paused.contains("t"));
+        app.on_mouse(click(30, 2));
+        assert!(app.paused.is_empty());
+        assert!(!has_live_stray(&node(Kind::Thread, "t", vec![]), "t"));
     }
 }

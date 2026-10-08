@@ -132,6 +132,14 @@ fn transcript_status(path: &Path) -> Option<String> {
     None
 }
 
+/// Is `pid` a running process? (`kill -0`)
+pub fn pid_alive(pid: &str) -> bool {
+    std::process::Command::new("kill").args(["-0", pid.trim()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+/// <agent dir>/terminated: written when Mark terminates the agent, cleared when it is started again.
+pub const TERMINATED: &str = "terminated";
+
 /// A random v4 UUID from /dev/urandom.
 pub fn new_uuid() -> Res<String> {
     let mut b = [0u8; 16];
@@ -173,6 +181,7 @@ pub fn register(a: LiveAgent) -> Arc<LiveAgent> {
 /// <dir>/session and clears a stale <dir>/status.
 pub fn session_args(dir: &Path) -> Res<[String; 4]> {
     let _ = fs::remove_file(dir.join("status"));
+    let _ = fs::remove_file(dir.join(TERMINATED));
     let session = new_uuid()?;
     fs::write(dir.join("session"), &session)?;
     Ok(["--session-id".into(), session, "--settings".into(), hooks_json(dir)])
@@ -208,6 +217,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     };
     let session = fs::read_to_string(dir.join("session")).map_err(|e| format!("{thread}/{agent}: no session: {e}"))?;
     let _ = fs::remove_file(dir.join("status"));
+    let _ = fs::remove_file(dir.join(TERMINATED));
     // ponytail: assumes --resume keeps the session id (subagent scan reads <session>/subagents); re-read it if not.
     cmd.args(["--resume", session.trim(), "--settings", &hooks_json(&dir)]);
     Ok(register(LiveAgent::spawn(cmd, thread, agent, &cwd, &dir)?))
