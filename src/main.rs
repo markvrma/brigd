@@ -131,7 +131,8 @@ fn real_main() -> Res<()> {
         }
         [name, task] if !task.starts_with('-') => {
             check_new_thread(name)?;
-            new_thread(name, plan(task)?, bg)
+            eprintln!("planning with opus (brigd-plan)…");
+            new_thread(name, plan(task, &env::current_dir()?)?, bg)
         }
         _ => Err(USAGE.into()),
     }
@@ -306,16 +307,24 @@ fn check_new_thread(name: &str) -> Res<()> {
     Ok(())
 }
 
+/// Writes a new thread's dir (it may already exist, reserved by the TUI), state.json with
+/// status "planned" and flowmap.json. Callers write FLOWPLAN themselves.
+fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) -> Res<State> {
+    let dir = root.join("threads").join(name);
+    fs::create_dir_all(&dir)?;
+    let state = State { thread: name.into(), repo: repo.into(), status: "planned".into(), updated: now(), ..Default::default() };
+    write_json(&dir.join("state.json"), &state)?;
+    write_json(&dir.join("flowmap.json"), flow)?;
+    Ok(state)
+}
+
 fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     check_new_thread(name)?;
-    let dir = thread_dir(name);
-    fs::create_dir_all(&dir)?;
-    let flow_path = dir.join("flowmap.json");
     let repo = env::current_dir()?.canonicalize()?.to_string_lossy().into_owned();
-    let state = State { thread: name.into(), repo, status: "planned".into(), updated: now(), ..Default::default() };
-    write_json(&dir.join("state.json"), &state)?;
+    let state = create_thread(&root(), name, &repo, &flow)?;
+    let dir = thread_dir(name);
+    let flow_path = dir.join("flowmap.json");
     if bg {
-        write_json(&flow_path, &flow)?;
         let plan = dir.join("FLOWPLAN");
         fs::write(&plan, flow_text(&flow))?;
         let at = launch_bg(name, &state.repo)?;
@@ -451,15 +460,16 @@ fn run_ok(c: &mut Command) -> Res<String> {
 
 // ---------- planning ----------
 
-fn plan(task: &str) -> Res<Flow> {
+/// Runs the planner in `repo` and returns a valid flow. Never prints: the TUI calls it too.
+fn plan(task: &str, repo: &Path) -> Res<Flow> {
     let mut prompt = format!("Plan a brigd flow for this task:\n\n{task}");
     for attempt in 0..2 {
-        eprintln!("planning with opus (brigd-plan)…");
         // ponytail: skill text passed as system prompt so it works uninstalled; install-skill is for interactive /brigd-plan.
         let mut cmd = Command::new("claude");
         // brigd may run under Claude Code; the planner is a session of its own.
         PARENT_SESSION_VARS.iter().for_each(|v| _ = cmd.env_remove(v));
         let out = cmd
+            .current_dir(repo)
             .args(["-p", &prompt, "--model", "opus", "--effort", "high", "--output-format", "json"])
             .args(["--no-session-persistence", "--json-schema", SCHEMA, "--tools", "Read,Grep,Glob"])
             .args(["--append-system-prompt", SKILL, "--permission-mode", "auto"])
@@ -1097,6 +1107,19 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         let out = |a: &[&str]| String::from_utf8_lossy(&git(a).stdout).into_owned();
         assert_eq!(out(&["worktree", "list"]).lines().count(), 1);
         assert_eq!(out(&["branch", "--list", "brigd/*", "--format=%(refname:short)"]).trim(), "brigd/other/k");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_thread_in_repo() {
+        let root = env::temp_dir().join(format!("brigd-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("threads/th")).unwrap(); // reserved by the TUI
+        let flow = Flow { goal: "g".into(), stages: vec![vec![agent("a", None, "default")]] };
+        create_thread(&root, "th", "/some/repo", &flow).unwrap();
+        let st: State = serde_json::from_str(&fs::read_to_string(root.join("threads/th/state.json")).unwrap()).unwrap();
+        assert_eq!((st.repo.as_str(), st.status.as_str()), ("/some/repo", "planned"));
+        assert!(root.join("threads/th/flowmap.json").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

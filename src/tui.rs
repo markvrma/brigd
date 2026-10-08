@@ -14,13 +14,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use tui_term::widget::PseudoTerminal;
@@ -130,6 +130,14 @@ fn push_tab(tabs: &mut Tabs, tab: Tab) {
     tabs.active = tabs.list.len() - 1;
 }
 
+/// What the planner and execute threads of a '+' new thread report to the run loop.
+enum Bg {
+    /// (thread, repo): planned, waiting for the y/n confirm.
+    Planned(String, String),
+    Failed(String),
+    Finished(String, Result<(), String>),
+}
+
 #[derive(Default)]
 struct App {
     tree: Vec<Node>,
@@ -162,6 +170,14 @@ struct App {
     shell_thread: HashMap<(String, String), String>,
     /// Pause dot rects from the last draw.
     pause_btns: Vec<(Rect, String)>,
+    /// '+' rects from the last draw -> the space (repo) a new thread goes in.
+    plus_btns: Vec<(Rect, PathBuf)>,
+    /// The new-thread window: (repo, "<name> <task>" typed so far, error). Takes every key.
+    newt: Option<(PathBuf, String, Option<String>)>,
+    /// A planned (thread, repo) waiting for y to run, n to be deleted.
+    confirm_run: Option<(String, String)>,
+    /// Created on first use; background threads send on clones of the sender.
+    bg: Option<(mpsc::Sender<Bg>, mpsc::Receiver<Bg>)>,
     // Layout from the last draw, for mouse hit tests.
     screen: Rect,
     side: Rect,
@@ -210,6 +226,9 @@ pub fn run(open: Option<&str>) -> Res<()> {
                 if let Some(s) = app.clip.take() {
                     copy_to_clipboard(&s);
                 }
+            }
+            while let Some(m) = app.bg.as_ref().and_then(|(_, rx)| rx.try_recv().ok()) {
+                app.on_bg(m);
             }
             if last.elapsed() >= REFRESH {
                 app.refresh();
@@ -982,7 +1001,93 @@ impl App {
         self.refresh();
     }
 
+    fn tx(&mut self) -> mpsc::Sender<Bg> {
+        self.bg.get_or_insert_with(mpsc::channel).0.clone()
+    }
+
+    /// Enter in the new-thread window: reserves the name, then plans off the UI thread.
+    fn submit_newt(&mut self, repo: PathBuf, input: String) {
+        let (name, task) = input.trim().split_once(' ').map(|(n, t)| (n.to_string(), t.trim().to_string())).unwrap_or((input.trim().into(), String::new()));
+        let dir = crate::thread_dir(&name);
+        // create_dir reserves the name; tree::build hides the dir until flowmap.json exists.
+        let reserve = || -> Res<()> {
+            crate::check_new_thread(&name)?;
+            if task.is_empty() {
+                return Err("type <name> <task>".into());
+            }
+            fs::create_dir_all(crate::root().join("threads"))?;
+            Ok(fs::create_dir(&dir)?)
+        };
+        if let Err(e) = reserve() {
+            self.newt = Some((repo, input, Some(e.to_string())));
+            return;
+        }
+        self.flash(format!("planning {name}…"));
+        let tx = self.tx();
+        // ponytail: no cancel; quitting brigd mid-plan orphans the `claude -p` planner.
+        std::thread::spawn(move || {
+            let r = crate::plan(&task, &repo).and_then(|flow| {
+                crate::create_thread(&crate::root(), &name, &repo.to_string_lossy(), &flow)?;
+                Ok(fs::write(dir.join("FLOWPLAN"), crate::flow_text(&flow))?)
+            });
+            let _ = tx.send(match r {
+                Ok(()) => Bg::Planned(name, repo.to_string_lossy().into_owned()),
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&dir);
+                    Bg::Failed(format!("plan {name}: {e}"))
+                }
+            });
+        });
+    }
+
+    fn on_bg(&mut self, m: Bg) {
+        match m {
+            Bg::Failed(e) => self.flash(e),
+            Bg::Planned(name, repo) => {
+                self.refresh();
+                self.open_flowplan(&name);
+                self.confirm_run = Some((name, repo));
+            }
+            Bg::Finished(name, Ok(())) => self.flash(format!("thread {name} done")),
+            Bg::Finished(name, Err(e)) => self.flash(format!("thread {name}: {e}")),
+        }
+    }
+
+    /// y on a planned thread: the same execute as --flow / resume, off the UI thread.
+    fn run_planned(&mut self, name: String) {
+        match crate::load(&name) {
+            Ok((flow, state)) => {
+                let tx = self.tx();
+                std::thread::spawn(move || {
+                    let r = crate::execute(&name, &flow, state).map_err(|e| e.to_string());
+                    let _ = tx.send(Bg::Finished(name, r));
+                });
+            }
+            Err(e) => self.flash(e.to_string()),
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
+        // The new-thread window and its run confirm come first: no key may reach anything behind them.
+        if let Some((repo, mut input, err)) = self.newt.take() {
+            match k.code {
+                KeyCode::Esc => return,
+                KeyCode::Enter => return self.submit_newt(repo, input),
+                KeyCode::Backspace => _ = input.pop(),
+                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => input.push(c),
+                _ => return self.newt = Some((repo, input, err)),
+            }
+            self.newt = Some((repo, input, None));
+            return;
+        }
+        if let Some((name, repo)) = self.confirm_run.take() {
+            match k.code {
+                KeyCode::Char('y' | 'Y') => self.run_planned(name),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.delete(&name),
+                _ => self.confirm_run = Some((name, repo)),
+            }
+            return;
+        }
         if let Some(mut m) = self.menu.take() {
             // ↑↓ move, Enter picks; Esc or any other key just closes the menu.
             match k.code {
@@ -1076,6 +1181,9 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
+        if self.newt.is_some() || self.confirm_run.is_some() {
+            return;
+        }
         let at = Position { x: m.column, y: m.row };
         if matches!(m.kind, MouseEventKind::Down(_)) {
             if let Some(menu) = self.menu.take() {
@@ -1109,7 +1217,9 @@ impl App {
                 // The sidebar is not among these, so a drag starting there selects nothing.
                 let panes = self.tabs.get(&self.thread).into_iter().flat_map(|p| &p.list).flat_map(|t| [t.bar, t.body]);
                 self.drag = panes.chain([self.hint]).find(|r| r.contains(at)).map(|r| (r, at, None));
-                if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
+                if let Some(repo) = self.plus_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, p)| p.clone()) {
+                    self.newt = Some((repo, String::new(), None));
+                } else if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
                 } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
                     self.sel = i;
@@ -1170,7 +1280,10 @@ impl App {
     }
 
     fn on_paste(&mut self, s: &str) {
-        if !self.focus_main {
+        if let Some((_, input, _)) = &mut self.newt {
+            return input.push_str(&s.replace(['\r', '\n'], " "));
+        }
+        if self.confirm_run.is_some() || !self.focus_main {
             return;
         }
         let Some(Tab::Term { live, .. }) = self.cur() else { return };
@@ -1356,14 +1469,25 @@ impl App {
             f.render_widget(Paragraph::new(lines), inner);
         }
 
-        // Pause dot at the right end of each visible thread row: ○ running, ● paused (click resumes).
+        // At the right end of each visible space row a '+' (new thread), of each thread row
+        // its pause dot: ○ running, ● paused (click resumes).
         self.pause_btns.clear();
-        for (y, r) in shown.iter().map(|&(y, i)| (y, &self.rows[i])).filter(|(_, r)| r.kind == Kind::Thread) {
-            let label = if self.paused.contains(&r.label) { " ● " } else { " ○ " };
+        self.plus_btns.clear();
+        for (y, r) in shown.iter().map(|&(y, i)| (y, &self.rows[i])) {
+            let (label, color) = match r.kind {
+                Kind::Space => (" + ", pal::GREEN),
+                Kind::Thread if self.paused.contains(&r.label) => (" ● ", pal::RED),
+                Kind::Thread => (" ○ ", pal::RED),
+                _ => continue,
+            };
             let w = label.chars().count() as u16;
             let rect = Rect::new(inner.right().saturating_sub(w).max(inner.x), inner.y + y as u16, w.min(inner.width), 1);
-            f.render_widget(Paragraph::new(label).style(Style::new().fg(pal::RED)), rect);
-            self.pause_btns.push((rect, r.label.clone()));
+            f.render_widget(Paragraph::new(label).style(Style::new().fg(color)), rect);
+            if r.kind == Kind::Space {
+                self.plus_btns.push((rect, r.path.clone()));
+            } else {
+                self.pause_btns.push((rect, r.label.clone()));
+            }
         }
 
         // The thread's panes side by side, a dim "│" between them.
@@ -1401,6 +1525,22 @@ impl App {
                 Line::styled(a.label(), Style::new().fg(if i == m.sel { pal::CRUST } else { pal::TEXT }).bg(bg).add_modifier(Modifier::BOLD))
             });
             f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), r);
+        }
+
+        // The new-thread window, or the run confirm once it is planned, centered on top.
+        let modal = if let Some((repo, input, err)) = &self.newt {
+            let help = err.as_ref().map_or(Span::styled("<name> <task> · Enter plans · Esc cancels", Style::new().fg(pal::OVERLAY0)), |e| Span::styled(e.clone(), Style::new().fg(pal::RED)));
+            Some((format!(" new thread in {} ", repo.display()), vec![Line::from(format!("> {input}█")), Line::from(help)]))
+        } else {
+            self.confirm_run.as_ref().map(|(name, repo)| (" run ".into(), vec![Line::styled(format!("Run thread {name} in {repo}? y / n"), Style::new().add_modifier(Modifier::BOLD))]))
+        };
+        if let Some((title, lines)) = modal {
+            let a = f.area();
+            let w = (lines.iter().map(Line::width).chain([title.chars().count(), 50]).max().unwrap_or(0) as u16 + 4).min(a.width);
+            let h = (lines.len() as u16 + 2).min(a.height);
+            let r = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
+            f.render_widget(Clear, r);
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal::LAVENDER))), r);
         }
 
         if let Some((r, a, Some(b))) = self.drag {
@@ -1847,6 +1987,30 @@ mod tests {
         app.on_mouse(click(30, 2));
         assert!(app.paused.is_empty());
         assert!(!has_live_stray(&node(Kind::Thread, "t", vec![]), "t"));
+    }
+
+    #[test]
+    fn plus_opens_new_thread_window() {
+        let mut app = App { plus_btns: vec![(Rect::new(30, 1, 3, 1), PathBuf::from("/repo"))], ..Default::default() };
+        app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 31, row: 1, modifiers: KeyModifiers::NONE });
+        assert_eq!(app.newt, Some((PathBuf::from("/repo"), String::new(), None)));
+        let typ = |app: &mut App, s: &str| s.chars().for_each(|c| app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE)));
+        typ(&mut app, "ab");
+        app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Char('t'), KeyModifiers::ALT)); // no terminal opens behind the window
+        assert_eq!((app.newt.as_ref().unwrap().1.as_str(), app.tabs.is_empty()), ("a", true));
+        app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        typ(&mut app, "Bad! x");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // a bad name keeps the window open with an error
+        assert!(app.newt.as_ref().unwrap().2.as_ref().unwrap().contains("bad thread name"));
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.newt.is_none());
+        // "Bad!" can never be a thread, so n's delete touches nothing on disk.
+        app.confirm_run = Some(("Bad!".into(), "/repo".into()));
+        app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.confirm_run.is_some());
+        app.on_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.confirm_run.is_none());
     }
 
     #[test]
