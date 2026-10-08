@@ -278,12 +278,12 @@ fn flatten(n: &Node, depth: usize, space: &Path, thread: &str, toggled: &HashSet
 }
 
 /// The rows that fit in `h` sidebar lines from row `offset`, as (line, row index).
-/// A blank line goes above each space and thread to keep the tree airy.
+/// A blank line goes above each space and each thread but a space's first.
 fn layout(rows: &[Row], offset: usize, h: usize) -> Vec<(usize, usize)> {
     let mut y = 0;
     let mut out = vec![];
     for (i, r) in rows.iter().enumerate().skip(offset) {
-        if i > offset && matches!(r.kind, Kind::Space | Kind::Thread) {
+        if i > offset && (r.kind == Kind::Space || r.kind == Kind::Thread && rows[i - 1].kind != Kind::Space) {
             y += 1;
         }
         if y >= h {
@@ -1191,17 +1191,23 @@ mod tests {
         // Spaces and threads start open, agents folded.
         let labels: Vec<_> = rows.iter().map(|r| (r.depth, r.label.as_str(), r.thread.as_str())).collect();
         assert_eq!(labels, [(0, "repo", ""), (1, "t", "t"), (2, "a", "t"), (2, "b", "t")]);
-        let inner = Rect::new(1, 1, 34, 4); // lines 1..=4: repo, blank, t, a
+        let inner = Rect::new(1, 1, 34, 3); // lines 1..=3: repo, t, a
         assert_eq!(hit(inner, 0, &rows, 5, 1), Some((0, false)));
-        assert_eq!(hit(inner, 0, &rows, 5, 2), None); // the blank line above a thread
-        assert_eq!(hit(inner, 1, &rows, 10, 2), Some((2, false))); // scrolled by one: no blank above the top row
-        assert_eq!(hit(inner, 0, &rows, 1 + 6, 4), Some((2, true))); // depth 2 arrow at x 6..8
-        assert_eq!(hit(inner, 0, &rows, 1 + 8, 4), Some((2, false)));
+        assert_eq!(hit(inner, 1, &rows, 10, 2), Some((2, false))); // scrolled by one
+        assert_eq!(hit(inner, 0, &rows, 1 + 6, 3), Some((2, true))); // depth 2 arrow at x 6..8
+        assert_eq!(hit(inner, 0, &rows, 1 + 8, 3), Some((2, false)));
         assert_eq!(hit(inner, 1, &rows, 1 + 6, 3), Some((3, false))); // "b" has no children: no arrow
-        assert_eq!(hit(inner, 3, &rows, 5, 2), None); // past the last row
-        assert_eq!(hit(inner, 0, &rows, 5, 5), None); // below the list
+        assert_eq!(hit(inner, 2, &rows, 5, 3), None); // past the last row
+        assert_eq!(hit(inner, 0, &rows, 5, 4), None); // below the list
         assert_eq!(hit(inner, 0, &rows, 0, 1), None); // on the border
-        assert_eq!(max_offset(&rows, 3), 1); // offset 0 shows repo, blank, t: b is cut off
+        assert_eq!(max_offset(&rows, 3), 1);
+        // A blank line above a later thread and a later space, none under a space.
+        let two = node(Kind::Space, "r", vec![node(Kind::Thread, "t", vec![]), node(Kind::Thread, "u", vec![])]);
+        let mut rows = Vec::new();
+        flatten(&two, 0, &two.path, "", &HashSet::new(), &mut rows);
+        flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut rows);
+        let ys: Vec<_> = layout(&rows, 0, 20).into_iter().map(|(y, _)| y).collect();
+        assert_eq!(ys, [0, 1, 3, 5, 6, 7, 8]); // r t _ u _ repo t a b
         // Unfolding agent "a" shows its output.md.
         let toggled = HashSet::from([(tree.path.clone(), PathBuf::from("/a"))]);
         let mut rows = Vec::new();
@@ -1236,15 +1242,15 @@ mod tests {
         let click = |b, x, y| MouseEvent { kind: MouseEventKind::Down(b), column: x, row: y, modifiers: KeyModifiers::NONE };
         app.on_mouse(click(MouseButton::Right, 5, 1)); // the space row: no menu
         assert!(app.menu.is_none());
-        app.on_mouse(click(MouseButton::Right, 5, 4)); // the agent row, below the thread's blank line
+        app.on_mouse(click(MouseButton::Right, 5, 3)); // the agent row
         let m = app.menu.as_ref().unwrap();
-        assert_eq!((m.thread.as_str(), m.agent.as_str(), m.rect.y), ("t", "a", 4));
+        assert_eq!((m.thread.as_str(), m.agent.as_str(), m.rect.y), ("t", "a", 3));
         app.on_mouse(click(MouseButton::Left, 50, 8)); // elsewhere: closes, opens nothing
         assert!(app.menu.is_none() && app.tabs.is_empty());
-        app.on_mouse(click(MouseButton::Right, 5, 4));
+        app.on_mouse(click(MouseButton::Right, 5, 3));
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.menu.is_none());
-        app.on_mouse(click(MouseButton::Right, 97, 4)); // at the screen edge: the menu is shifted left
+        app.on_mouse(click(MouseButton::Right, 97, 3)); // at the screen edge: the menu is shifted left
         assert_eq!(app.menu.as_ref().unwrap().rect.right(), 100);
     }
 
