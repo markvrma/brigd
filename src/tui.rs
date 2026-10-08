@@ -1,6 +1,6 @@
 //! brigd's TUI: a sidebar of spaces (the tree.rs folder tree) and, for the
-//! selected thread, a tab bar of agent terminals (runner.rs PTYs drawn with
-//! tui-term) and read-only output.md viewers. No panes.
+//! selected thread, one or two side-by-side panes, each a tab bar of agent terminals
+//! (runner.rs PTYs drawn with tui-term) and read-only output.md viewers.
 
 use crate::runner::{self, LiveAgent, Res};
 use crate::tree::{self, Kind, Node};
@@ -88,6 +88,35 @@ impl Act {
 struct Tabs {
     list: Vec<Tab>,
     active: usize,
+    // From the last draw: the pane's tab bar, its body, and each shown tab's (x0, x1, index).
+    bar: Rect,
+    body: Rect,
+    spans: Vec<(u16, u16, usize)>,
+}
+
+/// A thread's panes, left to right (1 or 2, never 0), and the focused one.
+struct Panes {
+    list: Vec<Tabs>,
+    focus: usize,
+}
+
+impl Default for Panes {
+    fn default() -> Self {
+        Panes { list: vec![Tabs::default()], focus: 0 }
+    }
+}
+
+impl Panes {
+    /// (pane, tab) of the first tab matching `f`: an open tab is focused, never shown twice.
+    fn find(&self, f: impl Fn(&Tab) -> bool) -> Option<(usize, usize)> {
+        self.list.iter().enumerate().find_map(|(j, t)| Some((j, t.list.iter().position(&f)?)))
+    }
+}
+
+/// `n` equal columns of `main` with a 1-column gap: each pane's (tab bar, body).
+fn pane_rects(main: Rect, n: usize) -> Vec<(Rect, Rect)> {
+    let cols = Layout::horizontal(vec![Constraint::Fill(1); n.max(1)]).spacing(1).split(main);
+    cols.iter().map(|&c| (Rect { height: c.height.min(1), ..c }, Rect { y: c.y + c.height.min(1), height: c.height.saturating_sub(1), ..c })).collect()
 }
 
 /// Tabs per tab bar; opening one more closes the oldest opened (its agent keeps running).
@@ -113,7 +142,7 @@ struct App {
     space: PathBuf,
     /// The thread whose tabs show.
     thread: String,
-    tabs: BTreeMap<String, Tabs>,
+    tabs: BTreeMap<String, Panes>,
     /// (thread, agent) -> running / blocked / done / failed / off
     agent_status: HashMap<(String, String), &'static str>,
     /// thread dir -> state.json status
@@ -143,14 +172,8 @@ struct App {
     side_w: Option<u16>,
     /// A divider drag is in progress.
     resizing: bool,
-    tab_bar: Rect,
-    /// Columns of the tabs shown in the last draw, starting at tab `tab_first`.
-    tab_spans: Vec<(u16, u16)>,
-    /// First tab shown in the bar (wheel-scrolled; follows the active tab when it changes).
-    tab_first: usize,
-    /// (thread, active tab, tab count) at the last draw: a change makes the bar follow the active tab.
-    tab_seen: (String, usize, usize),
-    body: Rect,
+    /// Right of the divider: every pane with its tab bar.
+    main: Rect,
     hint: Rect,
     /// Left-drag text selection: (rect it started in, anchor, cursor once dragged).
     drag: Option<(Rect, Position, Option<Position>)>,
@@ -289,18 +312,6 @@ fn tab_window(widths: &[u16], first: usize, follow: Option<usize>, avail: u16) -
         }
     }
     (first, end_from(first))
-}
-
-fn resize_all(body: Rect) {
-    if body.width == 0 || body.height == 0 {
-        return;
-    }
-    for a in live_agents() {
-        let size = a.parser.lock().unwrap().screen().size();
-        if size != (body.height, body.width) {
-            let _ = a.resize(body.height, body.width);
-        }
-    }
 }
 
 /// While the process lives its hook status wins (a done agent Mark types into is live
@@ -530,7 +541,7 @@ impl App {
 
         // Tabs follow a restart of their agent (execute or resume registers a new LiveAgent).
         let diff_tick = self.ticks.is_multiple_of(4); // git diff open diff tabs each ~3s, not every refresh
-        for tab in self.tabs.values_mut().flat_map(|t| &mut t.list) {
+        for tab in self.tabs.values_mut().flat_map(|p| &mut p.list).flat_map(|t| &mut t.list) {
             match tab {
                 Tab::Term { thread, agent, live, .. } => {
                     if let Some(new) = reg.get(&(thread.clone(), agent.clone())).filter(|n| n.alive() && !Arc::ptr_eq(n, live)) {
@@ -546,7 +557,7 @@ impl App {
             }
         }
         self.load_plans();
-        resize_all(self.body);
+        self.resize_all();
         // supervise mirrors subagents only for agents execute runs; this covers ones resumed from the sidebar.
         if self.ticks % 7 == 0 {
             let home = PathBuf::from(env::var("HOME").unwrap_or_default());
@@ -567,7 +578,7 @@ impl App {
 
     /// Reloads flowmap.json + state.json for every open FLOWPLAN tab.
     fn load_plans(&mut self) {
-        let paths = self.tabs.values().flat_map(|t| &t.list).filter_map(|t| match t {
+        let paths = self.tabs.values().flat_map(|p| &p.list).flat_map(|t| &t.list).filter_map(|t| match t {
             Tab::View { path, rel: None, .. } if path.ends_with("FLOWPLAN") => Some(path.clone()),
             _ => None,
         });
@@ -681,23 +692,29 @@ impl App {
         }
     }
 
-    /// Opens registry agent (thread, agent) as a tab in brigd thread `key`'s bar.
+    /// Opens registry agent (thread, agent) as a tab in brigd thread `key`'s focused pane
+    /// (or focuses the pane that already has it).
     fn open_agent(&mut self, key: String, thread: &str, agent: &str, stage: Option<usize>) {
-        let tabs = self.tabs.entry(key.clone()).or_default();
-        let found = tabs.list.iter().position(|t| matches!(t, Tab::Term { thread: t, agent: a, .. } if t == thread && a == agent));
-        if let Some(i) = found.filter(|&i| matches!(&tabs.list[i], Tab::Term { live, .. } if live.alive())) {
-            tabs.active = i;
+        let p = self.tabs.entry(key.clone()).or_default();
+        let found = p.find(|t| matches!(t, Tab::Term { thread: t, agent: a, .. } if t == thread && a == agent));
+        if let Some((j, _)) = found {
+            p.focus = j;
+        }
+        if let Some((j, i)) = found.filter(|&(j, i)| matches!(&p.list[j].list[i], Tab::Term { live, .. } if live.alive())) {
+            p.list[j].active = i;
             self.focus_main = true;
             return;
         }
         // Not live (brigd restarted, or it exited): reopen its session.
         match runner::resume_agent(thread, agent) {
             Ok(live) => {
-                let _ = live.resize(self.body.height.max(1), self.body.width.max(1));
+                let b = self.pane_body(&key);
+                let _ = live.resize(b.height.max(1), b.width.max(1));
                 let tab = Tab::Term { thread: thread.into(), agent: agent.into(), stage, live };
-                let tabs = self.tabs.entry(key).or_default();
+                let p = self.tabs.entry(key).or_default();
+                let tabs = &mut p.list[p.focus];
                 match found {
-                    Some(i) => (tabs.list[i], tabs.active) = (tab, i),
+                    Some((_, i)) => (tabs.list[i], tabs.active) = (tab, i),
                     None => push_tab(tabs, tab),
                 }
                 self.focus_main = true;
@@ -716,7 +733,7 @@ impl App {
         // Registry key (space, name): names are unique per space, and a closed-but-running tab keeps its name.
         let thread = space.to_string_lossy().into_owned();
         let reg = runner::registry().lock().unwrap().clone();
-        let taken = self.tabs.values().flat_map(|t| &t.list).filter_map(|t| match t {
+        let taken = self.tabs.values().flat_map(|p| &p.list).flat_map(|t| &t.list).filter_map(|t| match t {
             Tab::Term { thread: t, agent, .. } if *t == thread => Some(agent.as_str()),
             _ => None,
         });
@@ -744,11 +761,12 @@ impl App {
         }
         match LiveAgent::spawn(cmd, &thread, &name, &cwd, Path::new("")).map(runner::register) {
             Ok(live) => {
-                let _ = live.resize(self.body.height.max(1), self.body.width.max(1));
+                let b = self.pane_body(&self.thread);
+                let _ = live.resize(b.height.max(1), b.width.max(1));
                 if let Some(t) = brigd_thread {
                     self.shell_thread.insert((thread.clone(), name.clone()), t);
                 }
-                push_tab(self.tabs.entry(self.thread.clone()).or_default(), Tab::Term { thread, agent: name, stage: None, live });
+                push_tab(self.pane(), Tab::Term { thread, agent: name, stage: None, live });
                 self.focus_main = true;
             }
             Err(e) => self.flash(format!("{name}: {e}")),
@@ -765,9 +783,9 @@ impl App {
     }
 
     fn open_view(&mut self, thread: String, path: PathBuf) {
-        let tabs = self.tabs.entry(thread).or_default();
-        if let Some(i) = tabs.list.iter().position(|t| matches!(t, Tab::View { path: p, .. } if *p == path)) {
-            tabs.active = i;
+        let p = self.tabs.entry(thread).or_default();
+        if let Some((j, i)) = p.find(|t| matches!(t, Tab::View { path: p, .. } if *p == path)) {
+            (p.focus, p.list[j].active) = (j, i);
         } else {
             let title = path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             let title = if path.file_name().is_some_and(|f| f == "FLOWPLAN") { format!("{title} FLOWPLAN") } else { title };
@@ -782,30 +800,88 @@ impl App {
                     Tab::View { path, title: format!("≡ {title}"), text, scroll: 0, rel: None }
                 }
             };
-            push_tab(tabs, tab);
+            push_tab(&mut p.list[p.focus], tab);
             self.load_plans();
         }
         self.focus_main = true;
     }
 
+    /// The shown thread's focused pane.
+    fn pane(&mut self) -> &mut Tabs {
+        let p = self.tabs.entry(self.thread.clone()).or_default();
+        &mut p.list[p.focus]
+    }
+
+    /// Thread `key`'s focused pane body as the next draw lays it out, so a new PTY starts at its real size.
+    fn pane_body(&self, key: &str) -> Rect {
+        let (n, focus) = self.tabs.get(key).map_or((1, 0), |p| (p.list.len(), p.focus));
+        pane_rects(self.main, n)[focus].1
+    }
+
     fn cur(&mut self) -> Option<&mut Tab> {
-        let t = self.tabs.get_mut(&self.thread)?;
+        let p = self.tabs.get_mut(&self.thread)?;
+        let t = &mut p.list[p.focus];
         t.list.get_mut(t.active)
     }
 
     fn cycle(&mut self, d: isize) {
-        if let Some(t) = self.tabs.get_mut(&self.thread).filter(|t| !t.list.is_empty()) {
+        let t = self.pane();
+        if !t.list.is_empty() {
             t.active = (t.active as isize + d).rem_euclid(t.list.len() as isize) as usize;
             self.focus_main = true;
         }
     }
 
-    /// Closes the current tab; its agent keeps running.
+    /// Closes the current tab (its agent keeps running), and its pane once empty unless it is the only one.
     fn close_tab(&mut self) {
-        if let Some(t) = self.tabs.get_mut(&self.thread).filter(|t| !t.list.is_empty()) {
+        let Some(p) = self.tabs.get_mut(&self.thread) else { return };
+        let t = &mut p.list[p.focus];
+        if !t.list.is_empty() {
             t.list.remove(t.active);
             t.active = t.active.min(t.list.len().saturating_sub(1));
-            self.focus_main = !t.list.is_empty();
+        }
+        if t.list.is_empty() && p.list.len() > 1 {
+            p.list.remove(p.focus);
+            p.focus = 0;
+        }
+        self.focus_main = !p.list[p.focus].list.is_empty();
+    }
+
+    /// A second pane for the shown thread, holding only a new terminal.
+    fn split(&mut self) {
+        let p = self.tabs.entry(self.thread.clone()).or_default();
+        if p.list.len() >= 2 {
+            return self.flash("max 2 panes");
+        }
+        p.list.push(Tabs::default());
+        p.focus = 1;
+        self.new_term();
+        if self.cur().is_none() {
+            self.close_tab(); // the shell failed to start: drop the empty pane
+        }
+    }
+
+    fn other_pane(&mut self) {
+        if let Some(p) = self.tabs.get_mut(&self.thread) {
+            p.focus = (p.focus + 1) % p.list.len();
+            self.focus_main = !p.list[p.focus].list.is_empty();
+        }
+    }
+
+    /// Sizes every live agent not on screen to a one-pane body (draw sizes the shown ones), so panes don't fight over SIGWINCH.
+    fn resize_all(&self) {
+        let body = pane_rects(self.main, 1)[0].1;
+        if body.width == 0 || body.height == 0 {
+            return;
+        }
+        let shown: Vec<&Arc<LiveAgent>> = self.tabs.get(&self.thread).into_iter().flat_map(|p| &p.list).filter_map(|t| match t.list.get(t.active) {
+            Some(Tab::Term { live, .. }) => Some(live),
+            _ => None,
+        }).collect();
+        for a in live_agents().into_iter().filter(|a| !shown.iter().any(|s| Arc::ptr_eq(s, a))) {
+            if a.parser.lock().unwrap().screen().size() != (body.height, body.width) {
+                let _ = a.resize(body.height, body.width);
+            }
         }
     }
 
@@ -880,7 +956,7 @@ impl App {
         crate::stop_thread(thread);
         self.live_shells().into_iter().filter(|(_, t)| t == thread).for_each(|(a, _)| a.kill());
         self.tabs.remove(thread);
-        self.focus_main &= self.tabs.get(&self.thread).is_some_and(|t| !t.list.is_empty());
+        self.focus_main &= self.cur().is_some();
         self.paused.remove(thread);
     }
 
@@ -933,13 +1009,15 @@ impl App {
         if self.prefix {
             self.prefix = false;
             match k.code {
+                _ if ctrl_o => self.send(&[0x0f]), // Ctrl-o twice sends one to claude
                 KeyCode::Char('s') => self.focus_main = false,
                 KeyCode::Char('n') => self.cycle(1),
                 KeyCode::Char('p') => self.cycle(-1),
                 KeyCode::Char('w') => self.close_tab(),
                 KeyCode::Char('t') => self.new_term(),
+                KeyCode::Char('v') => self.split(),
+                KeyCode::Char('o') => self.other_pane(),
                 KeyCode::Char('q') => self.ask_quit(),
-                _ if ctrl_o => self.send(&[0x0f]), // Ctrl-o twice sends one to claude
                 _ => {}
             }
             return;
@@ -991,7 +1069,7 @@ impl App {
             KeyCode::Enter => self.activate(self.sel, false),
             KeyCode::Right | KeyCode::Char('l') if sel == Some((true, false)) => self.toggle(self.sel),
             KeyCode::Left | KeyCode::Char('h') if sel == Some((true, true)) => self.toggle(self.sel),
-            KeyCode::Tab => self.focus_main = self.tabs.get(&self.thread).is_some_and(|t| !t.list.is_empty()),
+            KeyCode::Tab => self.focus_main = self.cur().is_some(),
             KeyCode::Char('q') => self.ask_quit(),
             _ => {}
         }
@@ -1029,20 +1107,25 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.resizing = self.divider.contains(at);
                 // The sidebar is not among these, so a drag starting there selects nothing.
-                self.drag = [self.tab_bar, self.body, self.hint].into_iter().find(|r| r.contains(at)).map(|r| (r, at, None));
+                let panes = self.tabs.get(&self.thread).into_iter().flat_map(|p| &p.list).flat_map(|t| [t.bar, t.body]);
+                self.drag = panes.chain([self.hint]).find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
                 } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
                     self.sel = i;
                     self.activate(i, arrow);
                     self.focus_main = false; // a click shows the item but keeps j/k on the sidebar
-                } else if self.tab_bar.contains(at) {
-                    if let Some(i) = self.tab_spans.iter().position(|&(a, b)| (a..b).contains(&m.column)) {
-                        self.tabs.entry(self.thread.clone()).or_default().active = self.tab_first + i;
-                        self.focus_main = true;
+                } else if let Some(p) = self.tabs.get_mut(&self.thread) {
+                    // A click on a pane focuses it; on one of its tabs, also shows that tab.
+                    if let Some(j) = p.list.iter().position(|t| t.bar.contains(at) || t.body.contains(at)) {
+                        let t = &mut p.list[j];
+                        if let Some(&(_, _, i)) = t.spans.iter().find(|&&(a, b, _)| t.bar.contains(at) && (a..b).contains(&m.column)) {
+                            t.active = i;
+                        }
+                        if !t.list.is_empty() {
+                            (p.focus, self.focus_main) = (j, true);
+                        }
                     }
-                } else if self.body.contains(at) && self.cur().is_some() {
-                    self.focus_main = true;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1065,14 +1148,11 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
                 let back = matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft);
                 let d: i32 = if back { -3 } else { 3 };
-                if self.tab_bar.contains(at) {
-                    let last = self.tabs.get(&self.thread).map_or(0, |t| t.list.len().saturating_sub(1));
-                    self.tab_first = if back { self.tab_first.saturating_sub(1) } else { (self.tab_first + 1).min(last) };
-                } else if self.side.contains(at) {
+                if self.side.contains(at) {
                     let max = max_offset(&self.rows, self.side_inner.height as usize) as i32;
                     self.offset = (self.offset as i32 + d).clamp(0, max.max(0)) as usize;
-                } else if self.body.contains(at) {
-                    match self.cur() {
+                } else if let Some(t) = self.tabs.get_mut(&self.thread).and_then(|p| p.list.iter_mut().find(|t| t.body.contains(at))) {
+                    match t.list.get_mut(t.active) {
                         Some(Tab::Term { live, .. }) => {
                             let mut p = live.parser.lock().unwrap();
                             let s = p.screen().scrollback() as i32;
@@ -1165,18 +1245,100 @@ impl App {
         }
     }
 
+    /// Pane `j` of the shown thread: its tab bar (the thread name first on pane 0), then the active tab.
+    fn draw_pane(&mut self, f: &mut Frame, j: usize, bar: Rect, body: Rect) {
+        let p = &self.tabs[&self.thread];
+        let (tabs, focused) = (&p.list[j], p.focus == j);
+        let mut spans = vec![];
+        let pill = if j == 0 {
+            spans.push(Span::styled(format!(" {} ", self.thread), Style::new().fg(pal::CRUST).bg(pal::MAUVE)));
+            self.thread.chars().count() as u16 + 2
+        } else {
+            0
+        };
+        let mut titles = vec![];
+        for t in &tabs.list {
+            titles.push(match t {
+                Tab::Term { agent, live, stage, .. } if !live.alive() => (format!(" {} (exited) ", tail(agent)), Some(stage_color(*stage))),
+                Tab::Term { agent, stage, .. } => (format!(" {} ", tail(agent)), Some(stage_color(*stage))),
+                Tab::View { title, .. } => (format!(" {title} "), None),
+            });
+        }
+        let widths: Vec<u16> = titles.iter().map(|(t, _)| 1 + t.chars().count() as u16).collect(); // "│" + title
+        let (first, end) = tab_window(&widths, 0, Some(tabs.active), bar.width.saturating_sub(pill));
+        let mut tab_spans = vec![];
+        let marker = |c| Span::styled(c, Style::new().fg(pal::OVERLAY0));
+        if first > 0 {
+            spans.push(marker("‹"));
+        }
+        let mut x = bar.x + pill + (first > 0) as u16;
+        // The focused pane's active tab is reversed, the other pane's underlined.
+        let on = if focused { Modifier::REVERSED | Modifier::BOLD } else { Modifier::UNDERLINED };
+        for i in first..end {
+            let (title, fg) = &titles[i];
+            tab_spans.push((x + 1, x + widths[i], i));
+            x += widths[i];
+            spans.push(Span::raw("│"));
+            let style = fg.map_or(Style::new(), |c| Style::new().fg(c));
+            spans.push(Span::styled(title.clone(), if tabs.active == i { style.add_modifier(on) } else { style }));
+        }
+        if end < titles.len() {
+            spans.push(marker("›"));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), bar);
+
+        let cursor = self.focus_main && focused;
+        let pad = Rect::new(body.x + 2, body.y + 1, body.width.saturating_sub(2), body.height.saturating_sub(1));
+        let mut plan = tabs.list.get(tabs.active).and_then(|t| match t {
+            Tab::View { path, text, rel: None, .. } => self.plan_view(path, text, pad.width as usize),
+            _ => None,
+        });
+        let t = &mut self.tabs.get_mut(&self.thread).unwrap().list[j];
+        (t.bar, t.body, t.spans) = (bar, body, tab_spans);
+        match t.list.get_mut(t.active) {
+            Some(Tab::Term { live, .. }) => {
+                if live.parser.lock().unwrap().screen().size() != (body.height, body.width) {
+                    let _ = live.resize(body.height, body.width);
+                }
+                let p = live.parser.lock().unwrap();
+                let mut pt = PseudoTerminal::new(p.screen());
+                if !cursor || p.screen().scrollback() > 0 {
+                    let mut c = tui_term::widget::Cursor::default();
+                    c.hide();
+                    pt = pt.cursor(c);
+                }
+                f.render_widget(pt, body);
+            }
+            Some(Tab::View { text, scroll, rel: Some(rel), .. }) => {
+                // The diff above, the file's path right-aligned on the body's last row.
+                let [d, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
+                f.render_widget(Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), d);
+                f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal::OVERLAY0)).right_aligned(), foot);
+            }
+            Some(Tab::View { scroll, .. }) if plan.is_some() => {
+                let lines = plan.take().unwrap_or_default();
+                *scroll = (*scroll).min(lines.len().saturating_sub(1) as u16);
+                f.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), pad);
+            }
+            Some(Tab::View { path, text, scroll, .. }) => {
+                let p = if path.extension().is_some_and(|e| e == "md") { Paragraph::new(md_lines(text)) } else { Paragraph::new(text.as_str()) };
+                f.render_widget(p.wrap(Wrap { trim: false }).scroll((*scroll, 0)), body);
+            }
+            None => f.render_widget(Paragraph::new("\n  Enter or click an agent to open its claude tab, or an output.md to read it."), body),
+        }
+    }
+
     fn draw(&mut self, f: &mut Frame) {
         let [top, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         let [side, divider, main] = Layout::horizontal([Constraint::Length(self.side_w.unwrap_or(SIDE_W)), Constraint::Length(1), Constraint::Min(0)]).areas(top);
-        let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(main);
         let border = if self.focus_main { pal::OVERLAY0 } else { pal::LAVENDER };
         // No box: a dim title row, then the tree inside a one-column margin.
         let inner = Rect::new(side.x + 1, side.y + 1, side.width.saturating_sub(2), side.height.saturating_sub(1));
-        if body != self.body {
-            resize_all(body);
+        if main != self.main {
+            self.main = main;
+            self.resize_all();
         }
-        self.divider = divider;
-        (self.screen, self.side, self.side_inner, self.tab_bar, self.body, self.hint) = (f.area(), side, inner, bar, body, hint);
+        (self.screen, self.side, self.side_inner, self.divider, self.hint) = (f.area(), side, inner, divider, hint);
         f.render_widget(Paragraph::new("spaces").style(Style::new().fg(pal::OVERLAY0)), Rect::new(inner.x, side.y, inner.width, 1));
         f.render_widget(Paragraph::new(vec![Line::from("┃"); divider.height as usize]).style(Style::new().fg(border)), divider);
 
@@ -1204,81 +1366,13 @@ impl App {
             self.pause_btns.push((rect, r.label.clone()));
         }
 
-        // Tab bar: thread name, then one tab per opened agent/viewer in this thread.
-        let mut spans = vec![Span::styled(format!(" {} ", self.thread), Style::new().fg(pal::CRUST).bg(pal::MAUVE))];
-        let pill = self.thread.chars().count() as u16 + 2;
-        let tabs = self.tabs.get(&self.thread);
-        let active = tabs.map_or(0, |t| t.active);
-        let mut titles = vec![];
-        for t in tabs.map(|t| t.list.as_slice()).unwrap_or_default() {
-            titles.push(match t {
-                Tab::Term { agent, live, stage, .. } if !live.alive() => (format!(" {} (exited) ", tail(agent)), Some(stage_color(*stage))),
-                Tab::Term { agent, stage, .. } => (format!(" {} ", tail(agent)), Some(stage_color(*stage))),
-                Tab::View { title, .. } => (format!(" {title} "), None),
-            });
+        // The thread's panes side by side, a dim "│" between them.
+        let rects = pane_rects(main, self.tabs.entry(self.thread.clone()).or_default().list.len());
+        if let [(l, _), _] = rects[..] {
+            f.render_widget(Paragraph::new(vec![Line::from("│"); main.height as usize]).style(Style::new().fg(pal::SURFACE1)), Rect::new(l.right(), main.y, 1, main.height));
         }
-        let widths: Vec<u16> = titles.iter().map(|(t, _)| 1 + t.chars().count() as u16).collect(); // "│" + title
-        let seen = (self.thread.clone(), active, titles.len());
-        let follow = self.tab_seen != seen;
-        self.tab_seen = seen;
-        let (first, end) = tab_window(&widths, self.tab_first, follow.then_some(active), bar.width.saturating_sub(pill));
-        self.tab_first = first;
-        self.tab_spans.clear();
-        let marker = |c| Span::styled(c, Style::new().fg(pal::OVERLAY0));
-        if first > 0 {
-            spans.push(marker("‹"));
-        }
-        let mut x = bar.x + pill + (first > 0) as u16;
-        for i in first..end {
-            let (title, fg) = &titles[i];
-            self.tab_spans.push((x + 1, x + widths[i]));
-            x += widths[i];
-            spans.push(Span::raw("│"));
-            let style = fg.map_or(Style::new(), |c| Style::new().fg(c));
-            spans.push(Span::styled(title.clone(), if tabs.is_some_and(|t| t.active == i) { style.add_modifier(Modifier::REVERSED | Modifier::BOLD) } else { style }));
-        }
-        if end < titles.len() {
-            spans.push(marker("›"));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), bar);
-
-        let focus_main = self.focus_main;
-        let pad = Rect::new(body.x + 2, body.y + 1, body.width.saturating_sub(2), body.height.saturating_sub(1));
-        let mut plan = self.tabs.get(&self.thread).and_then(|t| t.list.get(t.active)).and_then(|t| match t {
-            Tab::View { path, text, rel: None, .. } => self.plan_view(path, text, pad.width as usize),
-            _ => None,
-        });
-        match self.cur() {
-            Some(Tab::Term { live, .. }) => {
-                let live = live.clone();
-                if live.parser.lock().unwrap().screen().size() != (body.height, body.width) {
-                    let _ = live.resize(body.height, body.width);
-                }
-                let p = live.parser.lock().unwrap();
-                let mut pt = PseudoTerminal::new(p.screen());
-                if !focus_main || p.screen().scrollback() > 0 {
-                    let mut c = tui_term::widget::Cursor::default();
-                    c.hide();
-                    pt = pt.cursor(c);
-                }
-                f.render_widget(pt, body);
-            }
-            Some(Tab::View { text, scroll, rel: Some(rel), .. }) => {
-                // The diff above, the file's path right-aligned on the body's last row.
-                let [d, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
-                f.render_widget(Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), d);
-                f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal::OVERLAY0)).right_aligned(), foot);
-            }
-            Some(Tab::View { scroll, .. }) if plan.is_some() => {
-                let lines = plan.take().unwrap_or_default();
-                *scroll = (*scroll).min(lines.len().saturating_sub(1) as u16);
-                f.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), pad);
-            }
-            Some(Tab::View { path, text, scroll, .. }) => {
-                let p = if path.extension().is_some_and(|e| e == "md") { Paragraph::new(md_lines(text)) } else { Paragraph::new(text.as_str()) };
-                f.render_widget(p.wrap(Wrap { trim: false }).scroll((*scroll, 0)), body);
-            }
-            None => f.render_widget(Paragraph::new("\n  Enter or click an agent to open its claude tab, or an output.md to read it."), body),
+        for (j, (bar, body)) in rects.into_iter().enumerate() {
+            self.draw_pane(f, j, bar, body);
         }
 
         let viewing = matches!(self.cur(), Some(Tab::View { .. }));
@@ -1292,7 +1386,7 @@ impl App {
                 format!("{} agents running; quitting kills them. Quit? y/N", live_agents().len()),
                 Style::new().fg(pal::RED).add_modifier(Modifier::BOLD),
             ),
-            _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · q quit · C-o send C-o"),
+            _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · q quit · C-o send C-o"),
             _ if !self.focus_main => Span::raw("↑↓/jk move · Enter open/fold · ←→ fold · Tab back to tab · M-h/l tabs · M-t terminal · q quit · wheel scrolls"),
             _ if viewing => Span::raw("↑↓/jk PgUp/PgDn g/G scroll · Tab/Esc sidebar · M-h/l tabs · M-t terminal · C-o w close · C-o q quit"),
             _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · wheel scrollback"),
@@ -1474,6 +1568,10 @@ mod tests {
         KeyEvent::new(code, m)
     }
 
+    fn one_pane(list: Vec<Tab>) -> Panes {
+        Panes { list: vec![Tabs { list, ..Default::default() }], focus: 0 }
+    }
+
     #[test]
     fn live_status_beats_saved() {
         assert_eq!(agent_glyph_status(Some("working"), "done"), "running");
@@ -1557,37 +1655,33 @@ mod tests {
     fn alt_hl_cycles_tabs() {
         let view = || Tab::View { path: PathBuf::new(), title: String::new(), text: String::new(), scroll: 0, rel: None };
         let mut app = App::default();
-        app.tabs.insert(String::new(), Tabs { list: vec![view(), view()], active: 0 });
+        app.tabs.insert(String::new(), one_pane(vec![view(), view()]));
         app.on_key(key(KeyCode::Char('l'), KeyModifiers::ALT)); // from the sidebar
-        assert_eq!((app.tabs[""].active, app.focus_main), (1, true));
+        assert_eq!((app.tabs[""].list[0].active, app.focus_main), (1, true));
         app.on_key(key(KeyCode::Char('˙'), KeyModifiers::NONE));
-        assert_eq!(app.tabs[""].active, 0);
+        assert_eq!(app.tabs[""].list[0].active, 0);
     }
 
     #[test]
     fn tab_bar_follows_active_tab() {
         let view = |n: usize| Tab::View { path: PathBuf::new(), title: format!("tab-number-{n}"), text: String::new(), scroll: 0, rel: None };
         let mut app = App::default();
-        app.tabs.insert(String::new(), Tabs { list: (0..10).map(view).collect(), active: 0 });
+        app.tabs.insert(String::new(), one_pane((0..10).map(view).collect()));
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
-        assert_eq!(app.tab_first, 0);
+        assert_eq!(app.tabs[""].list[0].spans[0].2, 0);
         for _ in 0..9 {
             app.on_key(key(KeyCode::Char('l'), KeyModifiers::ALT));
         }
         term.draw(|f| app.draw(f)).unwrap();
-        assert!(app.tab_first > 0);
-        let (a, b) = *app.tab_spans.last().unwrap();
-        assert_eq!(app.tab_first + app.tab_spans.len(), 10); // the last tab is shown, fully
-        assert!(b <= app.tab_bar.right() && b - a == "tab-number-9".len() as u16 + 2);
-        // Wheel over the bar scrolls it without moving the active tab; a click maps through the offset.
-        let wheel = |kind| MouseEvent { kind, column: 50, row: 0, modifiers: KeyModifiers::NONE };
-        app.on_mouse(wheel(MouseEventKind::ScrollUp));
-        term.draw(|f| app.draw(f)).unwrap();
-        assert_eq!(app.tabs[""].active, 9);
-        let (a, _) = app.tab_spans[0];
+        let t = &app.tabs[""].list[0];
+        let (first, (a, b, last)) = (t.spans[0].2, *t.spans.last().unwrap());
+        assert!(first > 0 && last == 9); // the last tab is shown, fully
+        assert!(b <= t.bar.right() && b - a == "tab-number-9".len() as u16 + 2);
+        // A click on a tab maps through the scrolled window.
+        let (a, _, i) = t.spans[0];
         app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: a, row: 0, modifiers: KeyModifiers::NONE });
-        assert_eq!(app.tabs[""].active, app.tab_first);
+        assert_eq!(app.tabs[""].list[0].active, i);
     }
 
     #[test]
@@ -1612,7 +1706,7 @@ mod tests {
         app.agent_status.insert(("th".into(), "trace-auth".into()), "running");
         app.plans.insert(path.clone(), (flow, state));
         let tab = Tab::View { path, title: String::new(), text: text + "   start check-db in /repo\n", scroll: 0, rel: None };
-        app.tabs.insert(String::new(), Tabs { list: vec![tab], active: 0 });
+        app.tabs.insert(String::new(), one_pane(vec![tab]));
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let b = term.backend().buffer();
@@ -1627,16 +1721,49 @@ mod tests {
     #[test]
     fn tab_cap_evicts_oldest() {
         let mut app = App::default();
-        let paths = |t: &App, th: &str| t.tabs[th].list.iter().map(|t| if let Tab::View { path, .. } = t { path.clone() } else { PathBuf::new() }).collect::<Vec<_>>();
+        let paths = |t: &App, th: &str| t.tabs[th].list[0].list.iter().map(|t| if let Tab::View { path, .. } = t { path.clone() } else { PathBuf::new() }).collect::<Vec<_>>();
         for i in 1..=6 {
             app.open_view("t".into(), PathBuf::from(format!("/nope/{i}")));
         }
         let want: Vec<_> = (2..=6).map(|i| PathBuf::from(format!("/nope/{i}"))).collect();
-        assert_eq!((paths(&app, "t"), app.tabs["t"].active), (want.clone(), 4));
+        assert_eq!((paths(&app, "t"), app.tabs["t"].list[0].active), (want.clone(), 4));
         app.open_view("t".into(), PathBuf::from("/nope/2")); // already open: only activated
-        assert_eq!((paths(&app, "t"), app.tabs["t"].active), (want.clone(), 0));
+        assert_eq!((paths(&app, "t"), app.tabs["t"].list[0].active), (want.clone(), 0));
         app.open_view("u".into(), PathBuf::from("/nope/7"));
-        assert_eq!((paths(&app, "t"), app.tabs["u"].list.len()), (want, 1));
+        assert_eq!((paths(&app, "t"), app.tabs["u"].list[0].list.len()), (want, 1));
+    }
+
+    #[test]
+    fn split_gives_new_pane_own_tab_bar() {
+        let main = Rect::new(41, 0, 79, 19);
+        let widths: Vec<_> = pane_rects(main, 2).iter().map(|(bar, body)| (bar.x, bar.width, body.y, body.height)).collect();
+        assert_eq!(widths, [(41, 39, 1, 18), (81, 39, 1, 18)]);
+        let mut app = App { thread: "t".into(), ..Default::default() };
+        app.open_view("t".into(), PathBuf::from("/nope/1"));
+        app.open_view("t".into(), PathBuf::from("/nope/2"));
+        let p = app.tabs.get_mut("t").unwrap();
+        p.list.push(Tabs::default()); // what split does, then new_term; a viewer stands in for the shell
+        p.focus = 1;
+        app.open_view("t".into(), PathBuf::from("/nope/3"));
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let p = &app.tabs["t"];
+        assert_eq!(p.list.iter().map(|t| (t.list.len(), t.bar, t.spans.len())).collect::<Vec<_>>(), [(2, pane_rects(main, 2)[0].0, 2), (1, pane_rects(main, 2)[1].0, 1)]);
+        assert_eq!(term.backend().buffer().cell((80, 5)).unwrap().symbol(), "│");
+        app.split();
+        assert_eq!((app.tabs["t"].list.len(), app.msg.as_ref().unwrap().0.as_str()), (2, "max 2 panes"));
+        app.open_view("t".into(), PathBuf::from("/nope/1")); // open in pane 0: focused there, not opened twice
+        assert_eq!((app.tabs["t"].focus, app.tabs["t"].list[1].list.len()), (0, 1));
+        app.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+        app.thread = "u".into(); // another thread and back: both panes and the focus stay
+        term.draw(|f| app.draw(f)).unwrap();
+        app.thread = "t".into();
+        assert_eq!((app.tabs["t"].list.len(), app.tabs["t"].focus), (2, 1));
+        app.on_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('w'), KeyModifiers::NONE)); // pane 1's last tab: the pane goes
+        let p = &app.tabs["t"];
+        assert_eq!((p.list.len(), p.focus, p.list[0].list.len()), (1, 0, 2));
     }
 
     #[test]
@@ -1696,10 +1823,11 @@ mod tests {
         let tree = node(Kind::Space, "repo", vec![node(Kind::Output, "nope.md", vec![])]);
         let mut app = App::default();
         flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut app.rows);
-        (app.side_inner, app.body) = (Rect::new(1, 1, 34, 10), Rect::new(40, 2, 40, 10));
+        app.side_inner = Rect::new(1, 1, 34, 10);
         let click = |x, y| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
         app.on_mouse(click(5, 2)); // the output row: opens a viewer tab, focus stays on the sidebar
-        assert_eq!((app.tabs[""].list.len(), app.focus_main), (1, false));
+        assert_eq!((app.tabs[""].list[0].list.len(), app.focus_main), (1, false));
+        app.tabs.get_mut("").unwrap().list[0].body = Rect::new(40, 2, 40, 10);
         app.on_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
         assert_eq!(app.sel, 0); // j/k moved the sidebar selection
         app.on_mouse(click(50, 5)); // the body
@@ -1725,7 +1853,8 @@ mod tests {
     fn drag_copies_selection() {
         let mut app = App::default();
         app.buf = Buffer::with_lines(["side|hello world  ", "side|second line  ", "side|third        "]);
-        (app.side, app.body) = (Rect::new(0, 0, 5, 3), Rect::new(5, 0, 13, 3));
+        app.side = Rect::new(0, 0, 5, 3);
+        app.pane().body = Rect::new(5, 0, 13, 3);
         let ev = |kind, x, y| MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
         let (down, drag, up) = (MouseEventKind::Down(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::Up(MouseButton::Left));
         app.on_mouse(ev(down, 11, 0));
@@ -1745,7 +1874,8 @@ mod tests {
     #[test]
     fn divider_drag_resizes() {
         let mut app = App::default();
-        (app.side, app.divider, app.body) = (Rect::new(0, 0, 40, 5), Rect::new(40, 0, 1, 5), Rect::new(41, 0, 40, 5));
+        (app.side, app.divider) = (Rect::new(0, 0, 40, 5), Rect::new(40, 0, 1, 5));
+        app.pane().body = Rect::new(41, 0, 40, 5);
         let ev = |kind, x| MouseEvent { kind, column: x, row: 1, modifiers: KeyModifiers::NONE };
         let (down, drag, up) = (MouseEventKind::Down(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::Up(MouseButton::Left));
         app.on_mouse(ev(down, 40));
@@ -1765,7 +1895,8 @@ mod tests {
     fn sidebar_drag_selects_nothing() {
         let mut app = App::default();
         app.buf = Buffer::with_lines(["side|hello world  ", "side|second line  "]);
-        (app.side, app.body) = (Rect::new(0, 0, 5, 2), Rect::new(5, 0, 13, 2));
+        app.side = Rect::new(0, 0, 5, 2);
+        app.pane().body = Rect::new(5, 0, 13, 2);
         let ev = |kind, x, y| MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
         app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 2, 0));
         app.on_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 10, 1));
