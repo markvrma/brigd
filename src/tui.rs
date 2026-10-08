@@ -90,11 +90,11 @@ struct App {
     msg: Option<(String, Instant)>,
     ticks: u32,
     menu: Option<Menu>,
-    /// Threads whose agents are paused (the button reads RESUME). In memory only.
+    /// Threads whose agents are paused (their dot is filled). In memory only.
     paused: HashSet<String>,
     /// Shell tab registry key -> the thread its $BRIGD_THREAD names (strays run inside these).
     shell_thread: HashMap<(String, String), String>,
-    /// PAUSE/RESUME button rects from the last draw.
+    /// Pause dot rects from the last draw.
     pause_btns: Vec<(Rect, String)>,
     // Layout from the last draw, for mouse hit tests.
     screen: Rect,
@@ -907,13 +907,13 @@ impl App {
             f.render_widget(Paragraph::new(lines), inner);
         }
 
-        // PAUSE/RESUME at the right end of each visible thread row.
+        // Pause dot at the right end of each visible thread row: ○ running, ● paused (click resumes).
         self.pause_btns.clear();
         for (y, r) in shown.iter().map(|&(y, i)| (y, &self.rows[i])).filter(|(_, r)| r.kind == Kind::Thread) {
-            let label = if self.paused.contains(&r.label) { " RESUME " } else { " PAUSE " };
-            let w = label.len() as u16;
+            let label = if self.paused.contains(&r.label) { " ● " } else { " ○ " };
+            let w = label.chars().count() as u16;
             let rect = Rect::new(inner.right().saturating_sub(w).max(inner.x), inner.y + y as u16, w.min(inner.width), 1);
-            f.render_widget(Paragraph::new(label).style(Style::new().fg(pal::CRUST).bg(pal::RED).add_modifier(Modifier::BOLD)), rect);
+            f.render_widget(Paragraph::new(label).style(Style::new().fg(pal::RED)), rect);
             self.pause_btns.push((rect, r.label.clone()));
         }
 
