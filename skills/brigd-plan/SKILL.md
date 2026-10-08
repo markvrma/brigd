@@ -9,6 +9,9 @@ Turn a task into a **brigd flow**: stages that run one after another, where ever
 agent inside a stage runs in parallel as its own interactive Claude session. brigd
 starts stage N+1 only after every agent in stage N has written its result file.
 
+From Claude Code you may run `brigd <name> --flow <file>` yourself: it opens in a
+new herdr tab, tmux window or Terminal window and returns at once.
+
 ## Output contract
 
 Return **only** the flow JSON. No prose, no code fence, no comments.

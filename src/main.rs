@@ -10,9 +10,9 @@ mod tui;
 use runner::Res;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
@@ -30,6 +30,9 @@ const USAGE: &str = "usage:
   brigd                        open the TUI over all threads
   brigd <name> \"task\"          plan with the brigd-plan skill, confirm, run in the TUI
   brigd <name> --flow <file>   run a hand-written flow
+    ... --bg                   skip the confirm, open the TUI in a new herdr tab, tmux window
+                               or Terminal window and return; automatic without a TTY or
+                               under Claude Code, so Claude can run `brigd <name> --flow <file>`
   brigd ls                     list threads
   brigd status <name>          per-agent detail
   brigd resume <name>          continue a stopped thread in the TUI
@@ -96,7 +99,11 @@ fn main() {
 }
 
 fn real_main() -> Res<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    let bg_flag = args.iter().any(|a| a == "--bg");
+    args.retain(|a| a != "--bg");
+    let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let bg = background(bg_flag, tty, |k| env::var(k).ok());
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     match a.as_slice() {
         [] => tui::run(None),
@@ -109,17 +116,22 @@ fn real_main() -> Res<()> {
             if state.status == "done" {
                 return Err(format!("thread {name} is already done").into());
             }
+            // A thread saved with N at the confirm has no FLOWPLAN yet.
+            let plan = thread_dir(name).join("FLOWPLAN");
+            if !plan.exists() {
+                fs::write(plan, flow_text(&flow))?;
+            }
             run_in_tui(name, flow, state)
         }
         ["install-skill"] => install_skill(),
         [name, "--flow", file] => {
             let flow: Flow = serde_json::from_str(&fs::read_to_string(file)?)?;
             validate(&flow)?;
-            new_thread(name, flow)
+            new_thread(name, flow, bg)
         }
         [name, task] if !task.starts_with('-') => {
             check_new_thread(name)?;
-            new_thread(name, plan(task)?)
+            new_thread(name, plan(task)?, bg)
         }
         _ => Err(USAGE.into()),
     }
@@ -227,7 +239,7 @@ fn check_new_thread(name: &str) -> Res<()> {
     Ok(())
 }
 
-fn new_thread(name: &str, mut flow: Flow) -> Res<()> {
+fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     check_new_thread(name)?;
     let dir = thread_dir(name);
     fs::create_dir_all(&dir)?;
@@ -235,6 +247,14 @@ fn new_thread(name: &str, mut flow: Flow) -> Res<()> {
     let repo = env::current_dir()?.canonicalize()?.to_string_lossy().into_owned();
     let state = State { thread: name.into(), repo, status: "planned".into(), updated: now(), ..Default::default() };
     write_json(&dir.join("state.json"), &state)?;
+    if bg {
+        write_json(&flow_path, &flow)?;
+        let plan = dir.join("FLOWPLAN");
+        fs::write(&plan, flow_text(&flow))?;
+        let at = launch_bg(name, &state.repo)?;
+        println!("brigd: thread {name} running in {at}; FLOWPLAN at {}", plan.display());
+        return Ok(());
+    }
     loop {
         write_json(&flow_path, &flow)?;
         print_flow(&flow);
@@ -260,6 +280,108 @@ fn new_thread(name: &str, mut flow: Flow) -> Res<()> {
     }
 }
 
+// ---------- background launch ----------
+
+/// True when nobody can answer the y/N confirm or watch a fullscreen TUI here: `--bg`,
+/// no TTY on stdin/stdout, or Claude Code's Bash tool (it sets CLAUDECODE=1).
+fn background(bg_flag: bool, tty: bool, var: impl Fn(&str) -> Option<String>) -> bool {
+    bg_flag || !tty || var("CLAUDECODE").is_some_and(|v| !v.is_empty())
+}
+
+/// Vars Claude Code's Bash tool sets that describe the calling session (seen in its env).
+const PARENT_SESSION_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "AI_AGENT",
+];
+
+#[derive(Debug, PartialEq)]
+enum Surface {
+    Herdr(String),
+    Tmux,
+    Terminal,
+}
+
+/// Terminal surfaces that can host `brigd resume`, best first.
+fn surfaces(var: impl Fn(&str) -> Option<String>) -> Vec<Surface> {
+    let set = |k: &str| var(k).filter(|v| !v.is_empty());
+    let mut v = vec![];
+    if let (Some(_), Some(ws)) = (set("HERDR_ENV"), set("HERDR_WORKSPACE_ID")) {
+        v.push(Surface::Herdr(ws));
+    }
+    if set("TMUX").is_some() {
+        v.push(Surface::Tmux);
+    }
+    if cfg!(target_os = "macos") {
+        v.push(Surface::Terminal);
+    }
+    v
+}
+
+/// Opens `brigd resume <name>` in a new terminal surface and says where. The herdr
+/// server, tmux server or Terminal.app owns that process, so it is detached from this
+/// one and from the caller's terminal; brigd only runs short helper commands.
+fn launch_bg(name: &str, repo: &str) -> Res<String> {
+    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    // A tmux window inherits this process's env: drop the calling Claude session's vars so agents start clean.
+    let unset: String = PARENT_SESSION_VARS.iter().map(|v| format!("-u {v} ")).collect();
+    let cmd = format!("env {unset}{} resume {name}", q(&env::current_exe()?.to_string_lossy()));
+    let label = format!("brigd-{name}");
+    let mut errs = vec![];
+    for s in surfaces(|k| env::var(k).ok()) {
+        let r = match &s {
+            Surface::Herdr(ws) => herdr_tab(ws, repo, &label, &cmd),
+            // `|| read` keeps the window open on an error so it can be read.
+            Surface::Tmux => run_ok(Command::new("tmux").args(["new-window", "-d", "-n", &label, "-c", repo, &format!("{cmd} || read _")]))
+                .map(|_| format!("tmux window {label} (tmux select-window -t {label})")),
+            Surface::Terminal => {
+                let sh = format!("cd {} && {cmd}", q(repo));
+                let script = format!("tell application \"Terminal\" to do script \"{}\"", sh.replace('\\', "\\\\").replace('"', "\\\""));
+                run_ok(Command::new("osascript").args(["-e", &script])).map(|_| "a new Terminal window".to_string())
+            }
+        };
+        match r {
+            Ok(at) => return Ok(at),
+            Err(e) => errs.push(format!("{s:?}: {e}")),
+        }
+    }
+    let why = if errs.is_empty() { "not in herdr or tmux, not on macOS".into() } else { errs.join("; ") };
+    Err(format!("no terminal to run thread {name} in ({why}); it is saved, `brigd resume {name}` in a terminal runs it").into())
+}
+
+/// Opens an unfocused herdr tab in workspace `ws` and runs `cmd` in its shell.
+fn herdr_tab(ws: &str, repo: &str, label: &str, cmd: &str) -> Res<String> {
+    let out = run_ok(Command::new("herdr").args(["tab", "create", "--workspace", ws, "--cwd", repo, "--label", label, "--no-focus"]))?;
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    let pane = v["result"]["root_pane"]["pane_id"].as_str().ok_or_else(|| format!("no root pane in {out}"))?;
+    // A fresh pane reports busy for a few seconds while its shell starts.
+    let mut last = String::new();
+    for _ in 0..20 {
+        match run_ok(Command::new("herdr").args(["pane", "run", pane, cmd])) {
+            Ok(_) => return Ok(format!("herdr tab {label} (workspace {ws}, pane {pane})")),
+            Err(e) => last = e.to_string(),
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!("herdr pane run {pane}: {last}").into())
+}
+
+/// Runs a short helper command; returns its stdout, or its stderr as the error.
+fn run_ok(c: &mut Command) -> Res<String> {
+    let out = c.stdin(Stdio::null()).output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string().into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 // ---------- planning ----------
 
 fn plan(task: &str) -> Res<Flow> {
@@ -267,7 +389,10 @@ fn plan(task: &str) -> Res<Flow> {
     for attempt in 0..2 {
         eprintln!("planning with opus (brigd-plan)…");
         // ponytail: skill text passed as system prompt so it works uninstalled; install-skill is for interactive /brigd-plan.
-        let out = Command::new("claude")
+        let mut cmd = Command::new("claude");
+        // brigd may run under Claude Code; the planner is a session of its own.
+        PARENT_SESSION_VARS.iter().for_each(|v| _ = cmd.env_remove(v));
+        let out = cmd
             .args(["-p", &prompt, "--model", "opus", "--effort", "high", "--output-format", "json"])
             .args(["--no-session-persistence", "--json-schema", SCHEMA, "--tools", "Read,Grep,Glob"])
             .args(["--append-system-prompt", SKILL])
@@ -847,6 +972,26 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
             assert!(stray_passthrough(&v(a)), "{a:?}");
         }
         let _ = fs::remove_dir_all(d.parent().unwrap());
+    }
+
+    #[test]
+    fn background_decision() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string());
+        assert!(!background(false, true, env(&[])));
+        assert!(background(true, true, env(&[])));
+        assert!(background(false, false, env(&[])));
+        assert!(background(false, true, env(&[("CLAUDECODE", "1")])));
+        assert!(!background(false, true, env(&[("CLAUDECODE", "")])));
+        let mac = |mut v: Vec<Surface>| {
+            if cfg!(target_os = "macos") {
+                v.push(Surface::Terminal);
+            }
+            v
+        };
+        const ALL: &[(&str, &str)] = &[("HERDR_ENV", "1"), ("HERDR_WORKSPACE_ID", "w1"), ("TMUX", "/tmp/t,1,0")];
+        assert_eq!(surfaces(env(ALL)), mac(vec![Surface::Herdr("w1".into()), Surface::Tmux]));
+        assert_eq!(surfaces(env(&[("HERDR_ENV", "1")])), mac(vec![]));
+        assert_eq!(surfaces(env(&[])), mac(vec![]));
     }
 
     #[test]
