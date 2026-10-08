@@ -14,7 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use std::{env, fs};
 use tui_term::widget::PseudoTerminal;
 
-const SIDE_W: u16 = 36;
+const SIDE_W: u16 = 40;
+/// Sidebar columns per tree level.
+const INDENT: usize = 3;
 const REFRESH: Duration = Duration::from_millis(700);
 
 /// (space, node path): a thread spanning spaces shows under each, folded separately.
@@ -275,14 +277,38 @@ fn flatten(n: &Node, depth: usize, space: &Path, thread: &str, toggled: &HashSet
     }
 }
 
+/// The rows that fit in `h` sidebar lines from row `offset`, as (line, row index).
+/// A blank line goes above each space and thread to keep the tree airy.
+fn layout(rows: &[Row], offset: usize, h: usize) -> Vec<(usize, usize)> {
+    let mut y = 0;
+    let mut out = vec![];
+    for (i, r) in rows.iter().enumerate().skip(offset) {
+        if i > offset && matches!(r.kind, Kind::Space | Kind::Thread) {
+            y += 1;
+        }
+        if y >= h {
+            break;
+        }
+        out.push((y, i));
+        y += 1;
+    }
+    out
+}
+
+/// The smallest offset that still shows the last row in `h` lines.
+fn max_offset(rows: &[Row], h: usize) -> usize {
+    (0..rows.len()).find(|&o| layout(rows, o, h).last().is_some_and(|&(_, i)| i + 1 == rows.len())).unwrap_or(0)
+}
+
 /// The sidebar row under a click, and whether the click hit its fold arrow.
 fn hit(inner: Rect, offset: usize, rows: &[Row], col: u16, row: u16) -> Option<(usize, bool)> {
     if !inner.contains(Position { x: col, y: row }) {
         return None;
     }
-    let i = offset + (row - inner.y) as usize;
-    let r = rows.get(i)?;
-    let arrow_x = (r.depth * 2) as u16;
+    let dy = (row - inner.y) as usize;
+    let i = layout(rows, offset, inner.height as usize).into_iter().find(|&(y, _)| y == dy)?.1;
+    let r = &rows[i];
+    let arrow_x = (r.depth * INDENT) as u16;
     let x = col - inner.x;
     Some((i, r.folder && x >= arrow_x && x < arrow_x + 2))
 }
@@ -416,7 +442,10 @@ impl App {
         self.sel = (self.sel as isize + d).clamp(0, self.rows.len() as isize - 1) as usize;
         self.space = self.rows[self.sel].space.clone();
         let h = (self.side_inner.height as usize).max(1);
-        self.offset = self.offset.clamp(self.sel.saturating_sub(h - 1), self.sel);
+        self.offset = self.offset.min(self.sel);
+        while self.offset < self.sel && !layout(&self.rows, self.offset, h).iter().any(|&(_, i)| i == self.sel) {
+            self.offset += 1;
+        }
     }
 
     fn toggle(&mut self, i: usize) {
@@ -774,7 +803,7 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let d: i32 = if m.kind == MouseEventKind::ScrollUp { -3 } else { 3 };
                 if self.side.contains(at) {
-                    let max = self.rows.len().saturating_sub(self.side_inner.height as usize) as i32;
+                    let max = max_offset(&self.rows, self.side_inner.height as usize) as i32;
                     self.offset = (self.offset as i32 + d).clamp(0, max.max(0)) as usize;
                 } else if self.body.contains(at) {
                     match self.cur() {
@@ -810,7 +839,7 @@ impl App {
             (true, true) => "▾ ",
             (true, false) => "▸ ",
         };
-        let mut spans = vec![Span::raw(format!("{}{arrow}", "  ".repeat(r.depth)))];
+        let mut spans = vec![Span::raw(format!("{}{arrow}", " ".repeat(r.depth * INDENT)))];
         let mut label = Style::new();
         match r.kind {
             Kind::Agent => {
@@ -856,7 +885,7 @@ impl App {
         let [side, main] = Layout::horizontal([Constraint::Length(SIDE_W), Constraint::Min(0)]).areas(top);
         let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(main);
         let border = if self.focus_main { pal::SURFACE1 } else { pal::LAVENDER };
-        let block = Block::bordered().title(" spaces ").border_style(Style::new().fg(border));
+        let block = Block::bordered().title(" spaces ").border_style(Style::new().fg(border)).padding(Padding::horizontal(1));
         let inner = block.inner(side);
         if body != self.body {
             resize_all(body);
@@ -865,8 +894,13 @@ impl App {
         f.render_widget(block, side);
 
         let h = inner.height as usize;
-        self.offset = self.offset.min(self.rows.len().saturating_sub(h));
-        let lines: Vec<Line> = self.rows.iter().enumerate().skip(self.offset).take(h).map(|(i, r)| self.row_line(r, i == self.sel)).collect();
+        self.offset = self.offset.min(max_offset(&self.rows, h));
+        let shown = layout(&self.rows, self.offset, h);
+        let mut lines: Vec<Line> = vec![];
+        for &(y, i) in &shown {
+            lines.resize(y, Line::default());
+            lines.push(self.row_line(&self.rows[i], i == self.sel));
+        }
         if lines.is_empty() {
             f.render_widget(Paragraph::new("no threads yet\n\nbrigd <name> \"task\""), inner);
         } else {
@@ -875,10 +909,10 @@ impl App {
 
         // PAUSE/RESUME at the right end of each visible thread row.
         self.pause_btns.clear();
-        for (n, r) in self.rows.iter().enumerate().skip(self.offset).take(h).filter(|(_, r)| r.kind == Kind::Thread) {
+        for (y, r) in shown.iter().map(|&(y, i)| (y, &self.rows[i])).filter(|(_, r)| r.kind == Kind::Thread) {
             let label = if self.paused.contains(&r.label) { " RESUME " } else { " PAUSE " };
             let w = label.len() as u16;
-            let rect = Rect::new(inner.right().saturating_sub(w).max(inner.x), inner.y + (n - self.offset) as u16, w.min(inner.width), 1);
+            let rect = Rect::new(inner.right().saturating_sub(w).max(inner.x), inner.y + y as u16, w.min(inner.width), 1);
             f.render_widget(Paragraph::new(label).style(Style::new().fg(pal::CRUST).bg(pal::RED).add_modifier(Modifier::BOLD)), rect);
             self.pause_btns.push((rect, r.label.clone()));
         }
@@ -1157,15 +1191,17 @@ mod tests {
         // Spaces and threads start open, agents folded.
         let labels: Vec<_> = rows.iter().map(|r| (r.depth, r.label.as_str(), r.thread.as_str())).collect();
         assert_eq!(labels, [(0, "repo", ""), (1, "t", "t"), (2, "a", "t"), (2, "b", "t")]);
-        let inner = Rect::new(1, 1, 34, 3); // rows 1..=3 visible
+        let inner = Rect::new(1, 1, 34, 4); // lines 1..=4: repo, blank, t, a
         assert_eq!(hit(inner, 0, &rows, 5, 1), Some((0, false)));
-        assert_eq!(hit(inner, 1, &rows, 10, 2), Some((2, false))); // scrolled by one
-        assert_eq!(hit(inner, 0, &rows, 1 + 4, 3), Some((2, true))); // depth 2 arrow at x 4..6
-        assert_eq!(hit(inner, 0, &rows, 1 + 6, 3), Some((2, false)));
-        assert_eq!(hit(inner, 1, &rows, 1 + 4, 3), Some((3, false))); // "b" has no children: no arrow
-        assert_eq!(hit(inner, 2, &rows, 5, 3), None); // past the last row
-        assert_eq!(hit(inner, 0, &rows, 5, 4), None); // below the list
+        assert_eq!(hit(inner, 0, &rows, 5, 2), None); // the blank line above a thread
+        assert_eq!(hit(inner, 1, &rows, 10, 2), Some((2, false))); // scrolled by one: no blank above the top row
+        assert_eq!(hit(inner, 0, &rows, 1 + 6, 4), Some((2, true))); // depth 2 arrow at x 6..8
+        assert_eq!(hit(inner, 0, &rows, 1 + 8, 4), Some((2, false)));
+        assert_eq!(hit(inner, 1, &rows, 1 + 6, 3), Some((3, false))); // "b" has no children: no arrow
+        assert_eq!(hit(inner, 3, &rows, 5, 2), None); // past the last row
+        assert_eq!(hit(inner, 0, &rows, 5, 5), None); // below the list
         assert_eq!(hit(inner, 0, &rows, 0, 1), None); // on the border
+        assert_eq!(max_offset(&rows, 3), 1); // offset 0 shows repo, blank, t: b is cut off
         // Unfolding agent "a" shows its output.md.
         let toggled = HashSet::from([(tree.path.clone(), PathBuf::from("/a"))]);
         let mut rows = Vec::new();
@@ -1200,15 +1236,15 @@ mod tests {
         let click = |b, x, y| MouseEvent { kind: MouseEventKind::Down(b), column: x, row: y, modifiers: KeyModifiers::NONE };
         app.on_mouse(click(MouseButton::Right, 5, 1)); // the space row: no menu
         assert!(app.menu.is_none());
-        app.on_mouse(click(MouseButton::Right, 5, 3)); // the agent row
+        app.on_mouse(click(MouseButton::Right, 5, 4)); // the agent row, below the thread's blank line
         let m = app.menu.as_ref().unwrap();
-        assert_eq!((m.thread.as_str(), m.agent.as_str(), m.rect.y), ("t", "a", 3));
+        assert_eq!((m.thread.as_str(), m.agent.as_str(), m.rect.y), ("t", "a", 4));
         app.on_mouse(click(MouseButton::Left, 50, 8)); // elsewhere: closes, opens nothing
         assert!(app.menu.is_none() && app.tabs.is_empty());
-        app.on_mouse(click(MouseButton::Right, 5, 3));
+        app.on_mouse(click(MouseButton::Right, 5, 4));
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.menu.is_none());
-        app.on_mouse(click(MouseButton::Right, 97, 3)); // at the screen edge: the menu is shifted left
+        app.on_mouse(click(MouseButton::Right, 97, 4)); // at the screen edge: the menu is shifted left
         assert_eq!(app.menu.as_ref().unwrap().rect.right(), 100);
     }
 
