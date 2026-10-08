@@ -235,8 +235,30 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
     }
 }
 
+/// Catppuccin Mocha (catppuccin.com/palette), the TUI's colors.
+mod pal {
+    use ratatui::style::Color::{self, Rgb};
+    pub const MAUVE: Color = Rgb(0xcb, 0xa6, 0xf7);
+    pub const PINK: Color = Rgb(0xf5, 0xc2, 0xe7);
+    pub const RED: Color = Rgb(0xf3, 0x8b, 0xa8);
+    pub const PEACH: Color = Rgb(0xfa, 0xb3, 0x87);
+    pub const YELLOW: Color = Rgb(0xf9, 0xe2, 0xaf);
+    pub const GREEN: Color = Rgb(0xa6, 0xe3, 0xa1);
+    pub const TEAL: Color = Rgb(0x94, 0xe2, 0xd5);
+    pub const SKY: Color = Rgb(0x89, 0xdc, 0xeb);
+    pub const BLUE: Color = Rgb(0x89, 0xb4, 0xfa);
+    pub const LAVENDER: Color = Rgb(0xb4, 0xbe, 0xfe);
+    pub const TEXT: Color = Rgb(0xcd, 0xd6, 0xf4);
+    pub const SUBTEXT0: Color = Rgb(0xa6, 0xad, 0xc8);
+    pub const OVERLAY0: Color = Rgb(0x6c, 0x70, 0x86);
+    pub const SURFACE1: Color = Rgb(0x45, 0x47, 0x5a);
+    pub const SURFACE0: Color = Rgb(0x31, 0x32, 0x44);
+    pub const MANTLE: Color = Rgb(0x18, 0x18, 0x25);
+    pub const CRUST: Color = Rgb(0x11, 0x11, 0x1b);
+}
+
 /// Agent rows/tabs are tinted by stage; avoids the status-glyph and selection colors.
-const STAGE_COLORS: [Color; 6] = [Color::Magenta, Color::Yellow, Color::LightBlue, Color::Indexed(208), Color::LightMagenta, Color::Indexed(37)];
+const STAGE_COLORS: [Color; 6] = [pal::MAUVE, pal::YELLOW, pal::BLUE, pal::PEACH, pal::PINK, pal::TEAL];
 
 fn stage_color(stage: Option<usize>) -> Color {
     stage.map_or(Color::Reset, |s| STAGE_COLORS[s % STAGE_COLORS.len()])
@@ -794,12 +816,12 @@ impl App {
             Kind::Agent => {
                 let st = self.agent_status.get(&(r.thread.clone(), tree::agent_id(&r.path, &r.label))).copied().unwrap_or("off");
                 let (g, style) = match st {
-                    "running" => ("● ", Style::new().fg(Color::Green)),
-                    "idle" => ("◦ ", Style::new().fg(Color::Green)),
-                    "blocked" => ("! ", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)),
-                    "done" => ("✓ ", Style::new().fg(Color::Blue)),
-                    "failed" => ("✗ ", Style::new().fg(Color::Red)),
-                    _ => ("○ ", Style::new().fg(Color::DarkGray)),
+                    "running" => ("● ", Style::new().fg(pal::GREEN)),
+                    "idle" => ("◦ ", Style::new().fg(pal::GREEN)),
+                    "blocked" => ("! ", Style::new().fg(pal::RED).add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)),
+                    "done" => ("✓ ", Style::new().fg(pal::BLUE)),
+                    "failed" => ("✗ ", Style::new().fg(pal::RED)),
+                    _ => ("○ ", Style::new().fg(pal::OVERLAY0)),
                 };
                 label = if st == "blocked" { style } else { label.fg(stage_color(r.stage)) };
                 spans.push(Span::styled(g, style));
@@ -807,20 +829,24 @@ impl App {
                     spans.push(Span::styled(format!("{}·", s + 1), Style::new().fg(stage_color(r.stage))));
                 }
             }
-            Kind::Output => label = label.fg(Color::Cyan),
-            Kind::Diff => label = label.fg(Color::Yellow),
-            _ => label = label.add_modifier(Modifier::BOLD),
+            Kind::Output => label = label.fg(pal::SKY),
+            Kind::Diff => label = label.fg(pal::YELLOW),
+            Kind::Space => label = label.fg(pal::MAUVE).add_modifier(Modifier::BOLD),
+            Kind::Thread => label = label.fg(pal::TEXT).add_modifier(Modifier::BOLD),
+            _ => label = label.fg(pal::SUBTEXT0),
         }
         let slash = if matches!(r.kind, Kind::Output | Kind::Diff) { "" } else { "/" };
         spans.push(Span::styled(format!("{}{slash}", r.label), label));
         if r.kind == Kind::Thread {
             let st = self.thread_status.get(&r.path).map(String::as_str).unwrap_or("");
-            spans.push(Span::styled(format!(" {st}"), Style::new().fg(Color::DarkGray)));
+            spans.push(Span::styled(format!(" {st}"), Style::new().fg(pal::OVERLAY0)));
         }
         let line = Line::from(spans);
         match (selected, self.focus_main) {
             (true, false) => line.style(Style::new().add_modifier(Modifier::REVERSED)),
-            (true, true) => line.style(Style::new().bg(Color::DarkGray)),
+            (true, true) => line.style(Style::new().bg(pal::SURFACE1)),
+            // The space (repo or worktree) whose tabs show.
+            _ if r.kind == Kind::Space && r.space == self.space => line.style(Style::new().bg(pal::SURFACE0)),
             _ => line,
         }
     }
@@ -829,7 +855,7 @@ impl App {
         let [top, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         let [side, main] = Layout::horizontal([Constraint::Length(SIDE_W), Constraint::Min(0)]).areas(top);
         let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(main);
-        let border = if self.focus_main { Color::DarkGray } else { Color::Cyan };
+        let border = if self.focus_main { pal::SURFACE1 } else { pal::LAVENDER };
         let block = Block::bordered().title(" spaces ").border_style(Style::new().fg(border));
         let inner = block.inner(side);
         if body != self.body {
@@ -853,13 +879,13 @@ impl App {
             let label = if self.paused.contains(&r.label) { " RESUME " } else { " PAUSE " };
             let w = label.len() as u16;
             let rect = Rect::new(inner.right().saturating_sub(w).max(inner.x), inner.y + (n - self.offset) as u16, w.min(inner.width), 1);
-            f.render_widget(Paragraph::new(label).style(Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)), rect);
+            f.render_widget(Paragraph::new(label).style(Style::new().fg(pal::CRUST).bg(pal::RED).add_modifier(Modifier::BOLD)), rect);
             self.pause_btns.push((rect, r.label.clone()));
         }
 
         // Tab bar: space name, then one tab per opened agent/viewer in this space.
         let space = self.space.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut spans = vec![Span::styled(format!(" {space} "), Style::new().fg(Color::Black).bg(Color::Cyan))];
+        let mut spans = vec![Span::styled(format!(" {space} "), Style::new().fg(pal::CRUST).bg(pal::MAUVE))];
         let mut x = bar.x + space.chars().count() as u16 + 2;
         self.tab_spans.clear();
         let tabs = self.tabs.get(&self.space);
@@ -899,7 +925,7 @@ impl App {
                 // The diff above, the file's path right-aligned on the body's last row.
                 let [d, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
                 f.render_widget(Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), d);
-                f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(Color::DarkGray)).right_aligned(), foot);
+                f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal::OVERLAY0)).right_aligned(), foot);
             }
             Some(Tab::View { path, text, scroll, .. }) => {
                 let p = if path.extension().is_some_and(|e| e == "md") { Paragraph::new(md_lines(text)) } else { Paragraph::new(text.as_str()) };
@@ -910,22 +936,22 @@ impl App {
 
         let viewing = matches!(self.cur(), Some(Tab::View { .. }));
         let text = match &self.msg {
-            Some((m, t)) if t.elapsed() < Duration::from_secs(5) => Span::styled(m.clone(), Style::new().fg(Color::Yellow)),
+            Some((m, t)) if t.elapsed() < Duration::from_secs(5) => Span::styled(m.clone(), Style::new().fg(pal::YELLOW)),
             _ if self.confirm_quit => Span::styled(
                 format!("{} agents running; quitting kills them. Quit? y/N", live_agents().len()),
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::new().fg(pal::RED).add_modifier(Modifier::BOLD),
             ),
             _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · q quit · C-o send C-o"),
             _ if !self.focus_main => Span::raw("↑↓/jk move · Enter open/fold · ←→ fold · Tab back to tab · M-h/l tabs · M-t terminal · q quit · wheel scrolls"),
             _ if viewing => Span::raw("↑↓/jk PgUp/PgDn g/G scroll · Tab/Esc sidebar · M-h/l tabs · M-t terminal · C-o w close · C-o q quit"),
             _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · wheel scrollback"),
         };
-        f.render_widget(Paragraph::new(Line::from(text).style(Style::new().fg(Color::Gray).bg(Color::Black))), hint);
+        f.render_widget(Paragraph::new(Line::from(text).style(Style::new().fg(pal::SUBTEXT0).bg(pal::MANTLE))), hint);
 
         if let Some(m) = &self.menu {
             let r = m.rect.intersection(f.area());
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(MENU_ITEM).style(Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)), r);
+            f.render_widget(Paragraph::new(MENU_ITEM).style(Style::new().fg(pal::CRUST).bg(pal::RED).add_modifier(Modifier::BOLD)), r);
         }
 
         if let Some((r, a, Some(b))) = self.drag {
@@ -974,9 +1000,9 @@ fn fresh_name<'a>(taken: impl Iterator<Item = &'a str>) -> String {
 fn diff_lines(text: &str) -> Vec<Line<'_>> {
     text.lines()
         .map(|l| match l.as_bytes().first() {
-            Some(b'+') => Line::styled(l, Style::new().fg(Color::Green)),
-            Some(b'-') => Line::styled(l, Style::new().fg(Color::Red)),
-            Some(b'@') if l.starts_with("@@") => Line::styled(l, Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM)),
+            Some(b'+') => Line::styled(l, Style::new().fg(pal::GREEN)),
+            Some(b'-') => Line::styled(l, Style::new().fg(pal::RED)),
+            Some(b'@') if l.starts_with("@@") => Line::styled(l, Style::new().fg(pal::SKY).add_modifier(Modifier::DIM)),
             _ => Line::raw(l),
         })
         .collect()
@@ -984,7 +1010,7 @@ fn diff_lines(text: &str) -> Vec<Line<'_>> {
 
 /// Markdown → styled lines, one per source line so scroll bounds match `text.lines()`.
 fn md_lines(text: &str) -> Vec<Line<'static>> {
-    let (mut code, dim) = (false, Style::new().fg(Color::DarkGray));
+    let (mut code, dim) = (false, Style::new().fg(pal::OVERLAY0));
     text.lines()
         .map(|l| {
             let t = l.trim_start();
@@ -994,10 +1020,10 @@ fn md_lines(text: &str) -> Vec<Line<'static>> {
                 return Line::styled("─".repeat(40), dim);
             }
             if code {
-                return Line::styled(l.to_string(), Style::new().fg(Color::LightYellow).bg(Color::Rgb(30, 30, 30)));
+                return Line::styled(l.to_string(), Style::new().fg(pal::PEACH).bg(pal::SURFACE0));
             }
             if let Some(n) = (1..=6).find(|&n| t.starts_with(&format!("{} ", "#".repeat(n)))) {
-                let c = [Color::Magenta, Color::Cyan, Color::Blue][(n - 1).min(2)];
+                let c = [pal::MAUVE, pal::SKY, pal::BLUE][(n - 1).min(2)];
                 return Line::from(inline(&t[n + 1..], Style::new().fg(c).add_modifier(Modifier::BOLD)));
             }
             if t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_')) {
@@ -1005,7 +1031,7 @@ fn md_lines(text: &str) -> Vec<Line<'static>> {
             }
             if let Some(q) = t.strip_prefix('>') {
                 let mut v = vec![Span::raw(ind.to_string()), Span::styled("│ ", dim)];
-                v.extend(inline(q.trim_start(), Style::new().fg(Color::Gray).add_modifier(Modifier::ITALIC)));
+                v.extend(inline(q.trim_start(), Style::new().fg(pal::SUBTEXT0).add_modifier(Modifier::ITALIC)));
                 return Line::from(v);
             }
             let num = t.find(". ").filter(|&i| i > 0 && t[..i].bytes().all(|b| b.is_ascii_digit()));
@@ -1016,7 +1042,7 @@ fn md_lines(text: &str) -> Vec<Line<'static>> {
             } else {
                 return Line::from([vec![Span::raw(ind.to_string())], inline(t, Style::new())].concat());
             };
-            Line::from([vec![Span::raw(ind.to_string()), Span::styled(mark + " ", Style::new().fg(Color::Yellow))], inline(rest, Style::new())].concat())
+            Line::from([vec![Span::raw(ind.to_string()), Span::styled(mark + " ", Style::new().fg(pal::YELLOW))], inline(rest, Style::new())].concat())
         })
         .collect()
 }
@@ -1035,7 +1061,7 @@ fn inline(s: &str, base: Style) -> Vec<Span<'static>> {
         if c == '`' {
             if let Some(e) = r.find('`') {
                 flush(&mut buf, &mut out);
-                out.push(Span::styled(r[..e].to_string(), Style::new().fg(Color::LightYellow).bg(Color::Rgb(30, 30, 30))));
+                out.push(Span::styled(r[..e].to_string(), Style::new().fg(pal::PEACH).bg(pal::SURFACE0)));
                 rest = &r[e + 1..];
                 continue;
             }
@@ -1056,7 +1082,7 @@ fn inline(s: &str, base: Style) -> Vec<Span<'static>> {
         } else if c == '[' {
             if let Some((e, u)) = r.find("](").and_then(|e| r[e + 2..].find(')').map(|u| (e, e + 2 + u))) {
                 flush(&mut buf, &mut out);
-                out.extend(inline(&r[..e], base.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)));
+                out.extend(inline(&r[..e], base.fg(pal::SKY).add_modifier(Modifier::UNDERLINED)));
                 rest = &r[u + 1..];
                 continue;
             }
@@ -1118,7 +1144,7 @@ mod tests {
     fn diff_colors() {
         let l = diff_lines("@@ -1,2 +1,2 @@\n a\n-b\n+c");
         let fg: Vec<_> = l.iter().map(|l| l.style.fg).collect();
-        assert_eq!(fg, [Some(Color::Cyan), None, Some(Color::Red), Some(Color::Green)]);
+        assert_eq!(fg, [Some(pal::SKY), None, Some(pal::RED), Some(pal::GREEN)]);
     }
 
     #[test]
