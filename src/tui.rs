@@ -866,6 +866,10 @@ impl App {
         }
         let slash = if matches!(r.kind, Kind::Output | Kind::Diff) { "" } else { "/" };
         spans.push(Span::styled(format!("{}{slash}", r.label), label));
+        if let Some((add, del)) = (r.kind == Kind::Diff).then(|| tree::diff_stat(&r.path)).flatten() {
+            spans.push(Span::styled(format!(" +{add}"), Style::new().fg(pal::GREEN)));
+            spans.push(Span::styled(format!(" -{del}"), Style::new().fg(pal::RED)));
+        }
         if r.kind == Kind::Thread {
             let st = self.thread_status.get(&r.path).map(String::as_str).unwrap_or("");
             spans.push(Span::styled(format!(" {st}"), Style::new().fg(pal::OVERLAY0)));

@@ -4,7 +4,7 @@
 
 use crate::runner::Res;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -136,11 +136,13 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
 
 /// Transcript path → (bytes parsed, up to the last full line; files it changed so far).
 static PARSED: Mutex<BTreeMap<PathBuf, (u64, Vec<PathBuf>)>> = Mutex::new(BTreeMap::new());
-/// Agent dir → (when checked; its base commit and the files `git diff --name-only` lists vs it).
-type Names = (Instant, Option<(String, HashSet<PathBuf>)>);
+/// Agent dir → (when checked; its base commit and the files `git diff --numstat` lists vs it,
+/// with their (added, removed) line counts, "-" for binary).
+type Names = (Instant, Option<(String, HashMap<PathBuf, (String, String)>)>);
 static NAMES: Mutex<BTreeMap<PathBuf, Names>> = Mutex::new(BTreeMap::new());
-/// Diff node path → (agent cwd, base commit, file path relative to the cwd).
-static VIEWS: Mutex<BTreeMap<PathBuf, (PathBuf, String, String)>> = Mutex::new(BTreeMap::new());
+/// Diff node path → (agent cwd, base commit, file path relative to the cwd, (added, removed)).
+type View = (PathBuf, String, String, (String, String));
+static VIEWS: Mutex<BTreeMap<PathBuf, View>> = Mutex::new(BTreeMap::new());
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let o = Command::new("git").arg("-C").arg(cwd).args(args).output().ok().filter(|o| o.status.success())?;
@@ -149,9 +151,25 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 
 /// What a Diff node shows: (path relative to the agent's cwd, `git diff` of it vs the agent's base).
 pub fn diff_view(key: &Path) -> Option<(String, String)> {
-    let (cwd, base, rel) = VIEWS.lock().unwrap().get(key).cloned()?;
+    let (cwd, base, rel, _) = VIEWS.lock().unwrap().get(key).cloned()?;
     let text = git(&cwd, &["diff", "--no-color", &base, "--", &rel]).unwrap_or_default();
     Some((rel, text))
+}
+
+/// A Diff node's (added, removed) line counts vs the agent's base.
+pub fn diff_stat(key: &Path) -> Option<(String, String)> {
+    VIEWS.lock().unwrap().get(key).map(|v| v.3.clone())
+}
+
+/// `git diff --numstat -z --no-renames` → path → (added, removed).
+fn numstat(out: &str, cwd: &Path) -> HashMap<PathBuf, (String, String)> {
+    out.split('\0')
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let (a, d, n) = (f.next()?, f.next()?, f.next()?);
+            Some((cwd.join(n), (a.into(), d.into())))
+        })
+        .collect()
 }
 
 /// The commit an agent started from: <dir>/base (written at launch), else where its
@@ -204,19 +222,20 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
     let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
     if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
         let b = base(cwd, repo, dir);
-        let listed = b.as_ref().and_then(|b| git(cwd, &["diff", "--name-only", "--relative", "-z", b]));
-        *entry = (Instant::now(), b.zip(listed).map(|(b, l)| (b, l.split('\0').filter(|n| !n.is_empty()).map(|n| cwd.join(n)).collect())));
+        let listed = b.as_ref().and_then(|b| git(cwd, &["diff", "--numstat", "--no-renames", "--relative", "-z", b]));
+        *entry = (Instant::now(), b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))));
     }
     let Some((base, listed)) = entry.1.clone() else { return vec![] };
     drop(names);
     let mut views = VIEWS.lock().unwrap();
     files
         .into_iter()
-        .filter(|f| !f.starts_with(dir) && listed.contains(f)) // its own output.md already shows
+        .filter(|f| !f.starts_with(dir)) // its own output.md already shows
         .filter_map(|file| {
+            let stat = listed.get(&file)?.clone();
             let rel = file.strip_prefix(cwd).ok()?.to_string_lossy().into_owned();
             let path = dir.join(".diff").join(file.strip_prefix("/").unwrap_or(&file));
-            views.insert(path.clone(), (cwd.into(), base.clone(), rel));
+            views.insert(path.clone(), (cwd.into(), base.clone(), rel, stat));
             let label = file.file_name()?.to_string_lossy().into_owned();
             Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None })
         })
@@ -396,6 +415,7 @@ mod tests {
         let (rel, text) = diff_view(&n[0].path).unwrap();
         assert_eq!(rel, "src/a.rs");
         assert!(text.contains("+two\n") && text.contains("+three\n"), "{text}");
+        assert_eq!(diff_stat(&n[0].path), Some(("2".into(), "0".into())));
         let _ = fs::remove_dir_all(&d);
     }
 
