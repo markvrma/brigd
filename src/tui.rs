@@ -26,6 +26,7 @@ use std::{env, fs};
 use tui_term::widget::PseudoTerminal;
 
 const SIDE_W: u16 = 40;
+const MIN_SIDE_W: u16 = 12;
 /// Sidebar columns per tree level.
 const INDENT: usize = 3;
 const REFRESH: Duration = Duration::from_millis(700);
@@ -105,6 +106,12 @@ struct App {
     screen: Rect,
     side: Rect,
     side_inner: Rect,
+    /// Divider column from the last draw.
+    divider: Rect,
+    /// Sidebar width set by dragging the divider; None = SIDE_W.
+    side_w: Option<u16>,
+    /// A divider drag is in progress.
+    resizing: bool,
     tab_bar: Rect,
     /// Columns of the tabs shown in the last draw, starting at tab `tab_first`.
     tab_spans: Vec<(u16, u16)>,
@@ -911,6 +918,7 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.resizing = self.divider.contains(at);
                 // The sidebar is not among these, so a drag starting there selects nothing.
                 self.drag = [self.tab_bar, self.body, self.hint].into_iter().find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
@@ -929,11 +937,14 @@ impl App {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(d) = &mut self.drag {
+                if self.resizing {
+                    self.side_w = Some(m.column.saturating_sub(self.side.x).clamp(MIN_SIDE_W, SIDE_W));
+                } else if let Some(d) = &mut self.drag {
                     d.2 = Some(at);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                self.resizing = false;
                 if let Some((r, a, Some(b))) = self.drag.take() {
                     let t = sel_text(&self.buf, r, a, b);
                     if !t.trim().is_empty() {
@@ -1035,7 +1046,7 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let [top, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
-        let [side, divider, main] = Layout::horizontal([Constraint::Length(SIDE_W), Constraint::Length(1), Constraint::Min(0)]).areas(top);
+        let [side, divider, main] = Layout::horizontal([Constraint::Length(self.side_w.unwrap_or(SIDE_W)), Constraint::Length(1), Constraint::Min(0)]).areas(top);
         let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(main);
         let border = if self.focus_main { pal::OVERLAY0 } else { pal::LAVENDER };
         // No box: a dim title row, then the tree inside a one-column margin.
@@ -1043,6 +1054,7 @@ impl App {
         if body != self.body {
             resize_all(body);
         }
+        self.divider = divider;
         (self.screen, self.side, self.side_inner, self.tab_bar, self.body, self.hint) = (f.area(), side, inner, bar, body, hint);
         f.render_widget(Paragraph::new("spaces").style(Style::new().fg(pal::OVERLAY0)), Rect::new(inner.x, side.y, inner.width, 1));
         f.render_widget(Paragraph::new(vec![Line::from("┃"); divider.height as usize]).style(Style::new().fg(border)), divider);
@@ -1545,6 +1557,25 @@ mod tests {
         app.on_mouse(ev(up, 7, 1));
         assert!(app.clip.is_none());
         assert_eq!((base64(b"Man"), base64(b"Ma"), base64(b"M")), ("TWFu".into(), "TWE=".into(), "TQ==".into()));
+    }
+
+    #[test]
+    fn divider_drag_resizes() {
+        let mut app = App::default();
+        (app.side, app.divider, app.body) = (Rect::new(0, 0, 40, 5), Rect::new(40, 0, 1, 5), Rect::new(41, 0, 40, 5));
+        let ev = |kind, x| MouseEvent { kind, column: x, row: 1, modifiers: KeyModifiers::NONE };
+        let (down, drag, up) = (MouseEventKind::Down(MouseButton::Left), MouseEventKind::Drag(MouseButton::Left), MouseEventKind::Up(MouseButton::Left));
+        app.on_mouse(ev(down, 40));
+        app.on_mouse(ev(drag, 25));
+        assert_eq!(app.side_w, Some(25));
+        assert!(app.drag.is_none()); // no text selection
+        app.on_mouse(ev(drag, 70)); // past SIDE_W: stops there
+        assert_eq!(app.side_w, Some(SIDE_W));
+        app.on_mouse(ev(drag, 2)); // and never below the minimum
+        assert_eq!(app.side_w, Some(MIN_SIDE_W));
+        app.on_mouse(ev(up, 2));
+        app.on_mouse(ev(drag, 30)); // released: a stray drag moves nothing
+        assert_eq!(app.side_w, Some(MIN_SIDE_W));
     }
 
     #[test]
