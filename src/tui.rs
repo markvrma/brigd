@@ -621,15 +621,18 @@ impl App {
         for t in self.tree.iter().flat_map(|s| &s.children) {
             let state: serde_json::Value = fs::read_to_string(t.path.join("state.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
             threads.insert(t.path.clone(), state["status"].as_str().unwrap_or("").to_string());
-            let strays = t.children.iter().filter(|c| c.kind == Kind::Folder).flat_map(|c| &c.children);
-            for a in t.children.iter().chain(strays).filter(|a| a.kind == Kind::Agent) {
-                let key = (t.label.clone(), tree::agent_id(&a.path, &a.label));
+            for a in t.children.iter().filter(|a| a.kind == Kind::Agent) {
+                let key = (t.label.clone(), a.label.clone());
                 let saved = state["agents"][&a.label]["status"].as_str().unwrap_or("");
-                let st = match reg.get(&key) {
-                    l if key.1 != a.label && !l.is_some_and(|l| l.alive()) => stray_status(&a.path),
-                    l => agent_glyph_status(l.filter(|l| l.alive()).map(|l| l.status()).as_deref(), saved),
-                };
-                agents.insert(key, st);
+                let live = reg.get(&key).filter(|l| l.alive()).map(|l| l.status());
+                agents.insert(key, agent_glyph_status(live.as_deref(), saved));
+            }
+            // A terminal running claude (a stray whose pid lives) gets that claude's status; else it stays "$".
+            for d in stray_dirs(&t.path) {
+                let (st, term) = (stray_status(&d), fs::read_to_string(d.join("term")).unwrap_or_default());
+                if st != "off" && !term.is_empty() {
+                    agents.insert((t.label.clone(), term.trim().to_string()), st);
+                }
             }
         }
         let blocked: HashSet<_> = agents.iter().filter(|(_, s)| **s == "blocked").map(|(k, _)| k.clone()).collect();
@@ -662,8 +665,7 @@ impl App {
             let home = PathBuf::from(env::var("HOME").unwrap_or_default());
             let mut runs: Vec<(PathBuf, PathBuf)> = live_agents().into_iter().filter(|a| !a.dir.as_os_str().is_empty()).map(|a| (a.dir.clone(), a.cwd.clone())).collect();
             // Strays running in a terminal tab (they keep a pid file while alive).
-            let folders = self.tree.iter().flat_map(|s| &s.children).flat_map(|t| &t.children).filter(|c| c.kind == Kind::Folder);
-            for d in folders.flat_map(|f| &f.children).map(|a| &a.path).filter(|d| d.join("pid").exists()) {
+            for d in self.tree.iter().flat_map(|s| &s.children).flat_map(|t| stray_dirs(&t.path)).filter(|d| d.join("pid").exists()) {
                 runs.extend(fs::read_to_string(d.join("cwd")).map(|c| (d.clone(), PathBuf::from(c.trim()))));
             }
             for (dir, cwd) in runs {
@@ -844,6 +846,7 @@ impl App {
         let mut cmd = portable_pty::CommandBuilder::new(&shell);
         if let Some(t) = &brigd_thread {
             cmd.env("BRIGD_THREAD", t);
+            cmd.env("BRIGD_TERM", &name); // stray() records it, so the terminal row can show this shell's claude
         }
         if let (Ok(bin), Ok(shim)) = (env::current_exe(), crate::ensure_shim()) {
             let path = env::var_os("PATH").unwrap_or_default();
@@ -1011,7 +1014,7 @@ impl App {
     /// run in). RESUME: "continue" + Enter to the same set.
     fn toggle_pause(&mut self, thread: &str) {
         let resume = self.paused.contains(thread);
-        let strays = self.tree.iter().any(|n| has_live_stray(n, thread));
+        let strays = stray_dirs(&crate::thread_dir(thread)).iter().any(|d| stray_status(d) != "off");
         let mut targets = live_agents().into_iter().filter(|a| a.thread == thread).collect::<Vec<_>>();
         if strays {
             // ponytail: a shell tab is matched to the thread by $BRIGD_THREAD, not to the exact claude inside it
@@ -1430,9 +1433,11 @@ impl App {
         let mut spans = vec![Span::raw(format!("{}{arrow}", " ".repeat(r.depth * INDENT)))];
         let mut label = Style::new();
         match r.kind {
-            Kind::Agent => {
-                let st = self.agent_status.get(&(r.thread.clone(), tree::agent_id(&r.path, &r.label))).copied().unwrap_or("off");
+            Kind::Agent | Kind::Terminal => {
+                // A terminal shows "$" unless claude runs in it (refresh puts that status in agent_status).
+                let st = self.agent_status.get(&(r.thread.clone(), r.label.clone())).copied().unwrap_or(if r.kind == Kind::Terminal { "$" } else { "off" });
                 let (g, style) = match st {
+                    "$" => ("$ ", Style::new().fg(pal().green)),
                     "running" => ("● ", Style::new().fg(pal().green)),
                     "idle" => ("◦ ", Style::new().fg(pal().green)),
                     "blocked" => ("! ", Style::new().fg(pal().red).add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)),
@@ -1440,15 +1445,11 @@ impl App {
                     "failed" => ("✗ ", Style::new().fg(pal().red)),
                     _ => ("○ ", Style::new().fg(pal().overlay0)),
                 };
-                label = if st == "blocked" { style } else { label.fg(stage_color(r.stage)) };
+                label = if st == "blocked" { style } else if r.kind == Kind::Terminal { label.fg(pal().text) } else { label.fg(stage_color(r.stage)) };
                 spans.push(Span::styled(g, style));
                 if let Some(s) = r.stage {
                     spans.push(Span::styled(format!("{}·", s + 1), Style::new().fg(stage_color(r.stage))));
                 }
-            }
-            Kind::Terminal => {
-                spans.push(Span::styled("$ ", Style::new().fg(pal().green)));
-                label = label.fg(pal().text);
             }
             Kind::Output => label = label.fg(pal().sky),
             Kind::Diff => label = label.fg(pal().yellow),
@@ -1705,10 +1706,11 @@ impl App {
     }
 }
 
-/// Does `thread` have a stray whose claude is still running?
-fn has_live_stray(n: &Node, thread: &str) -> bool {
-    let strays = |t: &Node| t.children.iter().filter(|c| c.kind == Kind::Folder).flat_map(|c| &c.children).any(|a| a.kind == Kind::Agent && !matches!(stray_status(&a.path), "off" | "done" | "failed"));
-    if n.kind == Kind::Thread { n.label == thread && strays(n) } else { n.children.iter().any(|c| has_live_stray(c, thread)) }
+/// The dirs of a thread's strays (<thread dir>/stray agents/*), recorded on disk but not in the tree.
+fn stray_dirs(thread_dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(thread_dir.join(tree::STRAY)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    v.sort();
+    v
 }
 
 /// Lists each thread's live terminals (`terms`: (thread, shell name)) in a TERMS folder, after its
@@ -2068,14 +2070,14 @@ mod tests {
     #[test]
     fn terminal_folder_under_thread() {
         let node = |kind, label: &str, path: &str, children| Node { kind, label: label.into(), path: PathBuf::from(path), children, stage: None, worktree: None };
-        let t = node(Kind::Thread, "t", "/t", vec![node(Kind::Output, "FLOWPLAN", "/t/FLOWPLAN", vec![]), node(Kind::Folder, tree::STRAY, "/t/stray agents", vec![]), node(Kind::Agent, "a", "/t/a", vec![])]);
+        let t = node(Kind::Thread, "t", "/t", vec![node(Kind::Output, "FLOWPLAN", "/t/FLOWPLAN", vec![]), node(Kind::Agent, "a", "/t/a", vec![])]);
         let mut tree = vec![node(Kind::Space, "repo", "/repo", vec![t, node(Kind::Thread, "u", "/u", vec![node(Kind::Agent, "b", "/u/b", vec![])])])];
         let terms = [("t", "term-2"), ("t", "term-1"), ("zz", "term-3"), ("u", "term-4")].map(|(a, b)| (a.to_string(), b.to_string()));
         add_terminals(&mut tree, &terms);
         let mut rows = Vec::new();
         flatten(&tree[0], 0, &tree[0].path, "", &HashSet::new(), &mut rows);
         let labels: Vec<_> = rows.iter().map(|r| (r.label.as_str(), r.thread.as_str())).collect();
-        assert_eq!(labels, [("repo", ""), ("t", "t"), ("FLOWPLAN", "t"), ("terminal", "t"), ("term-1", "t"), ("term-2", "t"), ("stray agents", "t"), ("a", "t"), ("u", "u"), ("terminal", "u"), ("term-4", "u"), ("b", "u")]);
+        assert_eq!(labels, [("repo", ""), ("t", "t"), ("FLOWPLAN", "t"), ("terminal", "t"), ("term-1", "t"), ("term-2", "t"), ("a", "t"), ("u", "u"), ("terminal", "u"), ("term-4", "u"), ("b", "u")]);
         assert_eq!((rows[4].kind.clone(), rows[4].path.clone()), (Kind::Terminal, PathBuf::from("/t/.terminal/term-1")));
     }
 
@@ -2145,7 +2147,6 @@ mod tests {
         assert!(app.paused.contains("t"));
         app.on_mouse(click(30, 2));
         assert!(app.paused.is_empty());
-        assert!(!has_live_stray(&node(Kind::Thread, "t", vec![]), "t"));
     }
 
     #[test]

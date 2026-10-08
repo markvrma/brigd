@@ -21,13 +21,13 @@ pub enum Kind {
     Output,
     /// A file the agent changed; opens as a diff (see `diff_view`).
     Diff,
-    /// The thread's "stray agents" dir (claude sessions started from a brigd terminal), or its TERMS folder.
+    /// The thread's TERMS folder.
     Folder,
     /// A live brigd terminal (shell tab) whose $BRIGD_THREAD is the thread; listed by the TUI, not on disk.
     Terminal,
 }
 
-/// <thread>/stray agents/<name>/{cwd,session,base,pid,status}: claude sessions typed in a brigd terminal.
+/// <thread>/stray agents/<name>/{cwd,session,base,pid,term,status}: claude sessions typed in a brigd terminal.
 pub const STRAY: &str = "stray agents";
 
 /// The folder of a thread's live terminals (synthetic path <thread dir>/.terminal).
@@ -89,21 +89,7 @@ pub fn build(root: &Path) -> Vec<Node> {
             agent.children.extend(diff_nodes(&home, &cwd, &repo, &agent.path));
             agents.push(agent);
         }
-        let wts = root.join("worktrees").join(&thread);
-        let mut strays = Vec::new();
-        let mut sdirs: Vec<PathBuf> = fs::read_dir(tdir.join(STRAY)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-        sdirs.sort();
-        for d in sdirs {
-            let Ok(cwd) = fs::read_to_string(d.join("cwd")).map(|c| PathBuf::from(c.trim())) else { continue };
-            let mut agent = dir_node(Kind::Agent, &d.file_name().unwrap_or_default().to_string_lossy(), &d);
-            agent.worktree = cwd.strip_prefix(&wts).ok().and_then(|r| r.components().next()).map(|c| c.as_os_str().to_string_lossy().into_owned());
-            agent.children.extend(diff_nodes(&home, &cwd, &cwd, &d));
-            strays.push(agent);
-        }
-        // FLOWPLAN (the plan + live run log) is the thread's first child, its strays next.
-        if !strays.is_empty() {
-            agents.insert(0, Node { kind: Kind::Folder, label: STRAY.into(), path: tdir.join(STRAY), children: strays, stage: None, worktree: None });
-        }
+        // FLOWPLAN (the plan + live run log) is the thread's first child. Strays stay on disk only (stray agents/).
         let plan = tdir.join("FLOWPLAN");
         if plan.exists() {
             agents.insert(0, Node { kind: Kind::Output, label: "FLOWPLAN".into(), path: plan, children: vec![], stage: None, worktree: None });
@@ -588,31 +574,21 @@ mod tests {
     }
 
     #[test]
-    fn build_places_strays() {
+    fn build_hides_strays() {
         let root = tmp("strays");
         let t = root.join("threads/t1");
-        let stray = |n: &str, cwd: &str| {
-            fs::create_dir_all(t.join(STRAY).join(n)).unwrap();
-            fs::write(t.join(STRAY).join(n).join("cwd"), cwd).unwrap();
-            fs::write(t.join(STRAY).join(n).join("session"), "s").unwrap();
-        };
-        stray("stray-1", "/src/myrepo/sub\n");
-        stray("stray-2", "/elsewhere/x");
-        stray("stray-3", &root.join("worktrees/t1/fix/src").to_string_lossy());
+        fs::create_dir_all(t.join(STRAY).join("stray-1")).unwrap();
+        fs::write(t.join(STRAY).join("stray-1").join("cwd"), "/src/myrepo/sub\n").unwrap();
         fs::create_dir_all(t.join("a")).unwrap();
         fs::write(t.join("FLOWPLAN"), "plan").unwrap();
         fs::write(t.join("flowmap.json"), serde_json::json!({"stages":[[{"name":"a","worktree":null}]]}).to_string()).unwrap();
         fs::write(t.join("state.json"), r#"{"repo":"/src/myrepo","agents":{"a":{"status":"done"}}}"#).unwrap();
         let tree = build(&root);
-        let labels = |n: &Node| n.children.iter().map(|c| c.label.clone()).collect::<Vec<_>>();
-        assert_eq!(tree.len(), 1); // every stray in the thread, wherever it runs
+        assert_eq!(tree.len(), 1);
         let th = &tree[0].children[0];
-        assert_eq!(labels(th), ["FLOWPLAN", STRAY, "a"]);
-        assert_eq!((th.children[1].kind.clone(), labels(&th.children[1])), (Kind::Folder, vec!["stray-1".to_string(), "stray-2".into(), "stray-3".into()]));
-        let s = &th.children[1].children;
-        assert_eq!((s[0].kind.clone(), s[0].stage, agent_id(&s[0].path, &s[0].label)), (Kind::Agent, None, format!("{STRAY}/stray-1")));
-        assert_eq!(s.iter().map(|n| n.worktree.as_deref()).collect::<Vec<_>>(), [None, None, Some("fix")]);
-        assert_eq!(agent_id(&th.children[2].path, "a"), "a");
+        assert_eq!(th.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["FLOWPLAN", "a"]); // the stray is on disk, not in the tree
+        assert_eq!(agent_id(&th.children[1].path, "a"), "a");
+        assert_eq!(agent_id(&t.join(STRAY).join("stray-1"), "stray-1"), format!("{STRAY}/stray-1"));
         let _ = fs::remove_dir_all(&root);
     }
 }
