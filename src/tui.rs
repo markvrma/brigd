@@ -12,7 +12,7 @@ use crossterm::terminal::{self as ct, EnterAlternateScreen, LeaveAlternateScreen
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color::{self, Rgb}, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -209,6 +210,7 @@ struct App {
 /// Opens the TUI over every thread in ~/.brigd/threads until Mark quits.
 /// Quitting kills every live agent.
 pub fn run(open: Option<&str>) -> Res<()> {
+    init_theme();
     setup()?;
     let res = (|| -> Res<()> {
         let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -356,12 +358,12 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
 /// The flow as an npx-style step tree ending at crate::LOG_MARK; also the plain FLOWPLAN
 /// text (crate::flow_text). `status(agent)`: pending / running / blocked / done / failed.
 pub fn plan_lines(flow: &crate::Flow, status: impl Fn(&str) -> &'static str, frame: usize, width: usize) -> Vec<Line<'static>> {
-    let dim = Style::new().fg(pal::OVERLAY0);
+    let dim = Style::new().fg(pal().overlay0);
     let guide = |s: &str| Span::styled(s.to_string(), dim);
     let mut out = vec![];
     for (i, l) in wrap(&flow.goal, width.saturating_sub(3).max(20)).into_iter().enumerate() {
-        let lead = if i == 0 { Span::styled("◆  ", Style::new().fg(pal::MAUVE)) } else { guide("│  ") };
-        out.push(Line::from(vec![lead, Span::styled(l, Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD))]));
+        let lead = if i == 0 { Span::styled("◆  ", Style::new().fg(pal().mauve)) } else { guide("│  ") };
+        out.push(Line::from(vec![lead, Span::styled(l, Style::new().fg(pal().text).add_modifier(Modifier::BOLD))]));
     }
     let w = flow.stages.iter().flatten().map(|a| a.name.len()).max().unwrap_or(0);
     for (i, stage) in flow.stages.iter().enumerate() {
@@ -395,11 +397,11 @@ pub fn plan_lines(flow: &crate::Flow, status: impl Fn(&str) -> &'static str, fra
 /// A step's glyph: pending ◇, running spinner, blocked !, done ✔, failed ✖.
 fn step(st: &str, frame: usize) -> Span<'static> {
     match st {
-        "done" => Span::styled("✔", Style::new().fg(pal::GREEN)),
-        "failed" => Span::styled("✖", Style::new().fg(pal::RED)),
-        "blocked" => Span::styled("!", Style::new().fg(pal::RED).add_modifier(Modifier::BOLD)),
-        "running" => Span::styled(SPIN[frame % SPIN.len()], Style::new().fg(pal::SKY)),
-        _ => Span::styled("◇", Style::new().fg(pal::OVERLAY0)),
+        "done" => Span::styled("✔", Style::new().fg(pal().green)),
+        "failed" => Span::styled("✖", Style::new().fg(pal().red)),
+        "blocked" => Span::styled("!", Style::new().fg(pal().red).add_modifier(Modifier::BOLD)),
+        "running" => Span::styled(SPIN[frame % SPIN.len()], Style::new().fg(pal().sky)),
+        _ => Span::styled("◇", Style::new().fg(pal().overlay0)),
     }
 }
 
@@ -420,33 +422,68 @@ fn wrap(s: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// Catppuccin Mocha (catppuccin.com/palette), the TUI's colors.
-mod pal {
-    use ratatui::style::Color::{self, Rgb};
-    pub const MAUVE: Color = Rgb(0xcb, 0xa6, 0xf7);
-    pub const PINK: Color = Rgb(0xf5, 0xc2, 0xe7);
-    pub const RED: Color = Rgb(0xf3, 0x8b, 0xa8);
-    pub const PEACH: Color = Rgb(0xfa, 0xb3, 0x87);
-    pub const YELLOW: Color = Rgb(0xf9, 0xe2, 0xaf);
-    pub const GREEN: Color = Rgb(0xa6, 0xe3, 0xa1);
-    pub const TEAL: Color = Rgb(0x94, 0xe2, 0xd5);
-    pub const SKY: Color = Rgb(0x89, 0xdc, 0xeb);
-    pub const BLUE: Color = Rgb(0x89, 0xb4, 0xfa);
-    pub const LAVENDER: Color = Rgb(0xb4, 0xbe, 0xfe);
-    pub const TEXT: Color = Rgb(0xcd, 0xd6, 0xf4);
-    pub const SUBTEXT0: Color = Rgb(0xa6, 0xad, 0xc8);
-    pub const OVERLAY0: Color = Rgb(0x6c, 0x70, 0x86);
-    pub const SURFACE1: Color = Rgb(0x45, 0x47, 0x5a);
-    pub const SURFACE0: Color = Rgb(0x31, 0x32, 0x44);
-    pub const MANTLE: Color = Rgb(0x18, 0x18, 0x25);
-    pub const CRUST: Color = Rgb(0x11, 0x11, 0x1b);
+/// One color per role. `THEMES[0]` (Catppuccin Mocha) is the default; hex values are each palette's official ones.
+struct Pal {
+    name: &'static str,
+    mauve: Color,
+    pink: Color,
+    red: Color,
+    peach: Color,
+    yellow: Color,
+    green: Color,
+    teal: Color,
+    sky: Color,
+    blue: Color,
+    lavender: Color,
+    text: Color,
+    subtext0: Color,
+    overlay0: Color,
+    surface1: Color,
+    surface0: Color,
+    mantle: Color,
+    crust: Color,
+}
+
+const THEMES: &[Pal] = &[
+    Pal { name: "catppuccin-mocha", mauve: Rgb(0xcb, 0xa6, 0xf7), pink: Rgb(0xf5, 0xc2, 0xe7), red: Rgb(0xf3, 0x8b, 0xa8), peach: Rgb(0xfa, 0xb3, 0x87), yellow: Rgb(0xf9, 0xe2, 0xaf), green: Rgb(0xa6, 0xe3, 0xa1), teal: Rgb(0x94, 0xe2, 0xd5), sky: Rgb(0x89, 0xdc, 0xeb), blue: Rgb(0x89, 0xb4, 0xfa), lavender: Rgb(0xb4, 0xbe, 0xfe), text: Rgb(0xcd, 0xd6, 0xf4), subtext0: Rgb(0xa6, 0xad, 0xc8), overlay0: Rgb(0x6c, 0x70, 0x86), surface1: Rgb(0x45, 0x47, 0x5a), surface0: Rgb(0x31, 0x32, 0x44), mantle: Rgb(0x18, 0x18, 0x25), crust: Rgb(0x11, 0x11, 0x1b) },
+    Pal { name: "catppuccin-latte", mauve: Rgb(0x88, 0x39, 0xef), pink: Rgb(0xea, 0x76, 0xcb), red: Rgb(0xd2, 0x0f, 0x39), peach: Rgb(0xfe, 0x64, 0x0b), yellow: Rgb(0xdf, 0x8e, 0x1d), green: Rgb(0x40, 0xa0, 0x2b), teal: Rgb(0x17, 0x92, 0x99), sky: Rgb(0x04, 0xa5, 0xe5), blue: Rgb(0x1e, 0x66, 0xf5), lavender: Rgb(0x72, 0x87, 0xfd), text: Rgb(0x4c, 0x4f, 0x69), subtext0: Rgb(0x6c, 0x6f, 0x85), overlay0: Rgb(0x9c, 0xa0, 0xb0), surface1: Rgb(0xbc, 0xc0, 0xcc), surface0: Rgb(0xcc, 0xd0, 0xda), mantle: Rgb(0xe6, 0xe9, 0xef), crust: Rgb(0xdc, 0xe0, 0xe8) },
+    Pal { name: "dracula", mauve: Rgb(0xbd, 0x93, 0xf9), pink: Rgb(0xff, 0x79, 0xc6), red: Rgb(0xff, 0x55, 0x55), peach: Rgb(0xff, 0xb8, 0x6c), yellow: Rgb(0xf1, 0xfa, 0x8c), green: Rgb(0x50, 0xfa, 0x7b), teal: Rgb(0x8b, 0xe9, 0xfd), sky: Rgb(0x8b, 0xe9, 0xfd), blue: Rgb(0xbd, 0x93, 0xf9), lavender: Rgb(0xbd, 0x93, 0xf9), text: Rgb(0xf8, 0xf8, 0xf2), subtext0: Rgb(0xc0, 0xc4, 0xd6), overlay0: Rgb(0x62, 0x72, 0xa4), surface1: Rgb(0x44, 0x47, 0x5a), surface0: Rgb(0x34, 0x37, 0x46), mantle: Rgb(0x21, 0x22, 0x2c), crust: Rgb(0x19, 0x1a, 0x21) },
+    Pal { name: "nord", mauve: Rgb(0xb4, 0x8e, 0xad), pink: Rgb(0xb4, 0x8e, 0xad), red: Rgb(0xbf, 0x61, 0x6a), peach: Rgb(0xd0, 0x87, 0x70), yellow: Rgb(0xeb, 0xcb, 0x8b), green: Rgb(0xa3, 0xbe, 0x8c), teal: Rgb(0x8f, 0xbc, 0xbb), sky: Rgb(0x88, 0xc0, 0xd0), blue: Rgb(0x5e, 0x81, 0xac), lavender: Rgb(0x81, 0xa1, 0xc1), text: Rgb(0xec, 0xef, 0xf4), subtext0: Rgb(0xd8, 0xde, 0xe9), overlay0: Rgb(0x61, 0x6e, 0x88), surface1: Rgb(0x43, 0x4c, 0x5e), surface0: Rgb(0x3b, 0x42, 0x52), mantle: Rgb(0x2e, 0x34, 0x40), crust: Rgb(0x24, 0x29, 0x33) },
+    Pal { name: "gruvbox-dark", mauve: Rgb(0xd3, 0x86, 0x9b), pink: Rgb(0xd3, 0x86, 0x9b), red: Rgb(0xfb, 0x49, 0x34), peach: Rgb(0xfe, 0x80, 0x19), yellow: Rgb(0xfa, 0xbd, 0x2f), green: Rgb(0xb8, 0xbb, 0x26), teal: Rgb(0x8e, 0xc0, 0x7c), sky: Rgb(0x83, 0xa5, 0x98), blue: Rgb(0x83, 0xa5, 0x98), lavender: Rgb(0xd3, 0x86, 0x9b), text: Rgb(0xeb, 0xdb, 0xb2), subtext0: Rgb(0xa8, 0x99, 0x84), overlay0: Rgb(0x92, 0x83, 0x74), surface1: Rgb(0x50, 0x49, 0x45), surface0: Rgb(0x3c, 0x38, 0x36), mantle: Rgb(0x28, 0x28, 0x28), crust: Rgb(0x1d, 0x20, 0x21) },
+    Pal { name: "tokyo-night", mauve: Rgb(0xbb, 0x9a, 0xf7), pink: Rgb(0xff, 0x00, 0x7c), red: Rgb(0xf7, 0x76, 0x8e), peach: Rgb(0xff, 0x9e, 0x64), yellow: Rgb(0xe0, 0xaf, 0x68), green: Rgb(0x9e, 0xce, 0x6a), teal: Rgb(0x73, 0xda, 0xca), sky: Rgb(0x7d, 0xcf, 0xff), blue: Rgb(0x7a, 0xa2, 0xf7), lavender: Rgb(0x9d, 0x7c, 0xd8), text: Rgb(0xc0, 0xca, 0xf5), subtext0: Rgb(0xa9, 0xb1, 0xd6), overlay0: Rgb(0x56, 0x5f, 0x89), surface1: Rgb(0x41, 0x48, 0x68), surface0: Rgb(0x29, 0x2e, 0x42), mantle: Rgb(0x16, 0x16, 0x1e), crust: Rgb(0x10, 0x10, 0x14) },
+    Pal { name: "one-dark", mauve: Rgb(0xc6, 0x78, 0xdd), pink: Rgb(0xc6, 0x78, 0xdd), red: Rgb(0xe0, 0x6c, 0x75), peach: Rgb(0xd1, 0x9a, 0x66), yellow: Rgb(0xe5, 0xc0, 0x7b), green: Rgb(0x98, 0xc3, 0x79), teal: Rgb(0x56, 0xb6, 0xc2), sky: Rgb(0x56, 0xb6, 0xc2), blue: Rgb(0x61, 0xaf, 0xef), lavender: Rgb(0x61, 0xaf, 0xef), text: Rgb(0xab, 0xb2, 0xbf), subtext0: Rgb(0x82, 0x89, 0x97), overlay0: Rgb(0x5c, 0x63, 0x70), surface1: Rgb(0x4b, 0x52, 0x63), surface0: Rgb(0x2c, 0x31, 0x3c), mantle: Rgb(0x21, 0x25, 0x2b), crust: Rgb(0x18, 0x1a, 0x1f) },
+    Pal { name: "solarized-dark", mauve: Rgb(0x6c, 0x71, 0xc4), pink: Rgb(0xd3, 0x36, 0x82), red: Rgb(0xdc, 0x32, 0x2f), peach: Rgb(0xcb, 0x4b, 0x16), yellow: Rgb(0xb5, 0x89, 0x00), green: Rgb(0x85, 0x99, 0x00), teal: Rgb(0x2a, 0xa1, 0x98), sky: Rgb(0x2a, 0xa1, 0x98), blue: Rgb(0x26, 0x8b, 0xd2), lavender: Rgb(0x6c, 0x71, 0xc4), text: Rgb(0x93, 0xa1, 0xa1), subtext0: Rgb(0x83, 0x94, 0x96), overlay0: Rgb(0x58, 0x6e, 0x75), surface1: Rgb(0x0d, 0x46, 0x55), surface0: Rgb(0x07, 0x36, 0x42), mantle: Rgb(0x00, 0x2b, 0x36), crust: Rgb(0x00, 0x21, 0x2b) },
+    Pal { name: "rose-pine", mauve: Rgb(0xc4, 0xa7, 0xe7), pink: Rgb(0xeb, 0xbc, 0xba), red: Rgb(0xeb, 0x6f, 0x92), peach: Rgb(0xf6, 0xc1, 0x77), yellow: Rgb(0xf6, 0xc1, 0x77), green: Rgb(0x9c, 0xcf, 0xd8), teal: Rgb(0x9c, 0xcf, 0xd8), sky: Rgb(0x9c, 0xcf, 0xd8), blue: Rgb(0x3e, 0x8f, 0xb0), lavender: Rgb(0xc4, 0xa7, 0xe7), text: Rgb(0xe0, 0xde, 0xf4), subtext0: Rgb(0x90, 0x8c, 0xaa), overlay0: Rgb(0x6e, 0x6a, 0x86), surface1: Rgb(0x40, 0x3d, 0x52), surface0: Rgb(0x26, 0x23, 0x3a), mantle: Rgb(0x1f, 0x1d, 0x2e), crust: Rgb(0x19, 0x17, 0x24) },
+];
+
+static THEME: AtomicUsize = AtomicUsize::new(0);
+
+fn pal() -> &'static Pal {
+    &THEMES[THEME.load(Ordering::Relaxed)]
+}
+
+fn theme_index(name: &str) -> usize {
+    THEMES.iter().position(|t| t.name == name.trim()).unwrap_or(0)
+}
+
+/// $BRIGD_THEME, else ~/.brigd/theme, else catppuccin-mocha.
+fn init_theme() {
+    let name = env::var("BRIGD_THEME").or_else(|_| fs::read_to_string(crate::root().join("theme"))).unwrap_or_default();
+    THEME.store(theme_index(&name), Ordering::Relaxed);
+}
+
+fn next_theme() -> &'static str {
+    let i = (THEME.load(Ordering::Relaxed) + 1) % THEMES.len();
+    THEME.store(i, Ordering::Relaxed);
+    let _ = fs::write(crate::root().join("theme"), format!("{}\n", THEMES[i].name)); // ponytail: best effort, lost write just means no persistence
+    THEMES[i].name
 }
 
 /// Agent rows/tabs are tinted by stage; avoids the status-glyph and selection colors.
-const STAGE_COLORS: [Color; 6] = [pal::MAUVE, pal::YELLOW, pal::BLUE, pal::PEACH, pal::PINK, pal::TEAL];
-
 fn stage_color(stage: Option<usize>) -> Color {
-    stage.map_or(Color::Reset, |s| STAGE_COLORS[s % STAGE_COLORS.len()])
+    let p = pal();
+    let c = [p.mauve, p.yellow, p.blue, p.peach, p.pink, p.teal];
+    stage.map_or(Color::Reset, |s| c[s % c.len()])
 }
 
 fn flatten(n: &Node, depth: usize, space: &Path, thread: &str, toggled: &HashSet<NodeKey>, out: &mut Vec<Row>) {
@@ -630,7 +667,7 @@ impl App {
         let all: Vec<&str> = text.lines().collect();
         let start = all.iter().position(|l| l.trim_end() == crate::LOG_MARK).map(|i| i + 1).or_else(|| all.iter().position(|l| l.starts_with("──")));
         let start = start.unwrap_or(all.len()).max(all.len().saturating_sub(LOG_TAIL));
-        lines.extend(all[start..].iter().map(|l| Line::styled(l.to_string(), Style::new().fg(pal::OVERLAY0))));
+        lines.extend(all[start..].iter().map(|l| Line::styled(l.to_string(), Style::new().fg(pal().overlay0))));
         Some(lines)
     }
 
@@ -1149,6 +1186,7 @@ impl App {
                 KeyCode::Char('t') => self.new_term(),
                 KeyCode::Char('v') => self.split(),
                 KeyCode::Char('o') => self.other_pane(),
+                KeyCode::Char('c') => self.msg = Some((format!("theme: {}", next_theme()), Instant::now())),
                 KeyCode::Char('q') => self.ask_quit(),
                 _ => {}
             }
@@ -1332,12 +1370,12 @@ impl App {
             Kind::Agent => {
                 let st = self.agent_status.get(&(r.thread.clone(), tree::agent_id(&r.path, &r.label))).copied().unwrap_or("off");
                 let (g, style) = match st {
-                    "running" => ("● ", Style::new().fg(pal::GREEN)),
-                    "idle" => ("◦ ", Style::new().fg(pal::GREEN)),
-                    "blocked" => ("! ", Style::new().fg(pal::RED).add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)),
-                    "done" => ("✓ ", Style::new().fg(pal::BLUE)),
-                    "failed" => ("✗ ", Style::new().fg(pal::RED)),
-                    _ => ("○ ", Style::new().fg(pal::OVERLAY0)),
+                    "running" => ("● ", Style::new().fg(pal().green)),
+                    "idle" => ("◦ ", Style::new().fg(pal().green)),
+                    "blocked" => ("! ", Style::new().fg(pal().red).add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK)),
+                    "done" => ("✓ ", Style::new().fg(pal().blue)),
+                    "failed" => ("✗ ", Style::new().fg(pal().red)),
+                    _ => ("○ ", Style::new().fg(pal().overlay0)),
                 };
                 label = if st == "blocked" { style } else { label.fg(stage_color(r.stage)) };
                 spans.push(Span::styled(g, style));
@@ -1346,26 +1384,26 @@ impl App {
                 }
             }
             Kind::Terminal => {
-                spans.push(Span::styled("$ ", Style::new().fg(pal::GREEN)));
-                label = label.fg(pal::TEXT);
+                spans.push(Span::styled("$ ", Style::new().fg(pal().green)));
+                label = label.fg(pal().text);
             }
-            Kind::Output => label = label.fg(pal::SKY),
-            Kind::Diff => label = label.fg(pal::YELLOW),
-            Kind::Space => label = label.fg(pal::MAUVE).add_modifier(Modifier::BOLD),
-            Kind::Thread => label = label.fg(pal::TEXT).add_modifier(Modifier::BOLD),
-            _ => label = label.fg(pal::SUBTEXT0),
+            Kind::Output => label = label.fg(pal().sky),
+            Kind::Diff => label = label.fg(pal().yellow),
+            Kind::Space => label = label.fg(pal().mauve).add_modifier(Modifier::BOLD),
+            Kind::Thread => label = label.fg(pal().text).add_modifier(Modifier::BOLD),
+            _ => label = label.fg(pal().subtext0),
         }
         let slash = if matches!(r.kind, Kind::Output | Kind::Diff | Kind::Terminal) { "" } else { "/" };
         spans.push(Span::styled(format!("{}{slash}", r.label), label));
         // Worktree name (agents) and +add -del (diffs) sit flush right, one column of padding.
         let mut right = vec![];
         if let Some(wt) = &r.worktree {
-            right.push(Span::styled(wt.clone(), Style::new().fg(pal::OVERLAY0)));
+            right.push(Span::styled(wt.clone(), Style::new().fg(pal().overlay0)));
         }
         if let Some((add, del)) = (r.kind == Kind::Diff).then(|| tree::diff_stat(&r.path)).flatten() {
-            right.push(Span::styled(format!("+{add}"), Style::new().fg(pal::GREEN)));
+            right.push(Span::styled(format!("+{add}"), Style::new().fg(pal().green)));
             right.push(Span::raw(" "));
-            right.push(Span::styled(format!("-{del}"), Style::new().fg(pal::RED)));
+            right.push(Span::styled(format!("-{del}"), Style::new().fg(pal().red)));
         }
         if !right.is_empty() {
             let used: usize = spans.iter().chain(&right).map(|s| s.content.chars().count()).sum();
@@ -1374,14 +1412,14 @@ impl App {
         }
         if r.kind == Kind::Thread {
             let st = self.thread_status.get(&r.path).map(String::as_str).unwrap_or("");
-            spans.push(Span::styled(format!(" {st}"), Style::new().fg(pal::OVERLAY0)));
+            spans.push(Span::styled(format!(" {st}"), Style::new().fg(pal().overlay0)));
         }
         let line = Line::from(spans);
         match (selected, self.focus_main) {
             (true, false) => line.style(Style::new().add_modifier(Modifier::REVERSED)),
-            (true, true) => line.style(Style::new().bg(pal::SURFACE1)),
+            (true, true) => line.style(Style::new().bg(pal().surface1)),
             // The space (repo) whose tabs show.
-            _ if r.kind == Kind::Space && r.space == self.space => line.style(Style::new().bg(pal::SURFACE0)),
+            _ if r.kind == Kind::Space && r.space == self.space => line.style(Style::new().bg(pal().surface0)),
             _ => line,
         }
     }
@@ -1392,7 +1430,7 @@ impl App {
         let (tabs, focused) = (&p.list[j], p.focus == j);
         let mut spans = vec![];
         let pill = if j == 0 {
-            spans.push(Span::styled(format!(" {} ", self.thread), Style::new().fg(pal::CRUST).bg(pal::MAUVE)));
+            spans.push(Span::styled(format!(" {} ", self.thread), Style::new().fg(pal().crust).bg(pal().mauve)));
             self.thread.chars().count() as u16 + 2
         } else {
             0
@@ -1408,7 +1446,7 @@ impl App {
         let widths: Vec<u16> = titles.iter().map(|(t, _)| 1 + t.chars().count() as u16).collect(); // "│" + title
         let (first, end) = tab_window(&widths, 0, Some(tabs.active), bar.width.saturating_sub(pill));
         let mut tab_spans = vec![];
-        let marker = |c| Span::styled(c, Style::new().fg(pal::OVERLAY0));
+        let marker = |c| Span::styled(c, Style::new().fg(pal().overlay0));
         if first > 0 {
             spans.push(marker("‹"));
         }
@@ -1454,7 +1492,7 @@ impl App {
                 // The diff above, the file's path right-aligned on the body's last row.
                 let [d, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
                 f.render_widget(Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), d);
-                f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal::OVERLAY0)).right_aligned(), foot);
+                f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal().overlay0)).right_aligned(), foot);
             }
             Some(Tab::View { scroll, .. }) if plan.is_some() => {
                 let lines = plan.take().unwrap_or_default();
@@ -1472,7 +1510,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let [top, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
         let [side, divider, main] = Layout::horizontal([Constraint::Length(self.side_w.unwrap_or(SIDE_W)), Constraint::Length(1), Constraint::Min(0)]).areas(top);
-        let border = if self.focus_main { pal::OVERLAY0 } else { pal::LAVENDER };
+        let border = if self.focus_main { pal().overlay0 } else { pal().lavender };
         // No box: a dim title row, then the tree inside a one-column margin.
         let inner = Rect::new(side.x + 1, side.y + 1, side.width.saturating_sub(2), side.height.saturating_sub(1));
         if main != self.main {
@@ -1480,7 +1518,7 @@ impl App {
             self.resize_all();
         }
         (self.screen, self.side, self.side_inner, self.divider, self.hint) = (f.area(), side, inner, divider, hint);
-        f.render_widget(Paragraph::new("spaces").style(Style::new().fg(pal::OVERLAY0)), Rect::new(inner.x, side.y, inner.width, 1));
+        f.render_widget(Paragraph::new("spaces").style(Style::new().fg(pal().overlay0)), Rect::new(inner.x, side.y, inner.width, 1));
         f.render_widget(Paragraph::new(vec![Line::from("┃"); divider.height as usize]).style(Style::new().fg(border)), divider);
 
         let h = inner.height as usize;
@@ -1503,9 +1541,9 @@ impl App {
         self.plus_btns.clear();
         for (y, r) in shown.iter().map(|&(y, i)| (y, &self.rows[i])) {
             let (label, color) = match r.kind {
-                Kind::Space => (" + ", pal::GREEN),
-                Kind::Thread if self.paused.contains(&r.label) => (" ● ", pal::RED),
-                Kind::Thread => (" ○ ", pal::RED),
+                Kind::Space => (" + ", pal().green),
+                Kind::Thread if self.paused.contains(&r.label) => (" ● ", pal().red),
+                Kind::Thread => (" ○ ", pal().red),
                 _ => continue,
             };
             let w = label.chars().count() as u16;
@@ -1521,7 +1559,7 @@ impl App {
         // The thread's panes side by side, a dim "│" between them.
         let rects = pane_rects(main, self.tabs.entry(self.thread.clone()).or_default().list.len());
         if let [(l, _), _] = rects[..] {
-            f.render_widget(Paragraph::new(vec![Line::from("│"); main.height as usize]).style(Style::new().fg(pal::SURFACE1)), Rect::new(l.right(), main.y, 1, main.height));
+            f.render_widget(Paragraph::new(vec![Line::from("│"); main.height as usize]).style(Style::new().fg(pal().surface1)), Rect::new(l.right(), main.y, 1, main.height));
         }
         for (j, (bar, body)) in rects.into_iter().enumerate() {
             self.draw_pane(f, j, bar, body);
@@ -1529,35 +1567,35 @@ impl App {
 
         let viewing = matches!(self.cur(), Some(Tab::View { .. }));
         let text = match &self.msg {
-            Some((m, t)) if t.elapsed() < Duration::from_secs(5) => Span::styled(m.clone(), Style::new().fg(pal::YELLOW)),
+            Some((m, t)) if t.elapsed() < Duration::from_secs(5) => Span::styled(m.clone(), Style::new().fg(pal().yellow)),
             _ if self.confirm_delete.is_some() => Span::styled(
                 format!("Delete thread {} with its worktrees and brigd/ branches? This cannot be undone. y/N", self.confirm_delete.as_deref().unwrap_or("")),
-                Style::new().fg(pal::RED).add_modifier(Modifier::BOLD),
+                Style::new().fg(pal().red).add_modifier(Modifier::BOLD),
             ),
             _ if self.confirm_quit => Span::styled(
                 format!("{} agents running; quitting kills them. Quit? y/N", live_agents().len()),
-                Style::new().fg(pal::RED).add_modifier(Modifier::BOLD),
+                Style::new().fg(pal().red).add_modifier(Modifier::BOLD),
             ),
-            _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · q quit · C-o send C-o"),
+            _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · c theme · q quit · C-o send C-o"),
             _ if !self.focus_main => Span::raw("↑↓/jk move · Enter open/fold · ←→ fold · Tab back to tab · M-h/l tabs · M-t terminal · q quit · wheel scrolls"),
             _ if viewing => Span::raw("↑↓/jk PgUp/PgDn g/G scroll · Tab/Esc sidebar · M-h/l tabs · M-t terminal · C-o w close · C-o q quit"),
             _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · wheel scrollback"),
         };
-        f.render_widget(Paragraph::new(Line::from(text).style(Style::new().fg(pal::SUBTEXT0).bg(pal::MANTLE))), hint);
+        f.render_widget(Paragraph::new(Line::from(text).style(Style::new().fg(pal().subtext0).bg(pal().mantle))), hint);
 
         if let Some(m) = &self.menu {
             let r = m.rect.intersection(f.area());
             f.render_widget(Clear, r);
             let lines = m.items.iter().enumerate().map(|(i, a)| {
-                let bg = if i == m.sel { pal::RED } else { pal::SURFACE1 };
-                Line::styled(a.label(), Style::new().fg(if i == m.sel { pal::CRUST } else { pal::TEXT }).bg(bg).add_modifier(Modifier::BOLD))
+                let bg = if i == m.sel { pal().red } else { pal().surface1 };
+                Line::styled(a.label(), Style::new().fg(if i == m.sel { pal().crust } else { pal().text }).bg(bg).add_modifier(Modifier::BOLD))
             });
             f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), r);
         }
 
         // The new-thread window, or the run confirm once it is planned, centered on top.
         let modal = if let Some((repo, input, err)) = &self.newt {
-            let help = err.as_ref().map_or(Span::styled("<name> <task> · Enter plans · Esc cancels", Style::new().fg(pal::OVERLAY0)), |e| Span::styled(e.clone(), Style::new().fg(pal::RED)));
+            let help = err.as_ref().map_or(Span::styled("<name> <task> · Enter plans · Esc cancels", Style::new().fg(pal().overlay0)), |e| Span::styled(e.clone(), Style::new().fg(pal().red)));
             Some((format!(" new thread in {} ", repo.display()), vec![Line::from(format!("> {input}█")), Line::from(help)]))
         } else {
             self.confirm_run.as_ref().map(|(name, repo)| (" run ".into(), vec![Line::styled(format!("Run thread {name} in {repo}? y / n"), Style::new().add_modifier(Modifier::BOLD))]))
@@ -1568,7 +1606,7 @@ impl App {
             let h = (lines.len() as u16 + 2).min(a.height);
             let r = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal::LAVENDER))), r);
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal().lavender))), r);
         }
 
         if let Some((r, a, Some(b))) = self.drag {
@@ -1634,9 +1672,9 @@ fn fresh_name<'a>(taken: impl Iterator<Item = &'a str>) -> String {
 fn diff_lines(text: &str) -> Vec<Line<'_>> {
     text.lines()
         .map(|l| match l.as_bytes().first() {
-            Some(b'+') => Line::styled(l, Style::new().fg(pal::GREEN)),
-            Some(b'-') => Line::styled(l, Style::new().fg(pal::RED)),
-            Some(b'@') if l.starts_with("@@") => Line::styled(l, Style::new().fg(pal::SKY).add_modifier(Modifier::DIM)),
+            Some(b'+') => Line::styled(l, Style::new().fg(pal().green)),
+            Some(b'-') => Line::styled(l, Style::new().fg(pal().red)),
+            Some(b'@') if l.starts_with("@@") => Line::styled(l, Style::new().fg(pal().sky).add_modifier(Modifier::DIM)),
             _ => Line::raw(l),
         })
         .collect()
@@ -1644,7 +1682,7 @@ fn diff_lines(text: &str) -> Vec<Line<'_>> {
 
 /// Markdown → styled lines, one per source line so scroll bounds match `text.lines()`.
 fn md_lines(text: &str) -> Vec<Line<'static>> {
-    let (mut code, dim) = (false, Style::new().fg(pal::OVERLAY0));
+    let (mut code, dim) = (false, Style::new().fg(pal().overlay0));
     text.lines()
         .map(|l| {
             let t = l.trim_start();
@@ -1654,10 +1692,10 @@ fn md_lines(text: &str) -> Vec<Line<'static>> {
                 return Line::styled("─".repeat(40), dim);
             }
             if code {
-                return Line::styled(l.to_string(), Style::new().fg(pal::PEACH).bg(pal::SURFACE0));
+                return Line::styled(l.to_string(), Style::new().fg(pal().peach).bg(pal().surface0));
             }
             if let Some(n) = (1..=6).find(|&n| t.starts_with(&format!("{} ", "#".repeat(n)))) {
-                let c = [pal::MAUVE, pal::SKY, pal::BLUE][(n - 1).min(2)];
+                let c = [pal().mauve, pal().sky, pal().blue][(n - 1).min(2)];
                 return Line::from(inline(&t[n + 1..], Style::new().fg(c).add_modifier(Modifier::BOLD)));
             }
             if t.len() >= 3 && (t.chars().all(|c| c == '-') || t.chars().all(|c| c == '*') || t.chars().all(|c| c == '_')) {
@@ -1665,7 +1703,7 @@ fn md_lines(text: &str) -> Vec<Line<'static>> {
             }
             if let Some(q) = t.strip_prefix('>') {
                 let mut v = vec![Span::raw(ind.to_string()), Span::styled("│ ", dim)];
-                v.extend(inline(q.trim_start(), Style::new().fg(pal::SUBTEXT0).add_modifier(Modifier::ITALIC)));
+                v.extend(inline(q.trim_start(), Style::new().fg(pal().subtext0).add_modifier(Modifier::ITALIC)));
                 return Line::from(v);
             }
             let num = t.find(". ").filter(|&i| i > 0 && t[..i].bytes().all(|b| b.is_ascii_digit()));
@@ -1676,7 +1714,7 @@ fn md_lines(text: &str) -> Vec<Line<'static>> {
             } else {
                 return Line::from([vec![Span::raw(ind.to_string())], inline(t, Style::new())].concat());
             };
-            Line::from([vec![Span::raw(ind.to_string()), Span::styled(mark + " ", Style::new().fg(pal::YELLOW))], inline(rest, Style::new())].concat())
+            Line::from([vec![Span::raw(ind.to_string()), Span::styled(mark + " ", Style::new().fg(pal().yellow))], inline(rest, Style::new())].concat())
         })
         .collect()
 }
@@ -1695,7 +1733,7 @@ fn inline(s: &str, base: Style) -> Vec<Span<'static>> {
         if c == '`' {
             if let Some(e) = r.find('`') {
                 flush(&mut buf, &mut out);
-                out.push(Span::styled(r[..e].to_string(), Style::new().fg(pal::PEACH).bg(pal::SURFACE0)));
+                out.push(Span::styled(r[..e].to_string(), Style::new().fg(pal().peach).bg(pal().surface0)));
                 rest = &r[e + 1..];
                 continue;
             }
@@ -1716,7 +1754,7 @@ fn inline(s: &str, base: Style) -> Vec<Span<'static>> {
         } else if c == '[' {
             if let Some((e, u)) = r.find("](").and_then(|e| r[e + 2..].find(')').map(|u| (e, e + 2 + u))) {
                 flush(&mut buf, &mut out);
-                out.extend(inline(&r[..e], base.fg(pal::SKY).add_modifier(Modifier::UNDERLINED)));
+                out.extend(inline(&r[..e], base.fg(pal().sky).add_modifier(Modifier::UNDERLINED)));
                 rest = &r[u + 1..];
                 continue;
             }
@@ -1779,10 +1817,18 @@ mod tests {
     }
 
     #[test]
+    fn theme_names_resolve() {
+        for (i, t) in THEMES.iter().enumerate() {
+            assert_eq!(theme_index(t.name), i);
+        }
+        assert_eq!(THEMES[theme_index("nope")].name, "catppuccin-mocha");
+    }
+
+    #[test]
     fn diff_colors() {
         let l = diff_lines("@@ -1,2 +1,2 @@\n a\n-b\n+c");
         let fg: Vec<_> = l.iter().map(|l| l.style.fg).collect();
-        assert_eq!(fg, [Some(pal::SKY), None, Some(pal::RED), Some(pal::GREEN)]);
+        assert_eq!(fg, [Some(pal().sky), None, Some(pal().red), Some(pal().green)]);
     }
 
     #[test]
