@@ -134,7 +134,8 @@ fn push_tab(tabs: &mut Tabs, tab: Tab) {
 enum Bg {
     /// (thread, repo): planned, waiting for the y/n confirm.
     Planned(String, String),
-    Failed(String),
+    /// (thread, message): planning failed.
+    Failed(String, String),
     Finished(String, Result<(), String>),
 }
 
@@ -176,6 +177,10 @@ struct App {
     newt: Option<(PathBuf, String, Option<String>)>,
     /// A planned (thread, repo) waiting for y to run, n to be deleted.
     confirm_run: Option<(String, String)>,
+    /// Planned threads waiting behind `confirm_run`.
+    queued: Vec<(String, String)>,
+    /// Threads whose reserved dir the planner thread still owns.
+    planning: HashSet<String>,
     /// Created on first use; background threads send on clones of the sender.
     bg: Option<(mpsc::Sender<Bg>, mpsc::Receiver<Bg>)>,
     // Layout from the last draw, for mouse hit tests.
@@ -236,6 +241,8 @@ pub fn run(open: Option<&str>) -> Res<()> {
             }
         }
         live_agents().iter().for_each(|a| a.kill());
+        // A plan still running dies with brigd: free the names it reserved.
+        app.planning.iter().for_each(|n| _ = fs::remove_dir_all(crate::thread_dir(n)));
         Ok(())
     })();
     teardown();
@@ -975,6 +982,10 @@ impl App {
         crate::stop_thread(thread);
         self.live_shells().into_iter().filter(|(_, t)| t == thread).for_each(|(a, _)| a.kill());
         self.tabs.remove(thread);
+        if self.thread == thread {
+            self.thread.clear(); // not a thread any more: reflow re-picks the first one
+            self.reflow();
+        }
         self.focus_main &= self.cur().is_some();
         self.paused.remove(thread);
     }
@@ -1022,19 +1033,23 @@ impl App {
             self.newt = Some((repo, input, Some(e.to_string())));
             return;
         }
+        self.planning.insert(name.clone());
         self.flash(format!("planning {name}…"));
         let tx = self.tx();
         // ponytail: no cancel; quitting brigd mid-plan orphans the `claude -p` planner.
         std::thread::spawn(move || {
-            let r = crate::plan(&task, &repo).and_then(|flow| {
-                crate::create_thread(&crate::root(), &name, &repo.to_string_lossy(), &flow)?;
-                Ok(fs::write(dir.join("FLOWPLAN"), crate::flow_text(&flow))?)
-            });
+            let r = std::panic::catch_unwind(|| {
+                crate::plan(&task, &repo).and_then(|flow| {
+                    crate::create_thread(&crate::root(), &name, &repo.to_string_lossy(), &flow)?;
+                    Ok(fs::write(dir.join("FLOWPLAN"), crate::flow_text(&flow))?)
+                })
+            })
+            .unwrap_or_else(|_| Err("planner panicked".into()));
             let _ = tx.send(match r {
                 Ok(()) => Bg::Planned(name, repo.to_string_lossy().into_owned()),
                 Err(e) => {
                     let _ = fs::remove_dir_all(&dir);
-                    Bg::Failed(format!("plan {name}: {e}"))
+                    Bg::Failed(name, e.to_string())
                 }
             });
         });
@@ -1042,11 +1057,19 @@ impl App {
 
     fn on_bg(&mut self, m: Bg) {
         match m {
-            Bg::Failed(e) => self.flash(e),
+            Bg::Failed(name, e) => {
+                self.planning.remove(&name);
+                self.flash(format!("plan {name}: {e}"));
+            }
             Bg::Planned(name, repo) => {
+                self.planning.remove(&name);
                 self.refresh();
                 self.open_flowplan(&name);
-                self.confirm_run = Some((name, repo));
+                if self.confirm_run.is_some() {
+                    self.queued.push((name, repo));
+                } else {
+                    self.confirm_run = Some((name, repo));
+                }
             }
             Bg::Finished(name, Ok(())) => self.flash(format!("thread {name} done")),
             Bg::Finished(name, Err(e)) => self.flash(format!("thread {name}: {e}")),
@@ -1084,8 +1107,12 @@ impl App {
             match k.code {
                 KeyCode::Char('y' | 'Y') => self.run_planned(name),
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => self.delete(&name),
-                _ => self.confirm_run = Some((name, repo)),
+                _ => {
+                    self.confirm_run = Some((name, repo));
+                    return;
+                }
             }
+            self.confirm_run = self.queued.pop();
             return;
         }
         if let Some(mut m) = self.menu.take() {
@@ -1218,6 +1245,7 @@ impl App {
                 let panes = self.tabs.get(&self.thread).into_iter().flat_map(|p| &p.list).flat_map(|t| [t.bar, t.body]);
                 self.drag = panes.chain([self.hint]).find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(repo) = self.plus_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, p)| p.clone()) {
+                    self.prefix = false;
                     self.newt = Some((repo, String::new(), None));
                 } else if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
