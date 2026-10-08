@@ -630,7 +630,7 @@ impl App {
             // A terminal running claude (a stray whose pid lives) gets that claude's status; else it stays "$".
             for d in stray_dirs(&t.path) {
                 let (st, term) = (stray_status(&d), fs::read_to_string(d.join("term")).unwrap_or_default());
-                if st != "off" && !term.is_empty() {
+                if !matches!(st, "off" | "failed") && !term.is_empty() {
                     agents.insert((t.label.clone(), term.trim().to_string()), st);
                 }
             }
@@ -1014,7 +1014,7 @@ impl App {
     /// run in). RESUME: "continue" + Enter to the same set.
     fn toggle_pause(&mut self, thread: &str) {
         let resume = self.paused.contains(thread);
-        let strays = stray_dirs(&crate::thread_dir(thread)).iter().any(|d| stray_status(d) != "off");
+        let strays = stray_dirs(&crate::thread_dir(thread)).iter().any(|d| !matches!(stray_status(d), "off" | "done" | "failed"));
         let mut targets = live_agents().into_iter().filter(|a| a.thread == thread).collect::<Vec<_>>();
         if strays {
             // ponytail: a shell tab is matched to the thread by $BRIGD_THREAD, not to the exact claude inside it
