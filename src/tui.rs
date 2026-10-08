@@ -21,7 +21,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use tui_term::widget::PseudoTerminal;
 
@@ -29,6 +29,10 @@ const SIDE_W: u16 = 40;
 /// Sidebar columns per tree level.
 const INDENT: usize = 3;
 const REFRESH: Duration = Duration::from_millis(700);
+/// Braille spinner for running steps; the frame comes from the clock (run redraws every ≤40ms).
+const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Run-log lines the FLOWPLAN view shows under the plan.
+const LOG_TAIL: usize = 15;
 
 /// (space, node path): a thread spanning spaces shows under each, folded separately.
 type NodeKey = (PathBuf, PathBuf);
@@ -115,6 +119,8 @@ struct App {
     buf: Buffer,
     /// Selected text waiting for the main loop to put on the clipboard.
     clip: Option<String>,
+    /// Open FLOWPLAN tab path -> its thread's flowmap.json and state.json, which the view draws from.
+    plans: HashMap<PathBuf, (crate::Flow, crate::State)>,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until Mark quits.
@@ -269,6 +275,73 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
         None if saved == "failed" => "failed",
         None => "off",
     }
+}
+
+/// The flow as an npx-style step tree ending at crate::LOG_MARK; also the plain FLOWPLAN
+/// text (crate::flow_text). `status(agent)`: pending / running / blocked / done / failed.
+pub fn plan_lines(flow: &crate::Flow, status: impl Fn(&str) -> &'static str, frame: usize, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(pal::OVERLAY0);
+    let guide = |s: &str| Span::styled(s.to_string(), dim);
+    let mut out = vec![];
+    for (i, l) in wrap(&flow.goal, width.saturating_sub(3).max(20)).into_iter().enumerate() {
+        let lead = if i == 0 { Span::styled("◆  ", Style::new().fg(pal::MAUVE)) } else { guide("│  ") };
+        out.push(Line::from(vec![lead, Span::styled(l, Style::new().fg(pal::TEXT).add_modifier(Modifier::BOLD))]));
+    }
+    let w = flow.stages.iter().flatten().map(|a| a.name.len()).max().unwrap_or(0);
+    for (i, stage) in flow.stages.iter().enumerate() {
+        let c = stage_color(Some(i));
+        let sts: Vec<&str> = stage.iter().map(|a| status(&a.name)).collect();
+        let st = if sts.iter().all(|s| *s == "done") {
+            "done"
+        } else if sts.contains(&"failed") {
+            "failed"
+        } else if sts.iter().any(|s| matches!(*s, "running" | "blocked")) {
+            "running"
+        } else {
+            "pending"
+        };
+        let n = if stage.len() == 1 { "1 agent".to_string() } else { format!("{} parallel", stage.len()) };
+        out.push(Line::from(guide("│")));
+        out.push(Line::from(vec![step(st, frame), Span::raw("  "), Span::styled(format!("stage {}", i + 1), Style::new().fg(c).add_modifier(Modifier::BOLD)), guide(&format!(" · {n}"))]));
+        for (j, (a, st)) in stage.iter().zip(&sts).enumerate() {
+            let last = j + 1 == stage.len();
+            let wt = a.worktree.as_deref().filter(|w| !w.is_empty()).map_or("main".into(), |w| format!("wt {w}"));
+            let meta = format!("{} · {} · {wt} · {}", a.model, a.effort, a.mode);
+            out.push(Line::from(vec![guide(if last { "│  └─ " } else { "│  ├─ " }), step(st, frame), Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)), guide(&meta)]));
+            out.push(Line::from(vec![guide(if last { "│       " } else { "│  │    " }), Span::styled(crate::first_line(&a.task), dim.add_modifier(Modifier::ITALIC))]));
+        }
+    }
+    out.push(Line::from(guide("│")));
+    out.push(Line::from(guide(crate::LOG_MARK)));
+    out
+}
+
+/// A step's glyph: pending ◇, running spinner, blocked !, done ✔, failed ✖.
+fn step(st: &str, frame: usize) -> Span<'static> {
+    match st {
+        "done" => Span::styled("✔", Style::new().fg(pal::GREEN)),
+        "failed" => Span::styled("✖", Style::new().fg(pal::RED)),
+        "blocked" => Span::styled("!", Style::new().fg(pal::RED).add_modifier(Modifier::BOLD)),
+        "running" => Span::styled(SPIN[frame % SPIN.len()], Style::new().fg(pal::SKY)),
+        _ => Span::styled("◇", Style::new().fg(pal::OVERLAY0)),
+    }
+}
+
+/// Word-wraps `s` to `w` columns (a longer word gets a line of its own).
+fn wrap(s: &str, w: usize) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for word in s.split_whitespace() {
+        let cur = out.last().map_or(0, |l| l.chars().count());
+        if cur > 0 && cur + 1 + word.chars().count() > w {
+            out.push(String::new());
+        }
+        let l = out.last_mut().unwrap();
+        if !l.is_empty() {
+            l.push(' ');
+        }
+        l.push_str(word);
+    }
+    out
 }
 
 /// Catppuccin Mocha (catppuccin.com/palette), the TUI's colors.
@@ -431,6 +504,7 @@ impl App {
                 Tab::View { path, text, .. } => *text = fs::read_to_string(&*path).unwrap_or_else(|e| format!("({e})")),
             }
         }
+        self.load_plans();
         resize_all(self.body);
         // supervise mirrors subagents only for agents execute runs; this covers ones resumed from the sidebar.
         if self.ticks % 7 == 0 {
@@ -448,6 +522,38 @@ impl App {
             }
         }
         self.reflow();
+    }
+
+    /// Reloads flowmap.json + state.json for every open FLOWPLAN tab.
+    fn load_plans(&mut self) {
+        let paths = self.tabs.values().flat_map(|t| &t.list).filter_map(|t| match t {
+            Tab::View { path, rel: None, .. } if path.ends_with("FLOWPLAN") => Some(path.clone()),
+            _ => None,
+        });
+        self.plans = paths.filter_map(|p| Some((p.clone(), crate::load(&p.parent()?.file_name()?.to_string_lossy()).ok()?))).collect();
+    }
+
+    /// A FLOWPLAN tab's view: the step tree with live statuses, then the run log's tail.
+    fn plan_view(&self, path: &Path, text: &str, width: usize) -> Option<Vec<Line<'static>>> {
+        let (flow, state) = self.plans.get(path)?;
+        // Saved done/failed wins (a done agent idles on, live); else the live hook status.
+        let status = |a: &str| match state.agents.get(a).map(|s| s.status.as_str()) {
+            Some("done") => "done",
+            Some("failed") => "failed",
+            _ => match self.agent_status.get(&(state.thread.clone(), a.to_string())).copied() {
+                Some("running" | "idle") => "running",
+                Some("blocked") => "blocked",
+                _ => "pending",
+            },
+        };
+        let frame = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() / 80) as usize;
+        let mut lines = plan_lines(flow, status, frame, width);
+        // The log follows LOG_MARK; a FLOWPLAN from before the marker starts its log at the first "──" line.
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.iter().position(|l| l.trim_end() == crate::LOG_MARK).map(|i| i + 1).or_else(|| all.iter().position(|l| l.starts_with("──")));
+        let start = start.unwrap_or(all.len()).max(all.len().saturating_sub(LOG_TAIL));
+        lines.extend(all[start..].iter().map(|l| Line::styled(l.to_string(), Style::new().fg(pal::OVERLAY0))));
+        Some(lines)
     }
 
     /// Re-flattens the tree (after a refresh or a fold), keeping the selected node.
@@ -616,6 +722,7 @@ impl App {
             };
             tabs.list.push(tab);
             tabs.active = tabs.list.len() - 1;
+            self.load_plans();
         }
         self.focus_main = true;
     }
@@ -1000,6 +1107,11 @@ impl App {
         f.render_widget(Paragraph::new(Line::from(spans)), bar);
 
         let focus_main = self.focus_main;
+        let pad = Rect::new(body.x + 2, body.y + 1, body.width.saturating_sub(2), body.height.saturating_sub(1));
+        let mut plan = self.tabs.get(&self.space).and_then(|t| t.list.get(t.active)).and_then(|t| match t {
+            Tab::View { path, text, rel: None, .. } => self.plan_view(path, text, pad.width as usize),
+            _ => None,
+        });
         match self.cur() {
             Some(Tab::Term { live, .. }) => {
                 let live = live.clone();
@@ -1020,6 +1132,11 @@ impl App {
                 let [d, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
                 f.render_widget(Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), d);
                 f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal::OVERLAY0)).right_aligned(), foot);
+            }
+            Some(Tab::View { scroll, .. }) if plan.is_some() => {
+                let lines = plan.take().unwrap_or_default();
+                *scroll = (*scroll).min(lines.len().saturating_sub(1) as u16);
+                f.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), pad);
             }
             Some(Tab::View { path, text, scroll, .. }) => {
                 let p = if path.extension().is_some_and(|e| e == "md") { Paragraph::new(md_lines(text)) } else { Paragraph::new(text.as_str()) };
@@ -1310,6 +1427,40 @@ mod tests {
         let (a, _) = app.tab_spans[0];
         app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: a, row: 0, modifiers: KeyModifiers::NONE });
         assert_eq!(app.tabs[&PathBuf::new()].active, app.tab_first);
+    }
+
+    #[test]
+    fn flowplan_view_draws_step_tree() {
+        let agent = |name: &str, wt: Option<&str>| crate::Agent {
+            name: name.into(),
+            model: "haiku".into(),
+            effort: "low".into(),
+            worktree: wt.map(String::from),
+            task: format!("task of {name}\nmore"),
+            files: vec![],
+            mode: "default".into(),
+        };
+        let flow = crate::Flow { goal: "ship it".into(), stages: vec![vec![agent("check-db", None), agent("trace-auth", Some("login"))], vec![agent("review", None)]] };
+        let text = crate::flow_text(&flow);
+        assert!(text.contains("│  ├─ ◇ check-db  ") && text.ends_with("│\n└  log\n"), "{text}");
+
+        let path = PathBuf::from("/th/FLOWPLAN");
+        let mut state = crate::State { thread: "th".into(), ..Default::default() };
+        state.agents.insert("check-db".into(), crate::AgentState { status: "done".into() });
+        let mut app = App::default();
+        app.agent_status.insert(("th".into(), "trace-auth".into()), "running");
+        app.plans.insert(path.clone(), (flow, state));
+        let tab = Tab::View { path, title: String::new(), text: text + "   start check-db in /repo\n", scroll: 0, rel: None };
+        app.tabs.insert(PathBuf::new(), Tabs { list: vec![tab], active: 0 });
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let b = term.backend().buffer();
+        let rows: Vec<String> = (0..b.area.height).map(|y| (0..b.area.width).map(|x| b.cell((x, y)).map_or(" ", |c| c.symbol())).collect()).collect();
+        let has = |s: &str| rows.iter().any(|r| r.contains(s));
+        assert!(has("◆  ship it") && has("│  ├─ ✔ check-db") && has("│  │    task of check-db"), "{}", rows.join("\n"));
+        assert!(SPIN.iter().any(|f| has(&format!("│  └─ {f} trace-auth"))) && has("wt login"));
+        assert!(SPIN.iter().any(|f| has(&format!("{f}  stage 1 · 2 parallel"))) && has("◇  stage 2 · 1 agent"));
+        assert!(has("└  log") && has("start check-db in /repo"));
     }
 
     #[test]

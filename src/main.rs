@@ -210,10 +210,10 @@ fn terminate(thread: &str, agent: &str) -> Res<usize> {
 
 /// Appends to ~/.brigd/threads/<thread>/FLOWPLAN, the plan followed by the live run log.
 /// execute never prints: the TUI owns the screen and shows this file.
+/// Log lines go under the plan's last line, LOG_MARK, which the TUI's FLOWPLAN view splits on.
 fn log(thread: &str, msg: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(thread_dir(thread).join("FLOWPLAN")) {
-        let pad = if msg.starts_with('─') { "" } else { "  " };
-        let _ = writeln!(f, "{pad}{msg}");
+        let _ = writeln!(f, "   {msg}");
     }
 }
 
@@ -343,16 +343,12 @@ fn print_flow(flow: &Flow) {
     println!("\n{}", flow_text(flow));
 }
 
+/// The last line of the plan in FLOWPLAN; the run log follows it.
+const LOG_MARK: &str = "└  log";
+
+/// The TUI's FLOWPLAN tree (tui::plan_lines) as plain text, every step pending, ending at LOG_MARK.
 fn flow_text(flow: &Flow) -> String {
-    let mut t = format!("goal: {}\n", flow.goal);
-    for (i, stage) in flow.stages.iter().enumerate() {
-        t += &format!("stage {} ({} parallel)\n", i + 1, stage.len());
-        for a in stage {
-            let wt = a.worktree.as_deref().unwrap_or("-");
-            t += &format!("  {:<19} {:<7} {:<6} wt={:<12} {:<11} {}\n", a.name, a.model, a.effort, wt, a.mode, first_line(&a.task));
-        }
-    }
-    t
+    tui::plan_lines(flow, |_| "pending", 0, 100).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
 }
 
 fn first_line(s: &str) -> String {
