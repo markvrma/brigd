@@ -90,8 +90,9 @@ Example, for "find why login is slow and fix it":
 - Give a worktree only to agents that **edit code**. A fresh worktree has no build
   artifacts or untracked files (e.g. `.env`).
 - One independent change set = one worktree.
-- `mode`: `default` for read-only or careful work (edits prompt the user),
-  `acceptEdits` for agents that edit files, `auto` only when asked.
+- `mode`: brigd launches every agent in Claude Code's `auto` permission mode;
+  `mode` only marks which agents edit files. `default` for read-only work,
+  `acceptEdits` (or `auto`) for agents that edit files.
 - At most **one** `acceptEdits`/`auto` agent per worktree per stage (`null` counts
   as one worktree). Put a second editor of the same worktree in the next stage.
 

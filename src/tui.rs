@@ -332,7 +332,7 @@ pub fn plan_lines(flow: &crate::Flow, status: impl Fn(&str) -> &'static str, fra
         for (j, (a, st)) in stage.iter().zip(&sts).enumerate() {
             let last = j + 1 == stage.len();
             let wt = a.worktree.as_deref().filter(|w| !w.is_empty()).map_or("main".into(), |w| format!("wt {w}"));
-            let meta = format!("{} · {} · {wt} · {}", a.model, a.effort, a.mode);
+            let meta = format!("{} · {} · {wt}", a.model, a.effort);
             out.push(Line::from(vec![guide(if last { "│  └─ " } else { "│  ├─ " }), step(st, frame), Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)), guide(&meta)]));
             out.push(Line::from(vec![guide(if last { "│       " } else { "│  │    " }), Span::styled(crate::first_line(&a.task), dim.add_modifier(Modifier::ITALIC))]));
         }

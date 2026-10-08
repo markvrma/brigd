@@ -462,7 +462,7 @@ fn plan(task: &str) -> Res<Flow> {
         let out = cmd
             .args(["-p", &prompt, "--model", "opus", "--effort", "high", "--output-format", "json"])
             .args(["--no-session-persistence", "--json-schema", SCHEMA, "--tools", "Read,Grep,Glob"])
-            .args(["--append-system-prompt", SKILL])
+            .args(["--append-system-prompt", SKILL, "--permission-mode", "auto"])
             .output()?;
         let v: serde_json::Value = serde_json::from_slice(&out.stdout)
             .map_err(|e| format!("planner output not JSON ({e}): {}", String::from_utf8_lossy(&out.stderr)))?;
@@ -659,7 +659,7 @@ fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
     );
     let s = |x: &str| x.to_string();
     vec![
-        s("--model"), a.model.clone(), s("--effort"), a.effort.clone(), s("--permission-mode"), a.mode.clone(),
+        s("--model"), a.model.clone(), s("--effort"), a.effort.clone(), s("--permission-mode"), s("auto"), // every brigd agent runs in auto mode; `mode` only marks editors
         s("-n"), a.name.clone(),
         // The thread dir sits outside the agent's cwd; grant it so reading the task and writing the result never prompt.
         format!("--add-dir={}", dir.display()),
@@ -827,7 +827,7 @@ fn stray(args: &[String]) -> Res<()> {
         };
         match setup() {
             Ok(a) => {
-                cmd.args(a);
+                cmd.args(a).args(["--permission-mode", "auto"]); // before the user's args, so their own --permission-mode wins
             }
             Err(e) => eprintln!("brigd: not recording this session: {e}"),
         }

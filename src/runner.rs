@@ -217,6 +217,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     let dir = crate::thread_dir(thread).join(agent);
     let mut cmd = CommandBuilder::new("claude");
     let cwd = if Path::new(agent).starts_with(crate::tree::STRAY) {
+        cmd.args(["--permission-mode", "auto"]);
         PathBuf::from(fs::read_to_string(dir.join("cwd")).map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?.trim())
     } else {
         let (flow, state) = crate::load(thread)?;
