@@ -1066,7 +1066,7 @@ impl App {
         self.send(bytes.as_bytes());
     }
 
-    fn row_line(&self, r: &Row, selected: bool) -> Line<'static> {
+    fn row_line(&self, r: &Row, selected: bool, width: usize) -> Line<'static> {
         let arrow = match (r.folder, r.open) {
             (false, _) => "  ",
             (true, true) => "▾ ",
@@ -1099,12 +1099,20 @@ impl App {
         }
         let slash = if matches!(r.kind, Kind::Output | Kind::Diff) { "" } else { "/" };
         spans.push(Span::styled(format!("{}{slash}", r.label), label));
+        // Worktree name (agents) and +add -del (diffs) sit flush right, one column of padding.
+        let mut right = vec![];
         if let Some(wt) = &r.worktree {
-            spans.push(Span::styled(format!(" {wt}"), Style::new().fg(pal::OVERLAY0)));
+            right.push(Span::styled(wt.clone(), Style::new().fg(pal::OVERLAY0)));
         }
         if let Some((add, del)) = (r.kind == Kind::Diff).then(|| tree::diff_stat(&r.path)).flatten() {
-            spans.push(Span::styled(format!(" +{add}"), Style::new().fg(pal::GREEN)));
-            spans.push(Span::styled(format!(" -{del}"), Style::new().fg(pal::RED)));
+            right.push(Span::styled(format!("+{add}"), Style::new().fg(pal::GREEN)));
+            right.push(Span::raw(" "));
+            right.push(Span::styled(format!("-{del}"), Style::new().fg(pal::RED)));
+        }
+        if !right.is_empty() {
+            let used: usize = spans.iter().chain(&right).map(|s| s.content.chars().count()).sum();
+            spans.push(Span::raw(" ".repeat(width.saturating_sub(used + 1).max(1))));
+            spans.extend(right);
         }
         if r.kind == Kind::Thread {
             let st = self.thread_status.get(&r.path).map(String::as_str).unwrap_or("");
@@ -1141,7 +1149,7 @@ impl App {
         let mut lines: Vec<Line> = vec![];
         for &(y, i) in &shown {
             lines.resize(y, Line::default());
-            lines.push(self.row_line(&self.rows[i], i == self.sel));
+            lines.push(self.row_line(&self.rows[i], i == self.sel, inner.width as usize));
         }
         if lines.is_empty() {
             f.render_widget(Paragraph::new("no threads yet\n\nbrigd <name> \"task\""), inner);
