@@ -14,7 +14,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
@@ -924,16 +924,17 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let [top, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(f.area());
-        let [side, main] = Layout::horizontal([Constraint::Length(SIDE_W), Constraint::Min(0)]).areas(top);
+        let [side, divider, main] = Layout::horizontal([Constraint::Length(SIDE_W), Constraint::Length(1), Constraint::Min(0)]).areas(top);
         let [bar, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(main);
-        let border = if self.focus_main { pal::SURFACE1 } else { pal::LAVENDER };
-        let block = Block::bordered().title(" spaces ").border_style(Style::new().fg(border)).padding(Padding::horizontal(1));
-        let inner = block.inner(side);
+        let border = if self.focus_main { pal::OVERLAY0 } else { pal::LAVENDER };
+        // No box: a dim title row, then the tree inside a one-column margin.
+        let inner = Rect::new(side.x + 1, side.y + 1, side.width.saturating_sub(2), side.height.saturating_sub(1));
         if body != self.body {
             resize_all(body);
         }
         (self.screen, self.side, self.side_inner, self.tab_bar, self.body, self.hint) = (f.area(), side, inner, bar, body, hint);
-        f.render_widget(block, side);
+        f.render_widget(Paragraph::new("spaces").style(Style::new().fg(pal::OVERLAY0)), Rect::new(inner.x, side.y, inner.width, 1));
+        f.render_widget(Paragraph::new(vec![Line::from("┃"); divider.height as usize]).style(Style::new().fg(border)), divider);
 
         let h = inner.height as usize;
         self.offset = self.offset.min(max_offset(&self.rows, h));
