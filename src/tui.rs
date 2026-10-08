@@ -156,10 +156,23 @@ struct Newt {
     hidden: bool,
 }
 
-/// `s` cut into rows of at most `w` chars; always at least one row.
+/// `s` cut into rows of at most `w` display columns (and at each '\n'); always at least one row.
 fn chunk(s: &str, w: usize) -> Vec<String> {
-    let c: Vec<char> = s.chars().collect();
-    if c.is_empty() { vec![String::new()] } else { c.chunks(w.max(1)).map(|r| r.iter().collect()).collect() }
+    let w = w.max(1);
+    let (mut rows, mut row, mut used) = (vec![], String::new(), 0);
+    for c in s.chars() {
+        let cw = if c == '\n' { 0 } else { Span::raw(c.to_string()).width() };
+        if c == '\n' || (used + cw > w && used > 0) {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if c != '\n' {
+            row.push(c);
+            used += cw;
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 #[derive(Default)]
@@ -1288,7 +1301,12 @@ impl App {
                 self.drag = panes.chain([self.hint]).find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(repo) = self.plus_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, p)| p.clone()) {
                     self.prefix = false;
-                    self.newt = Some(Newt { repo, ..Default::default() });
+                    // A hidden box still planning is tracked in `newt`: replacing it would lose its inputs on failure.
+                    if let Some(n) = self.newt.as_mut().filter(|n| n.planning) {
+                        n.hidden = false;
+                    } else {
+                        self.newt = Some(Newt { repo, ..Default::default() });
+                    }
                 } else if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
                 } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
@@ -1613,13 +1631,14 @@ impl App {
                 let style = if n.planning { dim } else { Style::new() };
                 lines.extend(chunk(&format!("{label}{text}{cursor}"), inner).into_iter().map(|l| Line::styled(l, style)));
             }
-            lines.push(if n.planning {
-                Line::styled(format!("{} planning {}… · Esc hides", SPIN[self.ticks as usize % SPIN.len()], n.name), Style::new().fg(pal::YELLOW))
+            let (status, style) = if n.planning {
+                (format!("{} planning {}… · Esc hides", SPIN[self.ticks as usize % SPIN.len()], n.name), Style::new().fg(pal::YELLOW))
             } else if let Some(e) = &n.err {
-                Line::styled(e.clone(), Style::new().fg(pal::RED))
+                (e.clone(), Style::new().fg(pal::RED))
             } else {
-                Line::styled("Tab/↑↓ switch · Enter next/plans · Esc cancels", dim)
-            });
+                ("Tab/↑↓ switch · Enter next/plans · Esc cancels".into(), dim)
+            };
+            lines.extend(chunk(&status, inner).into_iter().map(|l| Line::styled(l, style)));
             Some((format!(" new thread in {} ", n.repo.display()), lines, w))
         } else {
             self.confirm_run.as_ref().map(|(name, repo)| {
@@ -1629,10 +1648,12 @@ impl App {
             })
         };
         if let Some((title, lines, w)) = modal {
-            let h = (lines.len() as u16 + 2).min(a.height);
+            let h = (lines.len() as u16).saturating_add(2).min(a.height);
             let r = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal::LAVENDER))), r);
+            // Clamped to the screen: drop the top rows so the cursor row and the status line stay visible.
+            let skip = (lines.len() as u16).saturating_sub(h.saturating_sub(2));
+            f.render_widget(Paragraph::new(lines).scroll((skip, 0)).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal::LAVENDER))), r);
         }
 
         if let Some((r, a, Some(b))) = self.drag {
@@ -2118,6 +2139,8 @@ mod tests {
     fn chunk_by_width() {
         assert_eq!(chunk("abcde", 2), ["ab", "cd", "e"]);
         assert_eq!(chunk("", 2), [""]);
+        assert_eq!(chunk("日本語", 4), ["日本", "語"]); // wide chars are 2 columns
+        assert_eq!(chunk("a\nb", 4), ["a", "b"]);
     }
 
     #[test]
@@ -2129,6 +2152,15 @@ mod tests {
         app.on_bg(Bg::Failed("n".into(), "boom".into())); // reopens, editable, fields kept
         let n = app.newt.as_ref().unwrap();
         assert!(!n.hidden && !n.planning && n.err.as_deref() == Some("boom") && (n.name.as_str(), n.task.as_str()) == ("n", "t"));
+    }
+
+    #[test]
+    fn newt_draws_on_tiny_terminal() {
+        let mut app = App { newt: Some(Newt { repo: "/r".into(), name: "n".into(), task: "日本語".repeat(40), err: Some("a\nb".into()), ..Default::default() }), ..Default::default() };
+        for (w, h) in [(1, 1), (10, 3), (80, 4), (80, 24)] {
+            let mut t = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            t.draw(|f| app.draw(f)).unwrap();
+        }
     }
 
     #[test]
