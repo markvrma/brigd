@@ -504,6 +504,8 @@ impl App {
     fn refresh(&mut self) {
         self.ticks += 1;
         self.tree = tree::build(&crate::root());
+        let terms: Vec<_> = self.live_shells().into_iter().map(|(a, t)| (t, a.agent.clone())).collect();
+        add_terminals(&mut self.tree, &terms);
         let reg = runner::registry().lock().unwrap().clone();
         let (mut agents, mut threads) = (HashMap::new(), HashMap::new());
         for t in self.tree.iter().flat_map(|s| &s.children) {
@@ -668,6 +670,12 @@ impl App {
                 }
                 self.open_agent(thread.clone(), &thread, &agent, stage);
             }
+            Kind::Terminal => {
+                let (key, name) = (r.thread.clone(), r.label.clone());
+                if let Some((a, _)) = self.live_shells().into_iter().find(|(a, t)| a.agent == name && *t == key) {
+                    self.open_agent(key, &a.thread, &name, None);
+                }
+            }
             _ if r.folder => self.toggle(i),
             _ => {}
         }
@@ -712,7 +720,9 @@ impl App {
             Tab::Term { thread: t, agent, .. } if *t == thread => Some(agent.as_str()),
             _ => None,
         });
-        let name = fresh_name(taken.chain(reg.iter().filter(|(k, a)| k.0 == thread && a.alive()).map(|(k, _)| k.1.as_str())));
+        // ponytail: names of every live shell are taken too, so the terminal folder can find a shell by thread + name
+        let is_shell = |k: &(String, String)| k.0 == thread || self.shell_thread.contains_key(k);
+        let name = fresh_name(taken.chain(reg.iter().filter(|(k, a)| is_shell(k) && a.alive()).map(|(k, _)| k.1.as_str())));
         // No dir: a shell has no hooks/status/session files (status() reads as "starting", never shown).
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut cmd = portable_pty::CommandBuilder::new(&shell);
@@ -830,9 +840,7 @@ impl App {
         let mut targets = live_agents().into_iter().filter(|a| a.thread == thread).collect::<Vec<_>>();
         if strays {
             // ponytail: a shell tab is matched to the thread by $BRIGD_THREAD, not to the exact claude inside it
-            let reg = runner::registry().lock().unwrap().clone();
-            let shells = reg.iter().filter(|(k, a)| a.alive() && self.shell_thread.get(*k).is_some_and(|t| t == thread));
-            targets.extend(shells.map(|(_, a)| a.clone()));
+            targets.extend(self.live_shells().into_iter().filter(|(_, t)| t == thread).map(|(a, _)| a));
         }
         let bytes: &[u8] = if resume { b"continue\r" } else { b"\x1b" };
         targets.iter().for_each(|a| {
@@ -843,6 +851,12 @@ impl App {
         } else {
             self.paused.insert(thread.into());
         }
+    }
+
+    /// Live shell tabs, each with the thread its $BRIGD_THREAD names.
+    fn live_shells(&self) -> Vec<(Arc<LiveAgent>, String)> {
+        let reg = runner::registry().lock().unwrap().clone();
+        reg.iter().filter(|(_, a)| a.alive()).filter_map(|(k, a)| Some((a.clone(), self.shell_thread.get(k)?.clone()))).collect()
     }
 
     fn terminate(&mut self, thread: &str, agent: &str) {
@@ -861,9 +875,10 @@ impl App {
         }
     }
 
-    /// Stops the thread's agents and strays and closes its tabs (Delete / Archive come next).
+    /// Stops the thread's agents, strays and terminals and closes its tabs (Delete / Archive come next).
     fn stop_thread(&mut self, thread: &str) {
         crate::stop_thread(thread);
+        self.live_shells().into_iter().filter(|(_, t)| t == thread).for_each(|(a, _)| a.kill());
         self.tabs.remove(thread);
         self.focus_main &= self.tabs.get(&self.thread).is_some_and(|t| !t.list.is_empty());
         self.paused.remove(thread);
@@ -1109,13 +1124,17 @@ impl App {
                     spans.push(Span::styled(format!("{}·", s + 1), Style::new().fg(stage_color(r.stage))));
                 }
             }
+            Kind::Terminal => {
+                spans.push(Span::styled("$ ", Style::new().fg(pal::GREEN)));
+                label = label.fg(pal::TEXT);
+            }
             Kind::Output => label = label.fg(pal::SKY),
             Kind::Diff => label = label.fg(pal::YELLOW),
             Kind::Space => label = label.fg(pal::MAUVE).add_modifier(Modifier::BOLD),
             Kind::Thread => label = label.fg(pal::TEXT).add_modifier(Modifier::BOLD),
             _ => label = label.fg(pal::SUBTEXT0),
         }
-        let slash = if matches!(r.kind, Kind::Output | Kind::Diff) { "" } else { "/" };
+        let slash = if matches!(r.kind, Kind::Output | Kind::Diff | Kind::Terminal) { "" } else { "/" };
         spans.push(Span::styled(format!("{}{slash}", r.label), label));
         // Worktree name (agents) and +add -del (diffs) sit flush right, one column of padding.
         let mut right = vec![];
@@ -1305,6 +1324,23 @@ impl App {
 fn has_live_stray(n: &Node, thread: &str) -> bool {
     let strays = |t: &Node| t.children.iter().filter(|c| c.kind == Kind::Folder).flat_map(|c| &c.children).any(|a| a.kind == Kind::Agent && !matches!(stray_status(&a.path), "off" | "done" | "failed"));
     if n.kind == Kind::Thread { n.label == thread && strays(n) } else { n.children.iter().any(|c| has_live_stray(c, thread)) }
+}
+
+/// Lists each thread's live terminals (`terms`: (thread, shell name)) in a TERMS folder, after its
+/// FLOWPLAN if it has one, else first.
+fn add_terminals(tree: &mut [Node], terms: &[(String, String)]) {
+    for t in tree.iter_mut().flat_map(|s| &mut s.children) {
+        let mut names: Vec<&str> = terms.iter().filter(|(th, _)| *th == t.label).map(|(_, n)| n.as_str()).collect();
+        if names.is_empty() {
+            continue;
+        }
+        names.sort();
+        let dir = t.path.join(".terminal");
+        let node = |kind, label: &str, path, children| Node { kind, label: label.into(), path, children, stage: None, worktree: None };
+        let kids = names.into_iter().map(|n| node(Kind::Terminal, n, dir.join(n), vec![])).collect();
+        let at = t.children.iter().position(|c| c.kind == Kind::Output && c.path.ends_with("FLOWPLAN")).map_or(0, |i| i + 1);
+        t.children.insert(at, node(Kind::Folder, tree::TERMS, dir, kids));
+    }
 }
 
 /// A stray tab shows "stray-1", not "stray agents/stray-1".
@@ -1601,6 +1637,20 @@ mod tests {
         assert_eq!((paths(&app, "t"), app.tabs["t"].active), (want.clone(), 0));
         app.open_view("u".into(), PathBuf::from("/nope/7"));
         assert_eq!((paths(&app, "t"), app.tabs["u"].list.len()), (want, 1));
+    }
+
+    #[test]
+    fn terminal_folder_under_thread() {
+        let node = |kind, label: &str, path: &str, children| Node { kind, label: label.into(), path: PathBuf::from(path), children, stage: None, worktree: None };
+        let t = node(Kind::Thread, "t", "/t", vec![node(Kind::Output, "FLOWPLAN", "/t/FLOWPLAN", vec![]), node(Kind::Folder, tree::STRAY, "/t/stray agents", vec![]), node(Kind::Agent, "a", "/t/a", vec![])]);
+        let mut tree = vec![node(Kind::Space, "repo", "/repo", vec![t, node(Kind::Thread, "u", "/u", vec![node(Kind::Agent, "b", "/u/b", vec![])])])];
+        let terms = [("t", "term-2"), ("t", "term-1"), ("zz", "term-3"), ("u", "term-4")].map(|(a, b)| (a.to_string(), b.to_string()));
+        add_terminals(&mut tree, &terms);
+        let mut rows = Vec::new();
+        flatten(&tree[0], 0, &tree[0].path, "", &HashSet::new(), &mut rows);
+        let labels: Vec<_> = rows.iter().map(|r| (r.label.as_str(), r.thread.as_str())).collect();
+        assert_eq!(labels, [("repo", ""), ("t", "t"), ("FLOWPLAN", "t"), ("terminal", "t"), ("term-1", "t"), ("term-2", "t"), ("stray agents", "t"), ("a", "t"), ("u", "u"), ("terminal", "u"), ("term-4", "u"), ("b", "u")]);
+        assert_eq!((rows[4].kind.clone(), rows[4].path.clone()), (Kind::Terminal, PathBuf::from("/t/.terminal/term-1")));
     }
 
     #[test]

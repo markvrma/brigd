@@ -21,12 +21,17 @@ pub enum Kind {
     Output,
     /// A file the agent changed; opens as a diff (see `diff_view`).
     Diff,
-    /// The thread's "stray agents" dir: claude sessions started from a brigd terminal.
+    /// The thread's "stray agents" dir (claude sessions started from a brigd terminal), or its TERMS folder.
     Folder,
+    /// A live brigd terminal (shell tab) whose $BRIGD_THREAD is the thread; listed by the TUI, not on disk.
+    Terminal,
 }
 
 /// <thread>/stray agents/<name>/{cwd,session,base,pid,status}: claude sessions typed in a brigd terminal.
 pub const STRAY: &str = "stray agents";
+
+/// The folder of a thread's live terminals (synthetic path <thread dir>/.terminal).
+pub const TERMS: &str = "terminal";
 
 /// An agent's registry/state name: its label, or "stray agents/<label>" for a stray.
 pub fn agent_id(path: &Path, label: &str) -> String {
