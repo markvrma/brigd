@@ -122,6 +122,8 @@ fn pane_rects(main: Rect, n: usize) -> Vec<(Rect, Rect)> {
 
 /// Tabs per tab bar; opening one more closes the oldest opened (its agent keeps running).
 const MAX_TABS: usize = 5;
+/// Width of the new-thread window.
+const NEWT_W: u16 = 60;
 
 fn push_tab(tabs: &mut Tabs, tab: Tab) {
     tabs.list.push(tab);
@@ -138,6 +140,40 @@ enum Bg {
     /// (thread, message): planning failed.
     Failed(String, String),
     Finished(String, Result<(), String>),
+}
+
+/// The '+' new-thread window: a name and a task field; once submitted, read-only while planning.
+#[derive(Debug, Default, PartialEq)]
+struct Newt {
+    repo: PathBuf,
+    name: String,
+    task: String,
+    /// Which field has focus: false = name, true = task.
+    focus_task: bool,
+    err: Option<String>,
+    /// Submitted: the planner thread runs and the fields are read-only.
+    planning: bool,
+    /// Esc while planning: the box is gone but planning goes on.
+    hidden: bool,
+}
+
+/// `s` cut into rows of at most `w` display columns (and at each '\n'); always at least one row.
+fn chunk(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let (mut rows, mut row, mut used) = (vec![], String::new(), 0);
+    for c in s.chars() {
+        let cw = if c == '\n' { 0 } else { Span::raw(c.to_string()).width() };
+        if c == '\n' || (used + cw > w && used > 0) {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if c != '\n' {
+            row.push(c);
+            used += cw;
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 #[derive(Default)]
@@ -174,8 +210,8 @@ struct App {
     pause_btns: Vec<(Rect, String)>,
     /// '+' rects from the last draw -> the space (repo) a new thread goes in.
     plus_btns: Vec<(Rect, PathBuf)>,
-    /// The new-thread window: (repo, "<name> <task>" typed so far, error). Takes every key.
-    newt: Option<(PathBuf, String, Option<String>)>,
+    /// The new-thread window. Takes every key unless hidden.
+    newt: Option<Newt>,
     /// A planned (thread, repo) waiting for y to run, n to be deleted.
     confirm_run: Option<(String, String)>,
     /// Planned threads waiting behind `confirm_run`.
@@ -1054,22 +1090,23 @@ impl App {
     }
 
     /// Enter in the new-thread window: reserves the name, then plans off the UI thread.
-    fn submit_newt(&mut self, repo: PathBuf, input: String) {
-        let (name, task) = input.trim().split_once(' ').map(|(n, t)| (n.to_string(), t.trim().to_string())).unwrap_or((input.trim().into(), String::new()));
+    fn submit_newt(&mut self, repo: PathBuf, name: String, task: String) {
         let dir = crate::thread_dir(&name);
         // create_dir reserves the name; tree::build hides the dir until flowmap.json exists.
         let reserve = || -> Res<()> {
             crate::check_new_thread(&name)?;
             if task.is_empty() {
-                return Err("type <name> <task>".into());
+                return Err("task is empty".into());
             }
             fs::create_dir_all(crate::root().join("threads"))?;
             Ok(fs::create_dir(&dir)?)
         };
         if let Err(e) = reserve() {
-            self.newt = Some((repo, input, Some(e.to_string())));
+            let focus_task = !task.is_empty() || name.is_empty();
+            self.newt = Some(Newt { repo, name, task, focus_task, err: Some(e.to_string()), ..Default::default() });
             return;
         }
+        self.newt = Some(Newt { repo: repo.clone(), name: name.clone(), task: task.clone(), focus_task: true, planning: true, ..Default::default() });
         self.planning.insert(name.clone());
         self.flash(format!("planning {name}…"));
         let tx = self.tx();
@@ -1096,10 +1133,16 @@ impl App {
         match m {
             Bg::Failed(name, e) => {
                 self.planning.remove(&name);
-                self.flash(format!("plan {name}: {e}"));
+                match &mut self.newt {
+                    Some(n) if n.planning && n.name == name => (n.planning, n.hidden, n.err) = (false, false, Some(e)),
+                    _ => self.flash(format!("plan {name}: {e}")),
+                }
             }
             Bg::Planned(name, repo) => {
                 self.planning.remove(&name);
+                if self.newt.as_ref().is_some_and(|n| n.planning && n.name == name) {
+                    self.newt = None;
+                }
                 self.refresh();
                 self.open_flowplan(&name);
                 if self.confirm_run.is_some() {
@@ -1129,15 +1172,27 @@ impl App {
 
     fn on_key(&mut self, k: KeyEvent) {
         // The new-thread window and its run confirm come first: no key may reach anything behind them.
-        if let Some((repo, mut input, err)) = self.newt.take() {
-            match k.code {
-                KeyCode::Esc => return,
-                KeyCode::Enter => return self.submit_newt(repo, input),
-                KeyCode::Backspace => _ = input.pop(),
-                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => input.push(c),
-                _ => return self.newt = Some((repo, input, err)),
+        if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
+            if n.planning {
+                // Read-only while planning; Esc only hides the box.
+                n.hidden = k.code == KeyCode::Esc;
+                return;
             }
-            self.newt = Some((repo, input, None));
+            n.err = None;
+            match k.code {
+                KeyCode::Esc => self.newt = None,
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => n.focus_task = !n.focus_task,
+                KeyCode::Enter if !n.focus_task => n.focus_task = true,
+                KeyCode::Enter => {
+                    let n = self.newt.take().unwrap();
+                    self.submit_newt(n.repo, n.name.trim().into(), n.task.trim().into());
+                }
+                KeyCode::Backspace => _ = if n.focus_task { &mut n.task } else { &mut n.name }.pop(),
+                KeyCode::Char(c) if !k.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                    if n.focus_task { &mut n.task } else { &mut n.name }.push(c)
+                }
+                _ => {}
+            }
             return;
         }
         if let Some((name, repo)) = self.confirm_run.take() {
@@ -1246,7 +1301,7 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) {
-        if self.newt.is_some() || self.confirm_run.is_some() {
+        if self.newt.as_ref().is_some_and(|n| !n.hidden) || self.confirm_run.is_some() {
             return;
         }
         let at = Position { x: m.column, y: m.row };
@@ -1284,7 +1339,12 @@ impl App {
                 self.drag = panes.chain([self.hint]).find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(repo) = self.plus_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, p)| p.clone()) {
                     self.prefix = false;
-                    self.newt = Some((repo, String::new(), None));
+                    // A hidden box still planning is tracked in `newt`: replacing it would lose its inputs on failure.
+                    if let Some(n) = self.newt.as_mut().filter(|n| n.planning) {
+                        n.hidden = false;
+                    } else {
+                        self.newt = Some(Newt { repo, ..Default::default() });
+                    }
                 } else if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
                 } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
@@ -1346,8 +1406,11 @@ impl App {
     }
 
     fn on_paste(&mut self, s: &str) {
-        if let Some((_, input, _)) = &mut self.newt {
-            return input.push_str(&s.replace(['\r', '\n'], " "));
+        if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
+            if !n.planning {
+                if n.focus_task { &mut n.task } else { &mut n.name }.push_str(&s.replace(['\r', '\n'], " "));
+            }
+            return;
         }
         if self.confirm_run.is_some() || !self.focus_main {
             return;
@@ -1594,19 +1657,41 @@ impl App {
         }
 
         // The new-thread window, or the run confirm once it is planned, centered on top.
-        let modal = if let Some((repo, input, err)) = &self.newt {
-            let help = err.as_ref().map_or(Span::styled("<name> <task> · Enter plans · Esc cancels", Style::new().fg(pal().overlay0)), |e| Span::styled(e.clone(), Style::new().fg(pal().red)));
-            Some((format!(" new thread in {} ", repo.display()), vec![Line::from(format!("> {input}█")), Line::from(help)]))
+        let a = f.area();
+        let modal = if let Some(n) = self.newt.as_ref().filter(|n| !n.hidden) {
+            // Fixed width; each field wraps inside it and the box grows to fit.
+            let w = NEWT_W.min(a.width);
+            let inner = (w as usize).saturating_sub(2);
+            let dim = Style::new().fg(pal().overlay0);
+            let mut lines = vec![];
+            for (label, text, on) in [("name: ", &n.name, !n.focus_task), ("task: ", &n.task, n.focus_task)] {
+                let cursor = if on && !n.planning { "█" } else { "" };
+                let style = if n.planning { dim } else { Style::new() };
+                lines.extend(chunk(&format!("{label}{text}{cursor}"), inner).into_iter().map(|l| Line::styled(l, style)));
+            }
+            let (status, style) = if n.planning {
+                (format!("{} planning {}… · Esc hides", SPIN[self.ticks as usize % SPIN.len()], n.name), Style::new().fg(pal().yellow))
+            } else if let Some(e) = &n.err {
+                (e.clone(), Style::new().fg(pal().red))
+            } else {
+                ("Tab/↑↓ switch · Enter next/plans · Esc cancels".into(), dim)
+            };
+            lines.extend(chunk(&status, inner).into_iter().map(|l| Line::styled(l, style)));
+            Some((format!(" new thread in {} ", n.repo.display()), lines, w))
         } else {
-            self.confirm_run.as_ref().map(|(name, repo)| (" run ".into(), vec![Line::styled(format!("Run thread {name} in {repo}? y / n"), Style::new().add_modifier(Modifier::BOLD))]))
+            self.confirm_run.as_ref().map(|(name, repo)| {
+                let l = Line::styled(format!("Run thread {name} in {repo}? y / n"), Style::new().add_modifier(Modifier::BOLD));
+                let w = (l.width().max(50) as u16 + 4).min(a.width);
+                (" run ".into(), vec![l], w)
+            })
         };
-        if let Some((title, lines)) = modal {
-            let a = f.area();
-            let w = (lines.iter().map(Line::width).chain([title.chars().count(), 50]).max().unwrap_or(0) as u16 + 4).min(a.width);
-            let h = (lines.len() as u16 + 2).min(a.height);
+        if let Some((title, lines, w)) = modal {
+            let h = (lines.len() as u16).saturating_add(2).min(a.height);
             let r = Rect::new(a.x + (a.width - w) / 2, a.y + (a.height - h) / 2, w, h);
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal().lavender))), r);
+            // Clamped to the screen: drop the top rows so the cursor row and the status line stay visible.
+            let skip = (lines.len() as u16).saturating_sub(h.saturating_sub(2));
+            f.render_widget(Paragraph::new(lines).scroll((skip, 0)).wrap(Wrap { trim: false }).block(Block::bordered().title(title).border_style(Style::new().fg(pal().lavender))), r);
         }
 
         if let Some((r, a, Some(b))) = self.drag {
@@ -2067,16 +2152,25 @@ mod tests {
     fn plus_opens_new_thread_window() {
         let mut app = App { plus_btns: vec![(Rect::new(30, 1, 3, 1), PathBuf::from("/repo"))], ..Default::default() };
         app.on_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 31, row: 1, modifiers: KeyModifiers::NONE });
-        assert_eq!(app.newt, Some((PathBuf::from("/repo"), String::new(), None)));
+        assert_eq!(app.newt, Some(Newt { repo: "/repo".into(), ..Default::default() }));
         let typ = |app: &mut App, s: &str| s.chars().for_each(|c| app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE)));
         typ(&mut app, "ab");
         app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
         app.on_key(key(KeyCode::Char('t'), KeyModifiers::ALT)); // no terminal opens behind the window
-        assert_eq!((app.newt.as_ref().unwrap().1.as_str(), app.tabs.is_empty()), ("a", true));
+        assert_eq!((app.newt.as_ref().unwrap().name.as_str(), app.tabs.is_empty()), ("a", true));
         app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
-        typ(&mut app, "Bad! x");
+        typ(&mut app, "Bad!");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // name -> task
+        assert!(app.newt.as_ref().unwrap().focus_task);
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!app.newt.as_ref().unwrap().focus_task);
+        app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        typ(&mut app, "x y");
+        app.on_paste("p\nq");
+        assert_eq!(app.newt.as_ref().unwrap().task, "x yp q");
         app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // a bad name keeps the window open with an error
-        assert!(app.newt.as_ref().unwrap().2.as_ref().unwrap().contains("bad thread name"));
+        let n = app.newt.as_ref().unwrap();
+        assert!(n.err.as_ref().unwrap().contains("bad thread name") && !n.planning && n.task == "x yp q");
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.newt.is_none());
         // "Bad!" can never be a thread, so n's delete touches nothing on disk.
@@ -2085,6 +2179,34 @@ mod tests {
         assert!(app.confirm_run.is_some());
         app.on_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(app.confirm_run.is_none());
+    }
+
+    #[test]
+    fn chunk_by_width() {
+        assert_eq!(chunk("abcde", 2), ["ab", "cd", "e"]);
+        assert_eq!(chunk("", 2), [""]);
+        assert_eq!(chunk("日本語", 4), ["日本", "語"]); // wide chars are 2 columns
+        assert_eq!(chunk("a\nb", 4), ["a", "b"]);
+    }
+
+    #[test]
+    fn newt_planning_state() {
+        let mut app = App { newt: Some(Newt { repo: "/r".into(), name: "n".into(), task: "t".into(), planning: true, ..Default::default() }), ..Default::default() };
+        app.on_key(key(KeyCode::Char('x'), KeyModifiers::NONE)); // read-only
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)); // hides, keeps planning
+        assert!(app.newt.as_ref().unwrap().hidden);
+        app.on_bg(Bg::Failed("n".into(), "boom".into())); // reopens, editable, fields kept
+        let n = app.newt.as_ref().unwrap();
+        assert!(!n.hidden && !n.planning && n.err.as_deref() == Some("boom") && (n.name.as_str(), n.task.as_str()) == ("n", "t"));
+    }
+
+    #[test]
+    fn newt_draws_on_tiny_terminal() {
+        let mut app = App { newt: Some(Newt { repo: "/r".into(), name: "n".into(), task: "日本語".repeat(40), err: Some("a\nb".into()), ..Default::default() }), ..Default::default() };
+        for (w, h) in [(1, 1), (10, 3), (80, 4), (80, 24)] {
+            let mut t = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            t.draw(|f| app.draw(f)).unwrap();
+        }
     }
 
     #[test]
