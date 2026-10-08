@@ -191,7 +191,18 @@ fn terminate(thread: &str, agent: &str) -> Res<usize> {
         let repo = PathBuf::from(&state.repo);
         (tree::space_cwd(&root(), &repo, thread, a.worktree.as_deref().unwrap_or("")), repo, Some(state))
     };
-    // First, so a supervise thread that sees the process die does not report it done.
+    stop_agent(thread, agent)?;
+    let n = tree::revert(&PathBuf::from(env::var("HOME").unwrap_or_default()), &cwd, &repo, &dir)?;
+    if let Some(state) = state {
+        set_agent(&Mutex::new(state), agent, "failed")?;
+    }
+    Ok(n)
+}
+
+/// Kills `agent`'s claude (its LiveAgent, or a stray's pid) and waits for it to be gone.
+/// Marks it `terminated` first, so a supervise thread that sees it die does not report it done.
+fn stop_agent(thread: &str, agent: &str) -> Res<()> {
+    let dir = thread_dir(thread).join(agent);
     fs::write(dir.join(runner::TERMINATED), "")?;
     let pid = fs::read_to_string(dir.join("pid")).ok(); // a stray running in a terminal tab
     if let Some(l) = runner::live(thread, agent) {
@@ -213,11 +224,67 @@ fn terminate(thread: &str, agent: &str) -> Res<usize> {
         thread::sleep(Duration::from_millis(100));
     }
     let _ = fs::remove_file(dir.join("pid"));
-    let n = tree::revert(&PathBuf::from(env::var("HOME").unwrap_or_default()), &cwd, &repo, &dir)?;
-    if let Some(state) = state {
-        set_agent(&Mutex::new(state), agent, "failed")?;
+    Ok(())
+}
+
+// ---------- deleting / archiving threads ----------
+
+/// Stops every running agent of `thread`: its live flow agents and its strays with a live pid.
+/// Unlike terminate it reverts nothing (an archived thread keeps its work).
+fn stop_thread(thread: &str) {
+    let mut agents: Vec<String> = runner::registry().lock().unwrap().values().filter(|a| a.thread == thread && a.alive()).map(|a| a.agent.clone()).collect();
+    let strays = fs::read_dir(thread_dir(thread).join(tree::STRAY)).into_iter().flatten().flatten().map(|e| e.path());
+    agents.extend(strays.filter(|d| fs::read_to_string(d.join("pid")).is_ok_and(|p| runner::pid_alive(&p))).filter_map(|d| Some(format!("{}/{}", tree::STRAY, d.file_name()?.to_string_lossy()))));
+    for a in agents {
+        let _ = stop_agent(thread, &a);
     }
-    Ok(n)
+}
+
+/// <root>/archive/threads/<thread>: where archive_thread moves a thread.
+fn archive_dir(root: &Path, thread: &str) -> PathBuf {
+    root.join("archive/threads").join(thread)
+}
+
+/// Moves <root>/threads/<thread> to archive_dir, unchanged; refuses if that exists. Its git
+/// worktrees stay in <root>/worktrees (moving them by hand would break git's links to them).
+fn archive_thread(root: &Path, thread: &str) -> Res<PathBuf> {
+    let to = archive_dir(root, thread);
+    if to.exists() {
+        return Err(format!("{} already exists", to.display()).into());
+    }
+    fs::create_dir_all(to.parent().unwrap_or(root))?;
+    fs::rename(root.join("threads").join(thread), &to)?;
+    Ok(to)
+}
+
+/// Removes `thread` for good: its git worktrees (in its state.json repo) and their
+/// brigd/<thread>/* branches, then <root>/threads/<thread> and <root>/worktrees/<thread>.
+fn delete_thread(root: &Path, thread: &str) -> Res<()> {
+    let (tdir, wdir) = (root.join("threads").join(thread), root.join("worktrees").join(thread));
+    let state: serde_json::Value = fs::read_to_string(tdir.join("state.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let repo = state["repo"].as_str().map(PathBuf::from).filter(|r| r.exists());
+    let git = |args: &[&str]| repo.as_ref().and_then(|r| Command::new("git").arg("-C").arg(r).args(args).output().ok());
+    for wt in fs::read_dir(&wdir).into_iter().flatten().flatten() {
+        let _ = git(&["worktree", "remove", "--force", &wt.path().to_string_lossy()]);
+    }
+    for d in [&tdir, &wdir] {
+        match fs::remove_dir_all(d) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(format!("{}: {e}", d.display()).into()),
+            _ => {}
+        }
+    }
+    let _ = git(&["worktree", "prune"]); // forgets any worktree `remove` refused
+    let refs = git(&["for-each-ref", "--format=%(refname:short)", &format!("refs/heads/brigd/{thread}/")]).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let mut kept = vec![];
+    for b in refs.lines() {
+        if !git(&["branch", "-D", b]).is_some_and(|o| o.status.success()) {
+            kept.push(b);
+        }
+    }
+    if !kept.is_empty() {
+        return Err(format!("could not delete branch(es) {}", kept.join(", ")).into());
+    }
+    Ok(())
 }
 
 /// Appends to ~/.brigd/threads/<thread>/FLOWPLAN, the plan followed by the live run log.
@@ -992,6 +1059,45 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         assert_eq!(surfaces(env(ALL)), mac(vec![Surface::Herdr("w1".into()), Surface::Tmux]));
         assert_eq!(surfaces(env(&[("HERDR_ENV", "1")])), mac(vec![]));
         assert_eq!(surfaces(env(&[])), mac(vec![]));
+    }
+
+    #[test]
+    fn archive_moves_thread_and_refuses_overwrite() {
+        let root = env::temp_dir().join(format!("brigd-archive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("threads/th/a")).unwrap();
+        fs::write(root.join("threads/th/a/output.md"), "x").unwrap();
+        let to = archive_thread(&root, "th").unwrap();
+        assert_eq!(to, root.join("archive/threads/th"));
+        assert!(!root.join("threads/th").exists() && to.join("a/output.md").exists());
+        fs::create_dir_all(root.join("threads/th")).unwrap();
+        assert!(archive_thread(&root, "th").unwrap_err().to_string().contains("already exists"));
+        assert!(root.join("threads/th").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_removes_worktrees_branches_and_dirs() {
+        let root = env::temp_dir().join(format!("brigd-delete-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |a: &[&str]| Command::new("git").arg("-C").arg(&repo).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&["branch", "brigd/other/k"]);
+        for k in ["k1", "k2"] {
+            let wt = root.join("worktrees/th").join(k);
+            assert!(git(&["worktree", "add", "-q", "-b", &format!("brigd/th/{k}"), &wt.to_string_lossy()]).status.success());
+        }
+        fs::create_dir_all(root.join("threads/th")).unwrap();
+        fs::write(root.join("threads/th/state.json"), format!(r#"{{"repo":{:?}}}"#, repo.to_string_lossy())).unwrap();
+        delete_thread(&root, "th").unwrap();
+        assert!(!root.join("threads/th").exists() && !root.join("worktrees/th").exists());
+        let out = |a: &[&str]| String::from_utf8_lossy(&git(a).stdout).into_owned();
+        assert_eq!(out(&["worktree", "list"]).lines().count(), 1);
+        assert_eq!(out(&["branch", "--list", "brigd/*", "--format=%(refname:short)"]).trim(), "brigd/other/k");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

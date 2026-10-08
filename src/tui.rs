@@ -59,14 +59,30 @@ enum Tab {
     View { path: PathBuf, title: String, text: String, scroll: u16, rel: Option<String> },
 }
 
-/// The right-click popup on an agent row: one "Terminate" item filling `rect`.
+/// The right-click popup: an agent row's Terminate, a thread row's Delete / Archive.
+/// Item `i` fills line `rect.y + i`; `sel` is the one Enter picks.
 struct Menu {
     rect: Rect,
-    thread: String,
-    agent: String,
+    items: Vec<Act>,
+    sel: usize,
 }
 
-const MENU_ITEM: &str = " Terminate ";
+#[derive(Clone, Debug, PartialEq)]
+enum Act {
+    Terminate { thread: String, agent: String },
+    Delete(String),
+    Archive(String),
+}
+
+impl Act {
+    fn label(&self) -> &'static str {
+        match self {
+            Act::Terminate { .. } => " Terminate ",
+            Act::Delete(_) => " Delete    ",
+            Act::Archive(_) => " Archive   ",
+        }
+    }
+}
 
 #[derive(Default)]
 struct Tabs {
@@ -92,6 +108,8 @@ struct App {
     blocked: HashSet<(String, String)>,
     prefix: bool,
     confirm_quit: bool,
+    /// A thread waiting for y to be deleted.
+    confirm_delete: Option<String>,
     quit: bool,
     msg: Option<(String, Instant)>,
     ticks: u32,
@@ -810,11 +828,66 @@ impl App {
         self.refresh();
     }
 
+    fn pick(&mut self, act: Act) {
+        match act {
+            Act::Terminate { thread, agent } => self.terminate(&thread, &agent),
+            Act::Delete(t) => self.confirm_delete = Some(t),
+            Act::Archive(t) => self.archive(&t),
+        }
+    }
+
+    /// Stops the thread's agents and strays and closes its tabs (Delete / Archive come next).
+    fn stop_thread(&mut self, thread: &str) {
+        crate::stop_thread(thread);
+        let dir = crate::thread_dir(thread);
+        for t in self.tabs.values_mut() {
+            t.list.retain(|tab| match tab {
+                Tab::Term { thread: th, .. } => th != thread,
+                Tab::View { path, .. } => !path.starts_with(&dir),
+            });
+            t.active = t.active.min(t.list.len().saturating_sub(1));
+        }
+        self.focus_main &= self.tabs.get(&self.space).is_some_and(|t| !t.list.is_empty());
+        self.paused.remove(thread);
+    }
+
+    fn archive(&mut self, thread: &str) {
+        let to = crate::archive_dir(&crate::root(), thread);
+        if to.exists() {
+            return self.flash(format!("archive {thread}: {} already exists", to.display()));
+        }
+        self.stop_thread(thread);
+        match crate::archive_thread(&crate::root(), thread) {
+            Ok(to) => self.flash(format!("archived {thread} to {} (its worktrees stay put)", to.display())),
+            Err(e) => self.flash(format!("archive {thread}: {e}")),
+        }
+        self.refresh();
+    }
+
+    fn delete(&mut self, thread: &str) {
+        self.stop_thread(thread);
+        match crate::delete_thread(&crate::root(), thread) {
+            Ok(()) => self.flash(format!("deleted {thread}")),
+            Err(e) => self.flash(format!("delete {thread}: {e}")),
+        }
+        self.refresh();
+    }
+
     fn on_key(&mut self, k: KeyEvent) {
-        if let Some(m) = self.menu.take() {
-            // Enter picks the item; Esc or any other key just closes the menu.
-            if k.code == KeyCode::Enter {
-                self.terminate(&m.thread, &m.agent);
+        if let Some(mut m) = self.menu.take() {
+            // ↑↓ move, Enter picks; Esc or any other key just closes the menu.
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1).min(m.items.len() - 1),
+                KeyCode::Enter => return self.pick(m.items.swap_remove(m.sel)),
+                _ => return,
+            }
+            self.menu = Some(m);
+            return;
+        }
+        if let Some(t) = self.confirm_delete.take() {
+            if matches!(k.code, KeyCode::Char('y' | 'Y')) {
+                self.delete(&t);
             }
             return;
         }
@@ -895,11 +968,11 @@ impl App {
         let at = Position { x: m.column, y: m.row };
         if matches!(m.kind, MouseEventKind::Down(_)) {
             if let Some(menu) = self.menu.take() {
-                // A left click on the item picks it; any other click closes the menu (a right
-                // click on another agent row then opens that row's menu below).
+                // A left click on an item picks it; any other click closes the menu (a right
+                // click on another row then opens that row's menu below).
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
                     if menu.rect.contains(at) {
-                        self.terminate(&menu.thread, &menu.agent);
+                        self.pick(menu.items[(m.row - menu.rect.y) as usize].clone());
                     }
                     return;
                 }
@@ -907,15 +980,18 @@ impl App {
         }
         match m.kind {
             MouseEventKind::Down(MouseButton::Right) => {
-                let agent = hit(self.side_inner, self.offset, &self.rows, m.column, m.row).map(|(i, _)| i).filter(|&i| self.rows[i].kind == Kind::Agent);
-                if let Some(i) = agent {
-                    self.sel = i;
-                    let r = &self.rows[i];
-                    let (thread, agent) = (r.thread.clone(), tree::agent_id(&r.path, &r.label));
-                    let w = MENU_ITEM.len() as u16;
-                    let x = if self.screen.width == 0 { m.column } else { m.column.min(self.screen.right().saturating_sub(w)) };
-                    self.menu = Some(Menu { rect: Rect::new(x, m.row, w, 1), thread, agent });
-                }
+                let Some((i, _)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) else { return };
+                let r = &self.rows[i];
+                let items = match r.kind {
+                    Kind::Agent => vec![Act::Terminate { thread: r.thread.clone(), agent: tree::agent_id(&r.path, &r.label) }],
+                    Kind::Thread => vec![Act::Delete(r.label.clone()), Act::Archive(r.label.clone())],
+                    _ => return,
+                };
+                self.sel = i;
+                let (w, h) = (items.iter().map(|a| a.label().len()).max().unwrap_or(0) as u16, items.len() as u16);
+                let x = if self.screen.width == 0 { m.column } else { m.column.min(self.screen.right().saturating_sub(w)) };
+                let y = if self.screen.height == 0 { m.row } else { m.row.min(self.screen.bottom().saturating_sub(h)) };
+                self.menu = Some(Menu { rect: Rect::new(x, y, w, h), items, sel: 0 });
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.resizing = self.divider.contains(at);
@@ -1164,6 +1240,10 @@ impl App {
         let viewing = matches!(self.cur(), Some(Tab::View { .. }));
         let text = match &self.msg {
             Some((m, t)) if t.elapsed() < Duration::from_secs(5) => Span::styled(m.clone(), Style::new().fg(pal::YELLOW)),
+            _ if self.confirm_delete.is_some() => Span::styled(
+                format!("Delete thread {} with its worktrees and brigd/ branches? This cannot be undone. y/N", self.confirm_delete.as_deref().unwrap_or("")),
+                Style::new().fg(pal::RED).add_modifier(Modifier::BOLD),
+            ),
             _ if self.confirm_quit => Span::styled(
                 format!("{} agents running; quitting kills them. Quit? y/N", live_agents().len()),
                 Style::new().fg(pal::RED).add_modifier(Modifier::BOLD),
@@ -1178,7 +1258,11 @@ impl App {
         if let Some(m) = &self.menu {
             let r = m.rect.intersection(f.area());
             f.render_widget(Clear, r);
-            f.render_widget(Paragraph::new(MENU_ITEM).style(Style::new().fg(pal::CRUST).bg(pal::RED).add_modifier(Modifier::BOLD)), r);
+            let lines = m.items.iter().enumerate().map(|(i, a)| {
+                let bg = if i == m.sel { pal::RED } else { pal::SURFACE1 };
+                Line::styled(a.label(), Style::new().fg(if i == m.sel { pal::CRUST } else { pal::TEXT }).bg(bg).add_modifier(Modifier::BOLD))
+            });
+            f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), r);
         }
 
         if let Some((r, a, Some(b))) = self.drag {
@@ -1497,7 +1581,7 @@ mod tests {
         assert!(app.menu.is_none());
         app.on_mouse(click(MouseButton::Right, 5, 3)); // the agent row
         let m = app.menu.as_ref().unwrap();
-        assert_eq!((m.thread.as_str(), m.agent.as_str(), m.rect.y), ("t", "a", 3));
+        assert_eq!((m.items.clone(), m.rect.y), (vec![Act::Terminate { thread: "t".into(), agent: "a".into() }], 3));
         app.on_mouse(click(MouseButton::Left, 50, 8)); // elsewhere: closes, opens nothing
         assert!(app.menu.is_none() && app.tabs.is_empty());
         app.on_mouse(click(MouseButton::Right, 5, 3));
@@ -1505,6 +1589,15 @@ mod tests {
         assert!(app.menu.is_none());
         app.on_mouse(click(MouseButton::Right, 97, 3)); // at the screen edge: the menu is shifted left
         assert_eq!(app.menu.as_ref().unwrap().rect.right(), 100);
+        app.on_mouse(click(MouseButton::Right, 5, 2)); // the thread row: Delete / Archive
+        let m = app.menu.as_ref().unwrap();
+        assert_eq!((m.items.clone(), m.rect.height), (vec![Act::Delete("t".into()), Act::Archive("t".into())], 2));
+        app.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // Delete asks first
+        assert_eq!((app.menu.is_none(), app.confirm_delete.as_deref()), (true, Some("t")));
+        app.on_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.confirm_delete.is_none());
     }
 
     #[test]
