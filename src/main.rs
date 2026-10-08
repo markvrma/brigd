@@ -822,7 +822,7 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
 
 /// `claude` in a brigd terminal tab runs this (via the ~/.brigd/bin shim). In thread
 /// $BRIGD_THREAD it records a new session under <thread>/stray agents/stray-<n>/
-/// {cwd,session,base,pid} with the flow agents' hooks, then becomes the real claude
+/// {cwd,session,base,pid,term} with the flow agents' hooks, then becomes the real claude
 /// (exec keeps the pid). Anything else (no thread, -p, --resume, …) is plain claude.
 fn stray(args: &[String]) -> Res<()> {
     use std::os::unix::process::CommandExt;
@@ -835,6 +835,7 @@ fn stray(args: &[String]) -> Res<()> {
             fs::write(dir.join("cwd"), cwd.to_string_lossy().as_bytes())?;
             record_base(&cwd, &dir);
             fs::write(dir.join("pid"), std::process::id().to_string())?;
+            fs::write(dir.join("term"), env::var("BRIGD_TERM").unwrap_or_default())?; // the terminal row shows this claude
             runner::session_args(&dir)
         };
         match setup() {
