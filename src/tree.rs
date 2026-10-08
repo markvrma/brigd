@@ -1,4 +1,4 @@
-//! The sidebar tree, read from disk: space (dir basename) → thread → agent →
+//! The sidebar tree, read from disk: space (repo basename) → thread → agent →
 //! [output.md, subagent dirs → output.md …, changed files]. Also mirrors claude's
 //! subagent transcripts into <agent>/<subagent>/output.md.
 
@@ -43,6 +43,8 @@ pub struct Node {
     pub children: Vec<Node>,
     /// Agent: its 0-based stage index in the flow.
     pub stage: Option<usize>,
+    /// Agent: the thread worktree key it runs in; None for the repo's main checkout.
+    pub worktree: Option<String>,
 }
 
 /// claude's ~/.claude/projects dir name for a cwd: every `/` and `.` becomes `-`.
@@ -60,8 +62,8 @@ pub fn subagents_dir(home: &Path, cwd: &Path, session: &str) -> PathBuf {
     home.join(".claude/projects").join(slug(cwd)).join(session).join("subagents")
 }
 
-/// Builds the sidebar from `root` (~/.brigd). A thread whose agents use several
-/// spaces shows under each of them, holding only that space's agents.
+/// Builds the sidebar from `root` (~/.brigd): one space per repo, each thread under its
+/// repo once, holding all its agents (each tagged with the worktree it runs in).
 pub fn build(root: &Path) -> Vec<Node> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let mut spaces: BTreeMap<PathBuf, Vec<Node>> = BTreeMap::new();
@@ -72,49 +74,42 @@ pub fn build(root: &Path) -> Vec<Node> {
         let (Some(flow), Some(state)) = (read("flowmap.json").or_else(|| read("flow.json")), read("state.json")) else { continue };
         let thread = tdir.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let repo = PathBuf::from(state["repo"].as_str().unwrap_or_default());
-        let mut per_space: BTreeMap<PathBuf, Vec<Node>> = BTreeMap::new();
+        let mut agents = Vec::new();
         for (si, a) in flow["stages"].as_array().into_iter().flatten().enumerate().flat_map(|(i, s)| s.as_array().into_iter().flatten().map(move |a| (i, a))) {
             // Only agents that have been launched: set_agent puts them in state.json's "agents".
             let Some(name) = a["name"].as_str().filter(|n| !state["agents"][*n].is_null()) else { continue };
-            let cwd = space_cwd(root, &repo, &thread, a["worktree"].as_str().unwrap_or(""));
-            let mut agent = Node { stage: Some(si), ..dir_node(Kind::Agent, name, &tdir.join(name)) };
+            let key = a["worktree"].as_str().unwrap_or("");
+            let cwd = space_cwd(root, &repo, &thread, key);
+            let mut agent = Node { stage: Some(si), worktree: Some(key.to_string()).filter(|k| !k.is_empty()), ..dir_node(Kind::Agent, name, &tdir.join(name)) };
             agent.children.extend(diff_nodes(&home, &cwd, &repo, &agent.path));
-            per_space.entry(cwd).or_default().push(agent);
+            agents.push(agent);
         }
-        // Strays go in the deepest of the thread's spaces holding their cwd, else a space of their own.
-        let mut strays: BTreeMap<PathBuf, Vec<Node>> = BTreeMap::new();
+        let wts = root.join("worktrees").join(&thread);
+        let mut strays = Vec::new();
         let mut sdirs: Vec<PathBuf> = fs::read_dir(tdir.join(STRAY)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
         sdirs.sort();
         for d in sdirs {
             let Ok(cwd) = fs::read_to_string(d.join("cwd")).map(|c| PathBuf::from(c.trim())) else { continue };
             let mut agent = dir_node(Kind::Agent, &d.file_name().unwrap_or_default().to_string_lossy(), &d);
+            agent.worktree = cwd.strip_prefix(&wts).ok().and_then(|r| r.components().next()).map(|c| c.as_os_str().to_string_lossy().into_owned());
             agent.children.extend(diff_nodes(&home, &cwd, &cwd, &d));
-            let space = per_space.keys().chain([&repo]).filter(|s| cwd.starts_with(s)).max_by_key(|s| s.components().count()).cloned();
-            strays.entry(space.unwrap_or(cwd)).or_default().push(agent);
+            strays.push(agent);
         }
-        if per_space.is_empty() {
-            per_space.insert(repo.clone(), vec![]); // nothing started yet: the thread (and its FLOWPLAN) under the repo
+        // FLOWPLAN (the plan + live run log) is the thread's first child, its strays next.
+        if !strays.is_empty() {
+            agents.insert(0, Node { kind: Kind::Folder, label: STRAY.into(), path: tdir.join(STRAY), children: strays, stage: None, worktree: None });
         }
-        for s in strays.keys() {
-            per_space.entry(s.clone()).or_default();
+        let plan = tdir.join("FLOWPLAN");
+        if plan.exists() {
+            agents.insert(0, Node { kind: Kind::Output, label: "FLOWPLAN".into(), path: plan, children: vec![], stage: None, worktree: None });
         }
-        for (cwd, mut agents) in per_space {
-            if let Some(s) = strays.remove(&cwd) {
-                agents.insert(0, Node { kind: Kind::Folder, label: STRAY.into(), path: tdir.join(STRAY), children: s, stage: None });
-            }
-            // FLOWPLAN (the plan + live run log) is the thread's first child, its strays next.
-            let plan = tdir.join("FLOWPLAN");
-            if plan.exists() {
-                agents.insert(0, Node { kind: Kind::Output, label: "FLOWPLAN".into(), path: plan, children: vec![], stage: None });
-            }
-            spaces.entry(cwd).or_default().push(Node { kind: Kind::Thread, label: thread.clone(), path: tdir.clone(), children: agents, stage: None });
-        }
+        spaces.entry(repo).or_default().push(Node { kind: Kind::Thread, label: thread, path: tdir.clone(), children: agents, stage: None, worktree: None });
     }
     spaces
         .into_iter()
         .map(|(cwd, children)| {
             let label = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-            Node { kind: Kind::Space, label, path: cwd, children, stage: None }
+            Node { kind: Kind::Space, label, path: cwd, children, stage: None, worktree: None }
         })
         .collect()
 }
@@ -124,14 +119,14 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
     let mut children = Vec::new();
     let out = dir.join("output.md");
     if out.exists() {
-        children.push(Node { kind: Kind::Output, label: "output.md".into(), path: out, children: vec![], stage: None });
+        children.push(Node { kind: Kind::Output, label: "output.md".into(), path: out, children: vec![], stage: None, worktree: None });
     }
     let mut subs: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     subs.sort();
     for s in subs {
         children.push(dir_node(Kind::Subagent, &s.file_name().unwrap_or_default().to_string_lossy(), &s));
     }
-    Node { kind, label: label.into(), path: dir.into(), children, stage: None }
+    Node { kind, label: label.into(), path: dir.into(), children, stage: None, worktree: None }
 }
 
 /// Transcript path → (bytes parsed, up to the last full line; files it changed so far).
@@ -237,7 +232,7 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
             let path = dir.join(".diff").join(file.strip_prefix("/").unwrap_or(&file));
             views.insert(path.clone(), (cwd.into(), base.clone(), rel, stat));
             let label = file.file_name()?.to_string_lossy().into_owned();
-            Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None })
+            Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None })
         })
         .collect()
 }
@@ -497,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn build_groups_by_space() {
+    fn build_groups_by_repo() {
         let root = tmp("build");
         let t = root.join("threads/t1");
         fs::create_dir_all(t.join("a/sub-1234567/deep-7654321")).unwrap();
@@ -513,22 +508,22 @@ mod tests {
         fs::write(t2.join("FLOWPLAN"), "plan").unwrap();
         fs::create_dir_all(root.join("threads/junk")).unwrap(); // no flowmap.json: skipped
         let tree = build(&root);
+        // Both threads, and t1's agents in the repo and in worktree "fix", sit under one space.
         let labels: Vec<&str> = tree.iter().map(|n| n.label.as_str()).collect();
-        assert_eq!(labels, ["myrepo", "fix"]);
-        assert!(tree.iter().all(|n| n.kind == Kind::Space));
-        let a = &tree[0].children[0].children[0];
-        assert_eq!((tree[0].children[0].label.as_str(), a.label.as_str(), a.stage), ("t1", "a", Some(0)));
+        assert_eq!(labels, ["myrepo"]);
+        assert_eq!((tree[0].kind.clone(), tree[0].path.clone()), (Kind::Space, PathBuf::from("/src/myrepo")));
+        let t1n = &tree[0].children[0];
+        let a = &t1n.children[0];
+        assert_eq!((t1n.label.as_str(), t1n.children.len(), a.label.as_str(), a.stage, a.worktree.clone()), ("t1", 2, "a", Some(0), None));
         assert_eq!(a.children[0].kind, Kind::Output);
         let sub = &a.children[1];
         assert_eq!((sub.kind.clone(), sub.label.as_str()), (Kind::Subagent, "sub-1234567"));
         assert_eq!(sub.children[0].kind, Kind::Output);
         assert_eq!(sub.children[1].label, "deep-7654321");
-        let t2n = &tree[0].children[1];
+        let b = &t1n.children[1];
+        assert_eq!((b.label.as_str(), b.children.len(), b.stage, b.worktree.as_deref()), ("b", 0, Some(1), Some("fix")));
+        let t2n = &tree[0].children[1]; // t2's unstarted c is hidden
         assert_eq!((t2n.label.as_str(), t2n.children.len(), t2n.children[0].label.as_str()), ("t2", 1, "FLOWPLAN"));
-        assert_eq!(tree[1].children.len(), 1); // t2's unstarted c is not under fix
-        let b = &tree[1].children[0].children[0];
-        assert_eq!((b.label.as_str(), b.children.len(), b.stage), ("b", 0, Some(1)));
-        assert_eq!(tree[1].path, root.join("worktrees/t1/fix"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -543,21 +538,21 @@ mod tests {
         };
         stray("stray-1", "/src/myrepo/sub\n");
         stray("stray-2", "/elsewhere/x");
+        stray("stray-3", &root.join("worktrees/t1/fix/src").to_string_lossy());
         fs::create_dir_all(t.join("a")).unwrap();
         fs::write(t.join("FLOWPLAN"), "plan").unwrap();
         fs::write(t.join("flowmap.json"), serde_json::json!({"stages":[[{"name":"a","worktree":null}]]}).to_string()).unwrap();
         fs::write(t.join("state.json"), r#"{"repo":"/src/myrepo","agents":{"a":{"status":"done"}}}"#).unwrap();
         let tree = build(&root);
-        let space = |l: &str| &tree.iter().find(|s| s.label == l).unwrap().children[0];
         let labels = |n: &Node| n.children.iter().map(|c| c.label.clone()).collect::<Vec<_>>();
-        let th = space("myrepo");
+        assert_eq!(tree.len(), 1); // every stray in the thread, wherever it runs
+        let th = &tree[0].children[0];
         assert_eq!(labels(th), ["FLOWPLAN", STRAY, "a"]);
-        assert_eq!((th.children[1].kind.clone(), labels(&th.children[1])), (Kind::Folder, vec!["stray-1".to_string()]));
-        let s1 = &th.children[1].children[0];
-        assert_eq!((s1.kind.clone(), s1.stage, agent_id(&s1.path, &s1.label)), (Kind::Agent, None, format!("{STRAY}/stray-1")));
+        assert_eq!((th.children[1].kind.clone(), labels(&th.children[1])), (Kind::Folder, vec!["stray-1".to_string(), "stray-2".into(), "stray-3".into()]));
+        let s = &th.children[1].children;
+        assert_eq!((s[0].kind.clone(), s[0].stage, agent_id(&s[0].path, &s[0].label)), (Kind::Agent, None, format!("{STRAY}/stray-1")));
+        assert_eq!(s.iter().map(|n| n.worktree.as_deref()).collect::<Vec<_>>(), [None, None, Some("fix")]);
         assert_eq!(agent_id(&th.children[2].path, "a"), "a");
-        let x = space("x"); // cwd outside every space of the thread: a space of its own
-        assert_eq!((labels(x), labels(&x.children[1])), (vec!["FLOWPLAN".to_string(), STRAY.into()], vec!["stray-2".to_string()]));
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -34,7 +34,7 @@ const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"
 /// Run-log lines the FLOWPLAN view shows under the plan.
 const LOG_TAIL: usize = 15;
 
-/// (space, node path): a thread spanning spaces shows under each, folded separately.
+/// (space, node path): what a fold toggle remembers.
 type NodeKey = (PathBuf, PathBuf);
 
 struct Row {
@@ -49,6 +49,7 @@ struct Row {
     folder: bool,
     open: bool,
     stage: Option<usize>,
+    worktree: Option<String>,
 }
 
 enum Tab {
@@ -378,7 +379,7 @@ fn flatten(n: &Node, depth: usize, space: &Path, thread: &str, toggled: &HashSet
     let default_open = matches!(n.kind, Kind::Space | Kind::Thread | Kind::Folder);
     let open = folder && default_open != toggled.contains(&(space.into(), n.path.clone()));
     let thread = if n.kind == Kind::Thread { n.label.as_str() } else { thread };
-    out.push(Row { depth, kind: n.kind.clone(), label: n.label.clone(), path: n.path.clone(), space: space.into(), thread: thread.into(), folder, open, stage: n.stage });
+    out.push(Row { depth, kind: n.kind.clone(), label: n.label.clone(), path: n.path.clone(), space: space.into(), thread: thread.into(), folder, open, stage: n.stage, worktree: n.worktree.clone() });
     if open {
         n.children.iter().for_each(|c| flatten(c, depth + 1, space, thread, toggled, out));
     }
@@ -1011,6 +1012,9 @@ impl App {
         }
         let slash = if matches!(r.kind, Kind::Output | Kind::Diff) { "" } else { "/" };
         spans.push(Span::styled(format!("{}{slash}", r.label), label));
+        if let Some(wt) = &r.worktree {
+            spans.push(Span::styled(format!(" {wt}"), Style::new().fg(pal::OVERLAY0)));
+        }
         if let Some((add, del)) = (r.kind == Kind::Diff).then(|| tree::diff_stat(&r.path)).flatten() {
             spans.push(Span::styled(format!(" +{add}"), Style::new().fg(pal::GREEN)));
             spans.push(Span::styled(format!(" -{del}"), Style::new().fg(pal::RED)));
@@ -1023,7 +1027,7 @@ impl App {
         match (selected, self.focus_main) {
             (true, false) => line.style(Style::new().add_modifier(Modifier::REVERSED)),
             (true, true) => line.style(Style::new().bg(pal::SURFACE1)),
-            // The space (repo or worktree) whose tabs show.
+            // The space (repo) whose tabs show.
             _ if r.kind == Kind::Space && r.space == self.space => line.style(Style::new().bg(pal::SURFACE0)),
             _ => line,
         }
@@ -1360,7 +1364,7 @@ mod tests {
 
     #[test]
     fn click_hits_tree_rows() {
-        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None, worktree: None };
         let agent = node(Kind::Agent, "a", vec![node(Kind::Output, "output.md", vec![])]);
         let tree = node(Kind::Space, "repo", vec![node(Kind::Thread, "t", vec![agent, node(Kind::Agent, "b", vec![])])]);
         let mut rows = Vec::new();
@@ -1471,7 +1475,7 @@ mod tests {
 
     #[test]
     fn right_click_opens_terminate_menu() {
-        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None, worktree: None };
         let tree = node(Kind::Space, "repo", vec![node(Kind::Thread, "t", vec![node(Kind::Agent, "a", vec![])])]);
         let mut app = App::default();
         flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut app.rows);
@@ -1493,7 +1497,7 @@ mod tests {
 
     #[test]
     fn sidebar_click_keeps_focus() {
-        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None, worktree: None };
         let tree = node(Kind::Space, "repo", vec![node(Kind::Output, "nope.md", vec![])]);
         let mut app = App::default();
         flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut app.rows);
@@ -1509,7 +1513,7 @@ mod tests {
 
     #[test]
     fn pause_button_toggles() {
-        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None };
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None, worktree: None };
         let mut app = App::default();
         app.pause_btns = vec![(Rect::new(28, 2, 7, 1), "t".into())];
         let click = |x, y| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
