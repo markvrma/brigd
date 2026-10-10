@@ -100,3 +100,20 @@ Example, for "find why login is slow and fix it":
 
 `files` must be real paths in the repo. Read the repo (Read, Grep, Glob) before
 choosing them. Use `[]` rather than guessing.
+
+## plan-review-go (opt-in)
+
+Only when the user's task **explicitly** asks for it (it names `plan-review-go` or
+`/plan-review-go`): return exactly this flow, with `<task>` = the user's task. Never
+infer it; otherwise ignore this section and plan as usual.
+
+```json
+{"goal": "<task, one line>", "stages": [
+  [{"name": "plan-review", "model": "opus", "effort": "high", "worktree": null,
+    "task": "Invoke the plan-review-go skill on this task: <task>. It needs the grill-me skill and the ponytail plugin's ponytail-review skill; if any is missing, say so and stop. Follow it through to the user approving the plan. Then rewrite the stages after stage 1 in this thread's flowmap.json to implement the approved plan, following the brigd-plan splitting, worktree and mode rules, and keep the schema valid. Do not change your own stage-1 entry or earlier stages.",
+    "files": [], "mode": "default"}],
+  [{"name": "implement", "model": "sonnet", "effort": "medium", "worktree": "impl",
+    "task": "Placeholder: the plan-review agent replaces this stage with the approved plan.",
+    "files": [], "mode": "acceptEdits"}]
+]}
+```
