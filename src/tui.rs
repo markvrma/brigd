@@ -1185,6 +1185,10 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        // A modal that opened while a prefix was armed must not leave it armed behind it.
+        if self.newt.as_ref().is_some_and(|n| !n.hidden) || self.confirm_run.is_some() || self.menu.is_some() || self.confirm_delete.is_some() || self.confirm_quit {
+            (self.prefix, self.thread_prefix) = (false, false);
+        }
         // The new-thread window and its run confirm come first: no key may reach anything behind them.
         if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
             if n.planning {
@@ -1262,7 +1266,7 @@ impl App {
             return;
         }
         if ctrl_o {
-            self.prefix = true;
+            (self.prefix, self.thread_prefix) = (true, false);
             return;
         }
         let ctrl_t = k.code == KeyCode::Char('t') && k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1339,6 +1343,7 @@ impl App {
         }
         let at = Position { x: m.column, y: m.row };
         if matches!(m.kind, MouseEventKind::Down(_)) {
+            (self.prefix, self.thread_prefix) = (false, false);
             if let Some(menu) = self.menu.take() {
                 // A left click on an item picks it; any other click closes the menu (a right
                 // click on another row then opens that row's menu below).
