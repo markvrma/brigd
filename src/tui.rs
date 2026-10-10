@@ -195,6 +195,8 @@ struct App {
     thread_status: HashMap<PathBuf, String>,
     blocked: HashSet<(String, String)>,
     prefix: bool,
+    /// Ctrl-t was pressed: the next key acts on the highlighted thread.
+    thread_prefix: bool,
     confirm_quit: bool,
     /// A thread waiting for y to be deleted.
     confirm_delete: Option<String>,
@@ -1066,6 +1068,15 @@ impl App {
         self.paused.remove(thread);
     }
 
+    fn open_newt(&mut self, repo: PathBuf) {
+        // A hidden box still planning is tracked in `newt`: replacing it would lose its inputs on failure.
+        if let Some(n) = self.newt.as_mut().filter(|n| n.planning) {
+            n.hidden = false;
+        } else {
+            self.newt = Some(Newt { repo, ..Default::default() });
+        }
+    }
+
     fn archive(&mut self, thread: &str) {
         let to = crate::archive_dir(&crate::root(), thread);
         if to.exists() {
@@ -1254,6 +1265,25 @@ impl App {
             self.prefix = true;
             return;
         }
+        let ctrl_t = k.code == KeyCode::Char('t') && k.modifiers.contains(KeyModifiers::CONTROL);
+        if self.thread_prefix {
+            self.thread_prefix = false;
+            let row = self.rows.get(self.sel);
+            let (thread, repo) = (row.map(|r| r.thread.clone()).filter(|t| !t.is_empty()), row.map_or(self.space.clone(), |r| r.space.clone()));
+            match (k.code, thread) {
+                _ if ctrl_t => self.send(&[0x14]), // Ctrl-t twice sends one to claude
+                (KeyCode::Char('d'), Some(t)) => self.confirm_delete = Some(t),
+                (KeyCode::Char('a'), Some(t)) => self.archive(&t),
+                (KeyCode::Char('d' | 'a'), None) => self.flash("no thread highlighted"),
+                (KeyCode::Char('n'), _) => self.open_newt(repo),
+                _ => {}
+            }
+            return;
+        }
+        if ctrl_t {
+            self.thread_prefix = true;
+            return;
+        }
         // Alt-h/l/t from anywhere; '˙'/'¬'/'†' are what macOS Option-h/l/t types without "Option as Meta".
         match (k.code, k.modifiers.contains(KeyModifiers::ALT)) {
             (KeyCode::Char('h'), true) | (KeyCode::Char('˙'), _) => return self.cycle(-1),
@@ -1341,13 +1371,8 @@ impl App {
                 let panes = self.tabs.get(&self.thread).into_iter().flat_map(|p| &p.list).flat_map(|t| [t.bar, t.body]);
                 self.drag = panes.chain([self.hint]).find(|r| r.contains(at)).map(|r| (r, at, None));
                 if let Some(repo) = self.plus_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, p)| p.clone()) {
-                    self.prefix = false;
-                    // A hidden box still planning is tracked in `newt`: replacing it would lose its inputs on failure.
-                    if let Some(n) = self.newt.as_mut().filter(|n| n.planning) {
-                        n.hidden = false;
-                    } else {
-                        self.newt = Some(Newt { repo, ..Default::default() });
-                    }
+                    (self.prefix, self.thread_prefix) = (false, false);
+                    self.open_newt(repo);
                 } else if let Some(t) = self.pause_btns.iter().find(|(r, _)| r.contains(at)).map(|(_, t)| t.clone()) {
                     self.toggle_pause(&t);
                 } else if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
@@ -1641,9 +1666,10 @@ impl App {
                 Style::new().fg(pal().red).add_modifier(Modifier::BOLD),
             ),
             _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · c theme · q quit · C-o send C-o"),
+            _ if self.thread_prefix => Span::raw("C-t …  d delete · a archive · n new thread · C-t send C-t"),
             _ if !self.focus_main => Span::raw("↑↓/jk move · Enter open/fold · ←→ fold · Tab back to tab · M-h/l tabs · M-t terminal · q quit · wheel scrolls"),
             _ if viewing => Span::raw("↑↓/jk PgUp/PgDn g/G scroll · Tab/Esc sidebar · M-h/l tabs · M-t terminal · C-o w close · C-o q quit"),
-            _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · wheel scrollback"),
+            _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · C-t thread · wheel scrollback"),
         };
         f.render_widget(Paragraph::new(Line::from(text).style(Style::new().fg(pal().subtext0).bg(pal().mantle))), hint);
 
@@ -2147,6 +2173,30 @@ mod tests {
         assert!(app.paused.contains("t"));
         app.on_mouse(click(30, 2));
         assert!(app.paused.is_empty());
+    }
+
+    #[test]
+    fn ctrl_t_acts_on_highlighted_thread() {
+        let node = |kind, label: &str, children| Node { kind, label: label.into(), path: PathBuf::from(format!("/{label}")), children, stage: None, worktree: None };
+        let tree = node(Kind::Space, "repo", vec![node(Kind::Thread, "t", vec![])]);
+        let mut app = App::default();
+        flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut app.rows);
+        let ctrl_t = || key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let ch = |c| key(KeyCode::Char(c), KeyModifiers::NONE);
+        app.on_key(ctrl_t()); // the space row: no thread, so a flashes and acts on nothing
+        app.on_key(ch('a'));
+        assert_eq!((app.thread_prefix, app.msg.as_ref().map(|m| m.0.as_str())), (false, Some("no thread highlighted")));
+        app.on_key(ctrl_t());
+        app.on_key(ctrl_t()); // C-t C-t opens nothing
+        assert!(!app.thread_prefix && app.newt.is_none() && app.confirm_delete.is_none());
+        app.sel = 1; // the thread row
+        app.on_key(ctrl_t());
+        app.on_key(ch('d'));
+        assert_eq!(app.confirm_delete.as_deref(), Some("t"));
+        app.on_key(ch('n')); // declines the delete
+        app.on_key(ctrl_t());
+        app.on_key(ch('n'));
+        assert_eq!(app.newt, Some(Newt { repo: "/repo".into(), ..Default::default() }));
     }
 
     #[test]
