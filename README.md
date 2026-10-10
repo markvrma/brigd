@@ -7,7 +7,7 @@ inside one TUI. Stages run in order; agents within a stage run in parallel.
 
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI (`claude`), installed and logged in. Claude is the default agent.
 - Rust toolchain (`cargo`), and `git`.
-- Optional: [herdr](https://herdr.dev) or `tmux`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS.
+- Optional: `tmux`. `--bg` opens the TUI in a new tmux window; otherwise it falls back to Terminal.app on macOS.
 
 ## Quick setup
 
@@ -36,7 +36,7 @@ flow JSON that `brigd <name> --flow flow.json` runs.
 |---|---|
 | `brigd <name> "task"` | plan with brigd-plan, confirm, run in the TUI |
 | `brigd <name> --flow flow.json` | run a hand-written flow |
-| `... --bg` | skip the confirm; open the TUI in a new herdr tab / tmux window / Terminal window and return (automatic without a TTY or under Claude Code) |
+| `... --bg` | skip the confirm; open the TUI in a new tmux window / Terminal window and return (automatic without a TTY or under Claude Code) |
 | `brigd` | open the TUI over all threads |
 | `brigd ls` | list threads |
 | `brigd status <name>` | per-agent detail |
