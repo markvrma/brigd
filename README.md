@@ -34,13 +34,13 @@ Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Skills
 
-`brigd install-skill` installs the **brigd-plan** skill to `~/.claude/skills/brigd-plan`.
+`brigd install-skill` installs **brigd-plan**, **plan-review-go**, **grill-me** and **grilling** to `~/.claude/skills/`.
 In Claude Code, `/brigd-plan <task>` splits a task into stages of parallel agents and returns a
 flow JSON that `brigd <name> --flow flow.json` runs.
 
 `brigd <name> "... use plan-review-go"` opts into a review path: stage 1 is an agent that runs plan-review-go with
-you, then rewrites the later stages. It needs the **plan-review-go** skill, the **grill-me** skill and the
-**ponytail** plugin (`ponytail-review`); never used unless you ask.
+you, then rewrites the later stages. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
+**ponytail** plugin (`ponytail-review`, installed by `setup.sh`); never used unless you ask.
 
 ## Starting a thread
 

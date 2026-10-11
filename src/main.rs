@@ -18,6 +18,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 const SKILL: &str = include_str!("../skills/brigd-plan/SKILL.md");
+// Installed by `brigd install-skill`; brigd-plan first, the rest back the opt-in plan-review-go path.
+const SKILLS: &[(&str, &str)] = &[
+    ("brigd-plan", SKILL),
+    ("plan-review-go", include_str!("../skills/plan-review-go/SKILL.md")),
+    ("grill-me", include_str!("../skills/grill-me/SKILL.md")),
+    ("grilling", include_str!("../skills/grilling/SKILL.md")),
+];
 const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const MODES: &[&str] = &["default", "acceptEdits", "auto"];
@@ -36,7 +43,7 @@ const USAGE: &str = "usage:
   brigd ls                     list threads
   brigd status <name>          per-agent detail
   brigd resume <name>          continue a stopped thread in the TUI
-  brigd install-skill          install brigd-plan into ~/.claude/skills";
+  brigd install-skill          install brigd-plan, plan-review-go, grill-me into ~/.claude/skills";
 
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","stages"],
 "properties":{"goal":{"type":"string"},
@@ -957,10 +964,13 @@ fn status(name: &str) -> Res<()> {
 }
 
 fn install_skill() -> Res<()> {
-    let dir = PathBuf::from(env::var("HOME")?).join(".claude/skills/brigd-plan");
-    fs::create_dir_all(&dir)?;
-    fs::write(dir.join("SKILL.md"), SKILL)?;
-    Ok(println!("installed {}", dir.join("SKILL.md").display()))
+    for (name, text) in SKILLS {
+        let dir = PathBuf::from(env::var("HOME")?).join(".claude/skills").join(name);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("SKILL.md"), text)?;
+        println!("installed {}", dir.join("SKILL.md").display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

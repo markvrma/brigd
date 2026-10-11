@@ -40,7 +40,11 @@ case ":$PATH:" in
   *) echo "warning: $cargo_bin is not on your PATH; add it to run brigd." >&2 ;;
 esac
 
-"$cargo_bin/brigd" install-skill
+"$cargo_bin/brigd" install-skill   # brigd-plan, plan-review-go, grill-me, grilling
+
+# ponytail plugin (ponytail-review) for the opt-in plan-review-go path; non-fatal.
+claude plugin marketplace add DietrichGebert/ponytail >/dev/null 2>&1 || true # already added is fine
+claude plugin install ponytail@ponytail || echo "warning: ponytail install failed; run: claude plugin install ponytail@ponytail" >&2
 
 if command -v herdr >/dev/null; then echo "found herdr: --bg will use it."
 elif command -v tmux >/dev/null; then echo "found tmux: --bg will use it."
