@@ -11,8 +11,16 @@ inside one TUI. Stages run in order; agents within a stage run in parallel.
 
 ## Quick setup
 
+One line (clones to `~/brigd`, or `$BRIGD_DIR`):
+
 ```sh
-git clone git@github-personal:markvrma/brigd.git && cd brigd && ./setup.sh
+curl -fsSL https://raw.githubusercontent.com/markvrma/brigd/main/setup.sh | bash
+```
+
+Or from a clone:
+
+```sh
+git clone https://github.com/markvrma/brigd.git && cd brigd && ./setup.sh
 ```
 
 Manual equivalent:
