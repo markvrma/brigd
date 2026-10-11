@@ -2,7 +2,7 @@
 # One-shot, idempotent brigd setup. Assumes Claude Code is the agent.
 set -euo pipefail
 
-REPO_URL="git@github-personal:markvrma/brigd.git"
+REPO_URL="https://github.com/markvrma/brigd.git"
 
 die() { echo "error: $*" >&2; exit 1; }
 
