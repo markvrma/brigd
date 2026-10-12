@@ -9,8 +9,10 @@ inside one TUI. Stages run in order; agents within a stage run in parallel.
 ## Requirements
 
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI (`claude`), installed and logged in. Claude is the default agent.
-- Rust 1.88 or newer (`cargo`), and `git`.
-- Optional: `tmux` or `herdr`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS.
+- Rust 1.89 or newer (`cargo`), and `git`.
+- macOS or Linux. Windows is not supported (needs a Unix PTY and `$HOME`). Agent terminals assume `zsh` (falls back to `/bin/sh`).
+- Optional: `tmux` or `herdr`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS. On Linux, `--bg` needs tmux or herdr; plain `brigd` and `resume` work anywhere.
+  Clipboard copy uses OSC 52 (terminal support required) and `pbcopy` on macOS.
 
 ## Install
 

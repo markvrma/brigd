@@ -10,7 +10,7 @@ homepage = "https://github.com/markvrma/brigd"
 readme = "README.md"
 keywords = ["tui", "claude", "agents", "pty", "terminal"]
 categories = ["command-line-utilities", "development-tools"]
-rust-version = "1.88"
+rust-version = "1.89"
 include = ["src/**/*", "skills/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [dependencies]

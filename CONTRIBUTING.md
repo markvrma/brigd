@@ -4,7 +4,7 @@ Thanks for helping. Small PRs beat big ones; open an issue first for anything la
 
 ## Prerequisites
 
-- Rust 1.88 or newer (via [rustup](https://rustup.rs)); CI pins an exact toolchain, see `.github/workflows/ci.yml`
+- Rust 1.89 or newer (via [rustup](https://rustup.rs)); CI pins an exact toolchain, see `.github/workflows/ci.yml`
 - `git`
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`), only to run brigd for real; the tests don't need it
 - `tmux` or `herdr` (optional: `--bg`)

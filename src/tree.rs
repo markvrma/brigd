@@ -35,7 +35,11 @@ pub const TERMS: &str = "terminal";
 
 /// An agent's registry/state name: its label, or "stray agents/<label>" for a stray.
 pub fn agent_id(path: &Path, label: &str) -> String {
-    if path.parent().is_some_and(|p| p.ends_with(STRAY)) { format!("{STRAY}/{label}") } else { label.into() }
+    if path.parent().is_some_and(|p| p.ends_with(STRAY)) {
+        format!("{STRAY}/{label}")
+    } else {
+        label.into()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,12 +63,19 @@ pub fn slug(cwd: &Path) -> String {
 
 /// The directory a space's agents run in: the repo for key "", else its worktree.
 pub fn space_cwd(root: &Path, repo: &Path, thread: &str, key: &str) -> PathBuf {
-    if key.is_empty() { repo.into() } else { root.join("worktrees").join(thread).join(key) }
+    if key.is_empty() {
+        repo.into()
+    } else {
+        root.join("worktrees").join(thread).join(key)
+    }
 }
 
 /// Where claude keeps the subagent transcripts of a session.
 pub fn subagents_dir(home: &Path, cwd: &Path, session: &str) -> PathBuf {
-    home.join(".claude/projects").join(slug(cwd)).join(session).join("subagents")
+    home.join(".claude/projects")
+        .join(slug(cwd))
+        .join(session)
+        .join("subagents")
 }
 
 /// Builds the sidebar from `root` (~/.brigd): one space per repo, each thread under its
@@ -72,35 +83,97 @@ pub fn subagents_dir(home: &Path, cwd: &Path, session: &str) -> PathBuf {
 pub fn build(root: &Path) -> Vec<Node> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let mut spaces: BTreeMap<PathBuf, Vec<Node>> = BTreeMap::new();
-    let mut threads: Vec<PathBuf> = fs::read_dir(root.join("threads")).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let mut threads: Vec<PathBuf> = fs::read_dir(root.join("threads"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
     threads.sort();
     for tdir in threads {
-        let read = |f: &str| fs::read_to_string(tdir.join(f)).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        let (Some(flow), Some(state)) = (read("flowmap.json").or_else(|| read("flow.json")), read("state.json")) else { continue };
-        let thread = tdir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let read = |f: &str| {
+            fs::read_to_string(tdir.join(f))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        };
+        let (Some(flow), Some(state)) = (
+            read("flowmap.json").or_else(|| read("flow.json")),
+            read("state.json"),
+        ) else {
+            continue;
+        };
+        let thread = tdir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let repo = PathBuf::from(state["repo"].as_str().unwrap_or_default());
         let mut agents = Vec::new();
-        for (si, a) in flow["stages"].as_array().into_iter().flatten().enumerate().flat_map(|(i, s)| s.as_array().into_iter().flatten().map(move |a| (i, a))) {
+        for (si, a) in flow["stages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .flat_map(|(i, s)| s.as_array().into_iter().flatten().map(move |a| (i, a)))
+        {
             // Only agents that have been launched: set_agent puts them in state.json's "agents".
-            let Some(name) = a["name"].as_str().filter(|n| !state["agents"][*n].is_null()) else { continue };
+            let Some(name) = a["name"]
+                .as_str()
+                .filter(|n| !state["agents"][*n].is_null())
+            else {
+                continue;
+            };
             let key = a["worktree"].as_str().unwrap_or("");
             let cwd = space_cwd(root, &repo, &thread, key);
-            let mut agent = Node { stage: Some(si), worktree: Some(key.to_string()).filter(|k| !k.is_empty()), ..dir_node(Kind::Agent, name, &tdir.join(name)) };
-            agent.children.extend(diff_nodes(&home, &cwd, &repo, &agent.path));
+            let mut agent = Node {
+                stage: Some(si),
+                worktree: Some(key.to_string()).filter(|k| !k.is_empty()),
+                ..dir_node(Kind::Agent, name, &tdir.join(name))
+            };
+            agent
+                .children
+                .extend(diff_nodes(&home, &cwd, &repo, &agent.path));
             agents.push(agent);
         }
         // FLOWPLAN (the plan + live run log) is the thread's first child. Strays stay on disk only (stray agents/).
         let plan = tdir.join("FLOWPLAN");
         if plan.exists() {
-            agents.insert(0, Node { kind: Kind::Output, label: "FLOWPLAN".into(), path: plan, children: vec![], stage: None, worktree: None });
+            agents.insert(
+                0,
+                Node {
+                    kind: Kind::Output,
+                    label: "FLOWPLAN".into(),
+                    path: plan,
+                    children: vec![],
+                    stage: None,
+                    worktree: None,
+                },
+            );
         }
-        spaces.entry(repo).or_default().push(Node { kind: Kind::Thread, label: thread, path: tdir.clone(), children: agents, stage: None, worktree: None });
+        spaces.entry(repo).or_default().push(Node {
+            kind: Kind::Thread,
+            label: thread,
+            path: tdir.clone(),
+            children: agents,
+            stage: None,
+            worktree: None,
+        });
     }
     spaces
         .into_iter()
         .map(|(cwd, children)| {
-            let label = cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| cwd.to_string_lossy().into_owned());
-            Node { kind: Kind::Space, label, path: cwd, children, stage: None, worktree: None }
+            let label = cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
+            Node {
+                kind: Kind::Space,
+                label,
+                path: cwd,
+                children,
+                stage: None,
+                worktree: None,
+            }
         })
         .collect()
 }
@@ -110,29 +183,67 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
     let mut children = Vec::new();
     let out = dir.join("output.md");
     if out.exists() {
-        children.push(Node { kind: Kind::Output, label: "output.md".into(), path: out, children: vec![], stage: None, worktree: None });
+        children.push(Node {
+            kind: Kind::Output,
+            label: "output.md".into(),
+            path: out,
+            children: vec![],
+            stage: None,
+            worktree: None,
+        });
     }
     // dot dirs (.diff, the frozen diffs) are brigd's own, not subagents
-    let mut subs: Vec<PathBuf> = fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))).collect();
+    let mut subs: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
     subs.sort();
     for s in subs {
-        children.push(dir_node(Kind::Subagent, &s.file_name().unwrap_or_default().to_string_lossy(), &s));
+        children.push(dir_node(
+            Kind::Subagent,
+            &s.file_name().unwrap_or_default().to_string_lossy(),
+            &s,
+        ));
     }
-    Node { kind, label: label.into(), path: dir.into(), children, stage: None, worktree: None }
+    Node {
+        kind,
+        label: label.into(),
+        path: dir.into(),
+        children,
+        stage: None,
+        worktree: None,
+    }
 }
 
 /// Transcript path → (bytes parsed, up to the last full line; files it changed so far).
 static PARSED: Mutex<BTreeMap<PathBuf, (u64, Vec<PathBuf>)>> = Mutex::new(BTreeMap::new());
 /// Agent dir → (when checked; its base commit and the files `git diff --numstat` lists vs it,
 /// with their (added, removed) line counts, "-" for binary).
-type Names = (Instant, Option<(String, HashMap<PathBuf, (String, String)>)>);
+type Names = (
+    Instant,
+    Option<(String, HashMap<PathBuf, (String, String)>)>,
+);
 static NAMES: Mutex<BTreeMap<PathBuf, Names>> = Mutex::new(BTreeMap::new());
 /// Diff node path → (agent cwd, base commit, file path relative to the cwd, (added, removed)).
 type View = (PathBuf, String, String, (String, String));
 static VIEWS: Mutex<BTreeMap<PathBuf, View>> = Mutex::new(BTreeMap::new());
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let o = Command::new("git").arg("-C").arg(cwd).args(args).output().ok().filter(|o| o.status.success())?;
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
     Some(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
@@ -148,7 +259,9 @@ pub fn diff_view(key: &Path) -> Option<(String, String)> {
 
 /// A Diff node's (added, removed) line counts vs the agent's base.
 pub fn diff_stat(key: &Path) -> Option<(String, String)> {
-    frozen(key).map(|f| f.0).or_else(|| VIEWS.lock().unwrap().get(key).map(|v| v.3.clone()))
+    frozen(key)
+        .map(|f| f.0)
+        .or_else(|| VIEWS.lock().unwrap().get(key).map(|v| v.3.clone()))
 }
 
 /// A finished agent's diff of one file, saved at the Diff node's path so that later changes
@@ -157,7 +270,11 @@ fn frozen(key: &Path) -> Option<((String, String), String, String)> {
     let s = fs::read_to_string(key).ok()?;
     let (head, text) = s.split_once('\n')?;
     let mut h = head.splitn(3, '\t');
-    Some(((h.next()?.into(), h.next()?.into()), h.next()?.into(), text.into()))
+    Some((
+        (h.next()?.into(), h.next()?.into()),
+        h.next()?.into(),
+        text.into(),
+    ))
 }
 
 /// `git diff --numstat -z --no-renames` → path → (added, removed).
@@ -178,28 +295,48 @@ fn base(cwd: &Path, repo: &Path, dir: &Path) -> Option<String> {
         return Some(b.trim().to_string());
     }
     let head = git(repo, &["rev-parse", "HEAD"])?;
-    Some(git(cwd, &["merge-base", "HEAD", head.trim()])?.trim().to_string())
+    Some(
+        git(cwd, &["merge-base", "HEAD", head.trim()])?
+            .trim()
+            .to_string(),
+    )
 }
 
 /// The files the agent's session (and its subagents) changed, per their transcripts, in
 /// first-change order. Parsed incrementally: only bytes appended since the last call.
 fn transcript_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
-    let Ok(session) = fs::read_to_string(dir.join("session")) else { return vec![] };
+    let Ok(session) = fs::read_to_string(dir.join("session")) else {
+        return vec![];
+    };
     let session = session.trim();
-    let mut logs: Vec<PathBuf> = fs::read_dir(subagents_dir(home, cwd, session)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "jsonl")).collect();
+    let mut logs: Vec<PathBuf> = fs::read_dir(subagents_dir(home, cwd, session))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .collect();
     logs.sort();
-    logs.insert(0, home.join(".claude/projects").join(slug(cwd)).join(format!("{session}.jsonl")));
+    logs.insert(
+        0,
+        home.join(".claude/projects")
+            .join(slug(cwd))
+            .join(format!("{session}.jsonl")),
+    );
     let mut files: Vec<PathBuf> = Vec::new();
     let mut parsed = PARSED.lock().unwrap();
     for log in logs {
-        let Ok(mut f) = fs::File::open(&log) else { continue };
+        let Ok(mut f) = fs::File::open(&log) else {
+            continue;
+        };
         let (done, seen) = parsed.entry(log).or_default();
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         if len < *done {
             (*done, *seen) = (0, vec![]); // rewritten: start over
         }
         let mut tail = Vec::new();
-        if len > *done && f.seek(SeekFrom::Start(*done)).is_ok() && f.read_to_end(&mut tail).is_ok() {
+        if len > *done && f.seek(SeekFrom::Start(*done)).is_ok() && f.read_to_end(&mut tail).is_ok()
+        {
             let end = tail.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
             add(seen, changed_files(&String::from_utf8_lossy(&tail[..end])));
             *done += end as u64;
@@ -221,8 +358,16 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
     let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
     if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
         let b = base(cwd, repo, dir);
-        let listed = b.as_ref().and_then(|b| git(cwd, &["diff", "--numstat", "--no-renames", "--relative", "-z", b]));
-        *entry = (Instant::now(), b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))));
+        let listed = b.as_ref().and_then(|b| {
+            git(
+                cwd,
+                &["diff", "--numstat", "--no-renames", "--relative", "-z", b],
+            )
+        });
+        *entry = (
+            Instant::now(),
+            b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))),
+        );
     }
     // no base/listing (git failed): only the already frozen diffs can show
     let (base, listed) = entry.1.clone().unwrap_or_default();
@@ -234,31 +379,70 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
         .into_iter()
         .filter(|f| !f.starts_with(dir)) // its own output.md already shows
         .filter_map(|file| {
-            let path = dir.join(".diff").join(file.strip_prefix("/").unwrap_or(&file));
+            let path = dir
+                .join(".diff")
+                .join(file.strip_prefix("/").unwrap_or(&file));
             let label = file.file_name()?.to_string_lossy().into_owned();
             if path.is_file() {
-                return Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None });
+                return Some(Node {
+                    kind: Kind::Diff,
+                    label,
+                    path,
+                    children: vec![],
+                    stage: None,
+                    worktree: None,
+                });
             }
             let stat = listed.get(&file)?.clone();
             let rel = file.strip_prefix(cwd).ok()?.to_string_lossy().into_owned();
             if done {
                 let text = git(cwd, &["diff", "--no-color", &base, "--", &rel]);
-                let save = |t: String| fs::create_dir_all(path.parent()?).ok().and_then(|_| fs::write(&path, format!("{}\t{}\t{rel}\n{t}", stat.0, stat.1)).ok());
+                let save = |t: String| {
+                    fs::create_dir_all(path.parent()?).ok().and_then(|_| {
+                        fs::write(&path, format!("{}\t{}\t{rel}\n{t}", stat.0, stat.1)).ok()
+                    })
+                };
                 if text.and_then(save).is_some() {
-                    return Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None });
+                    return Some(Node {
+                        kind: Kind::Diff,
+                        label,
+                        path,
+                        children: vec![],
+                        stage: None,
+                        worktree: None,
+                    });
                 }
             }
             views.insert(path.clone(), (cwd.into(), base.clone(), rel, stat));
-            Some(Node { kind: Kind::Diff, label, path, children: vec![], stage: None, worktree: None })
+            Some(Node {
+                kind: Kind::Diff,
+                label,
+                path,
+                children: vec![],
+                stage: None,
+                worktree: None,
+            })
         })
         .collect()
 }
 
 /// The paths under `## Files changed` (`- /abs/path` lines) in the agent's own output.md.
 fn reported_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(text) = fs::read_to_string(dir.join("output.md")) else { return vec![] };
-    let mut lines = text.lines().skip_while(|l| l.trim() != "## Files changed").skip(1).take_while(|l| !l.starts_with('#'));
-    lines.by_ref().filter_map(|l| l.trim().strip_prefix("- ")).map(|p| p.trim().trim_matches('`')).filter(|p| p.starts_with('/')).map(PathBuf::from).collect()
+    let Ok(text) = fs::read_to_string(dir.join("output.md")) else {
+        return vec![];
+    };
+    let mut lines = text
+        .lines()
+        .skip_while(|l| l.trim() != "## Files changed")
+        .skip(1)
+        .take_while(|l| !l.starts_with('#'));
+    lines
+        .by_ref()
+        .filter_map(|l| l.trim().strip_prefix("- "))
+        .map(|p| p.trim().trim_matches('`'))
+        .filter(|p| p.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// What the agent changed: its transcripts' files plus the ones it listed in its output.md.
@@ -275,7 +459,9 @@ fn revert_set(files: &[PathBuf], cwd: &Path, dir: &Path) -> Vec<String> {
         .iter()
         .filter(|f| !f.starts_with(dir))
         .filter_map(|f| f.strip_prefix(cwd).ok())
-        .filter(|r| !r.as_os_str().is_empty() && r.components().all(|c| matches!(c, Component::Normal(_))))
+        .filter(|r| {
+            !r.as_os_str().is_empty() && r.components().all(|c| matches!(c, Component::Normal(_)))
+        })
         .map(|r| r.to_string_lossy().into_owned())
         .collect()
 }
@@ -291,12 +477,18 @@ pub fn revert(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Res<usize> {
         let in_base = git(cwd, &["cat-file", "-e", &format!("{base}:./{rel}")]).is_some();
         let abs = cwd.join(&rel);
         if in_base {
-            if git(cwd, &["diff", "--name-only", &base, "--", &rel]).is_some_and(|d| !d.trim().is_empty()) {
-                git(cwd, &["checkout", &base, "--", &rel]).ok_or_else(|| format!("git checkout {rel} failed"))?;
+            if git(cwd, &["diff", "--name-only", &base, "--", &rel])
+                .is_some_and(|d| !d.trim().is_empty())
+            {
+                git(cwd, &["checkout", &base, "--", &rel])
+                    .ok_or_else(|| format!("git checkout {rel} failed"))?;
                 n += 1;
             }
         } else if abs.is_file() {
-            git(cwd, &["rm", "-q", "--cached", "--ignore-unmatch", "--", &rel]);
+            git(
+                cwd,
+                &["rm", "-q", "--cached", "--ignore-unmatch", "--", &rel],
+            );
             fs::remove_file(&abs).map_err(|e| format!("{rel}: {e}"))?;
             n += 1;
         }
@@ -317,10 +509,24 @@ fn add(out: &mut Vec<PathBuf>, new: Vec<PathBuf>) {
 /// bashEditDiff.files[]), in first-change order.
 pub fn changed_files(jsonl: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for v in jsonl.lines().filter(|l| l.contains("\"filePath\"")).filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+    for v in jsonl
+        .lines()
+        .filter(|l| l.contains("\"filePath\""))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    {
         let r = &v["toolUseResult"];
-        let bash = r["bashEditDiff"]["files"].as_array().into_iter().flatten().map(|f| &f["filePath"]);
-        add(&mut out, bash.chain([&r["filePath"]]).filter_map(Value::as_str).map(PathBuf::from).collect());
+        let bash = r["bashEditDiff"]["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| &f["filePath"]);
+        add(
+            &mut out,
+            bash.chain([&r["filePath"]])
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect(),
+        );
     }
     out
 }
@@ -330,21 +536,33 @@ pub fn final_text(jsonl: &str) -> Option<String> {
     let last = jsonl
         .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .filter(|v| v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")
-        .last()?;
-    let text: String = last["message"]["content"].as_array()?.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect();
+        .rfind(|v| v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")?;
+    let text: String = last["message"]["content"]
+        .as_array()?
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
     (!text.is_empty()).then_some(text)
 }
 
 /// Dir name for a subagent: its description as a slug, plus a short id so it stays unique and stable.
 fn sub_name(id: &str, desc: &str) -> String {
-    let mut s: String = desc.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let mut s: String = desc
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     while s.contains("--") {
         s = s.replace("--", "-");
     }
     let s: String = s.trim_matches('-').chars().take(32).collect();
     let s = s.trim_end_matches('-');
-    format!("{}-{}", if s.is_empty() { "agent" } else { s }, &id[..id.len().min(7)])
+    format!(
+        "{}-{}",
+        if s.is_empty() { "agent" } else { s },
+        &id[..id.len().min(7)]
+    )
 }
 
 /// Mirrors `subagents` (claude's flat transcript dir) into nested dirs under
@@ -355,10 +573,22 @@ pub fn sync_subagents(subagents: &Path, agent_dir: &Path) -> io::Result<()> {
     let mut metas: HashMap<String, (Option<String>, String)> = HashMap::new();
     for e in fs::read_dir(subagents).into_iter().flatten().flatten() {
         let f = e.file_name().to_string_lossy().into_owned();
-        let Some(id) = f.strip_prefix("agent-").and_then(|f| f.strip_suffix(".meta.json")) else { continue };
-        let Ok(m) = fs::read_to_string(e.path()).map(|s| serde_json::from_str::<Value>(&s).unwrap_or_default()) else { continue };
+        let Some(id) = f
+            .strip_prefix("agent-")
+            .and_then(|f| f.strip_suffix(".meta.json"))
+        else {
+            continue;
+        };
+        let Ok(m) = fs::read_to_string(e.path())
+            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or_default())
+        else {
+            continue;
+        };
         let parent = m["parentAgentId"].as_str().map(String::from);
-        metas.insert(id.into(), (parent, m["description"].as_str().unwrap_or("").into()));
+        metas.insert(
+            id.into(),
+            (parent, m["description"].as_str().unwrap_or("").into()),
+        );
     }
     for id in metas.keys() {
         // Walk up to the top-level subagent; stop at unknown parents and at cycles.
@@ -369,9 +599,12 @@ pub fn sync_subagents(subagents: &Path, agent_dir: &Path) -> io::Result<()> {
             }
             chain.push(p);
         }
-        let dir = chain.iter().rev().fold(agent_dir.to_path_buf(), |d, i| d.join(sub_name(i, &metas[*i].1)));
+        let dir = chain.iter().rev().fold(agent_dir.to_path_buf(), |d, i| {
+            d.join(sub_name(i, &metas[*i].1))
+        });
         fs::create_dir_all(&dir)?;
-        let jsonl = fs::read_to_string(subagents.join(format!("agent-{id}.jsonl"))).unwrap_or_default();
+        let jsonl =
+            fs::read_to_string(subagents.join(format!("agent-{id}.jsonl"))).unwrap_or_default();
         if let Some(text) = final_text(&jsonl) {
             let out = dir.join("output.md");
             if fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
@@ -409,7 +642,10 @@ mod tests {
             res(serde_json::json!({"stdout": "", "bashEditDiff": {"files": [{"filePath": "/r/src/main.rs"}, {"filePath": "/r/b.sh"}]}})),
         ]
         .join("\n");
-        assert_eq!(changed_files(&j), ["/r/src/main.rs", "/r/new.md", "/r/b.sh"].map(PathBuf::from));
+        assert_eq!(
+            changed_files(&j),
+            ["/r/src/main.rs", "/r/new.md", "/r/b.sh"].map(PathBuf::from)
+        );
     }
 
     #[test]
@@ -418,7 +654,17 @@ mod tests {
         let (home, cwd, dir) = (d.join("home"), d.join("repo"), d.join("agent"));
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(cwd.join("src")).unwrap();
-        let g = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&cwd).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap().status.success());
+        let g = |a: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(a)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
         g(&["init", "-q"]);
         fs::write(cwd.join("src/a.rs"), "one\n").unwrap();
         g(&["add", "."]);
@@ -429,34 +675,65 @@ mod tests {
         fs::write(cwd.join("src/a.rs"), "one\ntwo\nthree\n").unwrap();
         fs::write(cwd.join("new.rs"), "x\n").unwrap(); // untracked
         fs::write(dir.join("session"), "s1\n").unwrap();
-        let log = home.join(".claude/projects").join(slug(&cwd)).join("s1.jsonl");
+        let log = home
+            .join(".claude/projects")
+            .join(slug(&cwd))
+            .join("s1.jsonl");
         fs::create_dir_all(log.parent().unwrap()).unwrap();
-        let edit = |f: &Path| serde_json::json!({"toolUseResult": {"filePath": f}}).to_string() + "\n";
+        let edit =
+            |f: &Path| serde_json::json!({"toolUseResult": {"filePath": f}}).to_string() + "\n";
         let (a, new) = (cwd.join("src/a.rs"), cwd.join("new.rs"));
         fs::write(&log, edit(&new) + &edit(&a)[..20]).unwrap(); // second line still being written
         assert!(diff_nodes(&home, &cwd, &cwd, &dir).is_empty());
         fs::write(&log, edit(&new) + &edit(&a) + &edit(&dir.join("output.md"))).unwrap();
         let n = diff_nodes(&home, &cwd, &cwd, &dir);
-        assert_eq!((n.len(), n[0].label.as_str(), n[0].kind.clone()), (1, "a.rs", Kind::Diff));
+        assert_eq!(
+            (n.len(), n[0].label.as_str(), n[0].kind.clone()),
+            (1, "a.rs", Kind::Diff)
+        );
         let (rel, text) = diff_view(&n[0].path).unwrap();
         assert_eq!(rel, "src/a.rs");
-        assert!(text.contains("+two\n") && text.contains("+three\n"), "{text}");
+        assert!(
+            text.contains("+two\n") && text.contains("+three\n"),
+            "{text}"
+        );
         assert_eq!(diff_stat(&n[0].path), Some(("2".into(), "0".into())));
         // output.md lists a file the transcript never named (a Bash edit); the agent is done: diffs freeze
         fs::write(cwd.join("b.rs"), "b\n").unwrap();
         g(&["add", "b.rs"]);
-        fs::write(dir.join("output.md"), format!("done\n## Files changed\n- {}\n- `{}`\n- rel/ignored\n\n## Other\n- /not/listed\n", a.display(), cwd.join("b.rs").display())).unwrap();
+        fs::write(
+            dir.join("output.md"),
+            format!(
+                "done\n## Files changed\n- {}\n- `{}`\n- rel/ignored\n\n## Other\n- /not/listed\n",
+                a.display(),
+                cwd.join("b.rs").display()
+            ),
+        )
+        .unwrap();
         NAMES.lock().unwrap().clear();
         let n = diff_nodes(&home, &cwd, &cwd, &dir);
-        assert_eq!(n.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(), ["a.rs", "b.rs"]);
+        assert_eq!(
+            n.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(),
+            ["a.rs", "b.rs"]
+        );
         let before = diff_view(&n[0].path).unwrap();
         // a later agent changes the file again, and the 3s git cache is stale: still the same diff
         fs::write(&a, "one\nLATER\n").unwrap();
         NAMES.lock().unwrap().clear();
         let n = diff_nodes(&home, &cwd, &cwd, &dir);
-        assert_eq!((n.len(), diff_view(&n[0].path).unwrap(), diff_stat(&n[0].path)), (2, before.clone(), Some(("2".into(), "0".into()))));
+        assert_eq!(
+            (
+                n.len(),
+                diff_view(&n[0].path).unwrap(),
+                diff_stat(&n[0].path)
+            ),
+            (2, before.clone(), Some(("2".into(), "0".into())))
+        );
         assert!(!before.1.contains("LATER"));
-        assert!(dir_node(Kind::Agent, "a", &dir).children.iter().all(|c| c.kind != Kind::Subagent)); // .diff is not a subagent
+        assert!(dir_node(Kind::Agent, "a", &dir)
+            .children
+            .iter()
+            .all(|c| c.kind != Kind::Subagent)); // .diff is not a subagent
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -466,7 +743,17 @@ mod tests {
         let (home, cwd, dir) = (d.join("home"), d.join("repo"), d.join("agent"));
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(&cwd).unwrap();
-        let g = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&cwd).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap().status.success());
+        let g = |a: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(a)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
         g(&["init", "-q"]);
         for f in ["a.rs", "other.rs"] {
             fs::write(cwd.join(f), "base\n").unwrap();
@@ -483,34 +770,64 @@ mod tests {
         fs::write(cwd.join("other.rs"), "someone else\n").unwrap(); // another agent's: not in the transcript
         fs::write(dir.join("output.md"), "result").unwrap();
         fs::write(dir.join("session"), "s1\n").unwrap();
-        let log = home.join(".claude/projects").join(slug(&cwd)).join("s1.jsonl");
+        let log = home
+            .join(".claude/projects")
+            .join(slug(&cwd))
+            .join("s1.jsonl");
         fs::create_dir_all(log.parent().unwrap()).unwrap();
-        let edit = |f: &Path| serde_json::json!({"toolUseResult": {"filePath": f}}).to_string() + "\n";
+        let edit =
+            |f: &Path| serde_json::json!({"toolUseResult": {"filePath": f}}).to_string() + "\n";
         let outside = d.join("elsewhere.rs");
         fs::write(&outside, "keep\n").unwrap();
-        let files: Vec<PathBuf> = ["a.rs", "staged.rs", "new.rs"].iter().map(|f| cwd.join(f)).chain([dir.join("output.md"), outside.clone(), cwd.join("../escape")]).collect();
+        let files: Vec<PathBuf> = ["a.rs", "staged.rs", "new.rs"]
+            .iter()
+            .map(|f| cwd.join(f))
+            .chain([
+                dir.join("output.md"),
+                outside.clone(),
+                cwd.join("../escape"),
+            ])
+            .collect();
         fs::write(&log, files.iter().map(|f| edit(f)).collect::<String>()).unwrap();
-        assert_eq!(revert_set(&files, &cwd, &dir), ["a.rs", "staged.rs", "new.rs"]); // no output.md, outside or `..`
+        assert_eq!(
+            revert_set(&files, &cwd, &dir),
+            ["a.rs", "staged.rs", "new.rs"]
+        ); // no output.md, outside or `..`
         assert_eq!(revert(&home, &cwd, &cwd, &dir).unwrap(), 3);
         assert_eq!(fs::read_to_string(cwd.join("a.rs")).unwrap(), "base\n");
         assert!(!cwd.join("staged.rs").exists() && !cwd.join("new.rs").exists());
-        assert_eq!(fs::read_to_string(cwd.join("other.rs")).unwrap(), "someone else\n");
+        assert_eq!(
+            fs::read_to_string(cwd.join("other.rs")).unwrap(),
+            "someone else\n"
+        );
         assert_eq!(fs::read_to_string(dir.join("output.md")).unwrap(), "result");
         assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
-        assert!(git(&cwd, &["ls-files"]).unwrap().lines().all(|l| l != "staged.rs"));
+        assert!(git(&cwd, &["ls-files"])
+            .unwrap()
+            .lines()
+            .all(|l| l != "staged.rs"));
         assert_eq!(revert(&home, &cwd, &cwd, &dir).unwrap(), 0); // nothing left to revert
         let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
     fn slug_rule() {
-        assert_eq!(slug(Path::new("/Users/mark.verma/.brigd/x")), "-Users-mark-verma--brigd-x");
+        assert_eq!(
+            slug(Path::new("/Users/alice/.brigd/x")),
+            "-Users-alice--brigd-x"
+        );
     }
 
     #[test]
     fn final_text_picks_last_end_turn() {
         let tool = r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"text","text":"no"}]}}"#;
-        let j = [end_turn("first"), tool.into(), end_turn("last"), r#"{"type":"user"}"#.into()].join("\n");
+        let j = [
+            end_turn("first"),
+            tool.into(),
+            end_turn("last"),
+            r#"{"type":"user"}"#.into(),
+        ]
+        .join("\n");
         assert_eq!(final_text(&j).as_deref(), Some("last"));
         assert_eq!(final_text(tool), None);
     }
@@ -520,17 +837,34 @@ mod tests {
         let d = tmp("sync");
         let (subs, agent) = (d.join("subagents"), d.join("agent"));
         fs::create_dir_all(&subs).unwrap();
-        let meta = |id: &str, m: Value| fs::write(subs.join(format!("agent-{id}.meta.json")), m.to_string()).unwrap();
-        meta("aaaaaaaa1", serde_json::json!({"description": "Find the bug!", "spawnDepth": 0}));
-        meta("bbbbbbbb2", serde_json::json!({"description": "grep", "spawnDepth": 1, "parentAgentId": "aaaaaaaa1"}));
-        meta("ccccccccc", serde_json::json!({"description": "", "spawnDepth": 0}));
+        let meta = |id: &str, m: Value| {
+            fs::write(subs.join(format!("agent-{id}.meta.json")), m.to_string()).unwrap()
+        };
+        meta(
+            "aaaaaaaa1",
+            serde_json::json!({"description": "Find the bug!", "spawnDepth": 0}),
+        );
+        meta(
+            "bbbbbbbb2",
+            serde_json::json!({"description": "grep", "spawnDepth": 1, "parentAgentId": "aaaaaaaa1"}),
+        );
+        meta(
+            "ccccccccc",
+            serde_json::json!({"description": "", "spawnDepth": 0}),
+        );
         fs::write(subs.join("agent-aaaaaaaa1.jsonl"), end_turn("top done")).unwrap();
         fs::write(subs.join("agent-bbbbbbbb2.jsonl"), end_turn("child done")).unwrap();
         fs::write(subs.join("agent-ccccccccc.jsonl"), r#"{"type":"user"}"#).unwrap();
         sync_subagents(&subs, &agent).unwrap();
         let top = agent.join("find-the-bug-aaaaaaa");
-        assert_eq!(fs::read_to_string(top.join("output.md")).unwrap(), "top done");
-        assert_eq!(fs::read_to_string(top.join("grep-bbbbbbb/output.md")).unwrap(), "child done");
+        assert_eq!(
+            fs::read_to_string(top.join("output.md")).unwrap(),
+            "top done"
+        );
+        assert_eq!(
+            fs::read_to_string(top.join("grep-bbbbbbb/output.md")).unwrap(),
+            "child done"
+        );
         assert!(agent.join("agent-ccccccc").is_dir());
         assert!(!agent.join("agent-ccccccc/output.md").exists()); // still running
         sync_subagents(&d.join("missing"), &agent).unwrap();
@@ -546,30 +880,72 @@ mod tests {
         fs::write(t.join("a/sub-1234567/output.md"), "y").unwrap();
         let flow = serde_json::json!({"goal":"g","stages":[[{"name":"a","worktree":null}],[{"name":"b","worktree":"fix"}]]});
         fs::write(t.join("flowmap.json"), flow.to_string()).unwrap();
-        fs::write(t.join("state.json"), r#"{"repo":"/src/myrepo","agents":{"a":{"status":"done"},"b":{"status":"running"}}}"#).unwrap();
+        fs::write(
+            t.join("state.json"),
+            r#"{"repo":"/src/myrepo","agents":{"a":{"status":"done"},"b":{"status":"running"}}}"#,
+        )
+        .unwrap();
         let t2 = root.join("threads/t2"); // c not started yet: hidden, thread shows its FLOWPLAN under the repo
         fs::create_dir_all(t2.join("c")).unwrap();
-        fs::write(t2.join("flowmap.json"), serde_json::json!({"stages":[[{"name":"c","worktree":"fix"}]]}).to_string()).unwrap();
-        fs::write(t2.join("state.json"), r#"{"repo":"/src/myrepo","agents":{}}"#).unwrap();
+        fs::write(
+            t2.join("flowmap.json"),
+            serde_json::json!({"stages":[[{"name":"c","worktree":"fix"}]]}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            t2.join("state.json"),
+            r#"{"repo":"/src/myrepo","agents":{}}"#,
+        )
+        .unwrap();
         fs::write(t2.join("FLOWPLAN"), "plan").unwrap();
         fs::create_dir_all(root.join("threads/junk")).unwrap(); // no flowmap.json: skipped
         let tree = build(&root);
         // Both threads, and t1's agents in the repo and in worktree "fix", sit under one space.
         let labels: Vec<&str> = tree.iter().map(|n| n.label.as_str()).collect();
         assert_eq!(labels, ["myrepo"]);
-        assert_eq!((tree[0].kind.clone(), tree[0].path.clone()), (Kind::Space, PathBuf::from("/src/myrepo")));
+        assert_eq!(
+            (tree[0].kind.clone(), tree[0].path.clone()),
+            (Kind::Space, PathBuf::from("/src/myrepo"))
+        );
         let t1n = &tree[0].children[0];
         let a = &t1n.children[0];
-        assert_eq!((t1n.label.as_str(), t1n.children.len(), a.label.as_str(), a.stage, a.worktree.clone()), ("t1", 2, "a", Some(0), None));
+        assert_eq!(
+            (
+                t1n.label.as_str(),
+                t1n.children.len(),
+                a.label.as_str(),
+                a.stage,
+                a.worktree.clone()
+            ),
+            ("t1", 2, "a", Some(0), None)
+        );
         assert_eq!(a.children[0].kind, Kind::Output);
         let sub = &a.children[1];
-        assert_eq!((sub.kind.clone(), sub.label.as_str()), (Kind::Subagent, "sub-1234567"));
+        assert_eq!(
+            (sub.kind.clone(), sub.label.as_str()),
+            (Kind::Subagent, "sub-1234567")
+        );
         assert_eq!(sub.children[0].kind, Kind::Output);
         assert_eq!(sub.children[1].label, "deep-7654321");
         let b = &t1n.children[1];
-        assert_eq!((b.label.as_str(), b.children.len(), b.stage, b.worktree.as_deref()), ("b", 0, Some(1), Some("fix")));
+        assert_eq!(
+            (
+                b.label.as_str(),
+                b.children.len(),
+                b.stage,
+                b.worktree.as_deref()
+            ),
+            ("b", 0, Some(1), Some("fix"))
+        );
         let t2n = &tree[0].children[1]; // t2's unstarted c is hidden
-        assert_eq!((t2n.label.as_str(), t2n.children.len(), t2n.children[0].label.as_str()), ("t2", 1, "FLOWPLAN"));
+        assert_eq!(
+            (
+                t2n.label.as_str(),
+                t2n.children.len(),
+                t2n.children[0].label.as_str()
+            ),
+            ("t2", 1, "FLOWPLAN")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -578,17 +954,38 @@ mod tests {
         let root = tmp("strays");
         let t = root.join("threads/t1");
         fs::create_dir_all(t.join(STRAY).join("stray-1")).unwrap();
-        fs::write(t.join(STRAY).join("stray-1").join("cwd"), "/src/myrepo/sub\n").unwrap();
+        fs::write(
+            t.join(STRAY).join("stray-1").join("cwd"),
+            "/src/myrepo/sub\n",
+        )
+        .unwrap();
         fs::create_dir_all(t.join("a")).unwrap();
         fs::write(t.join("FLOWPLAN"), "plan").unwrap();
-        fs::write(t.join("flowmap.json"), serde_json::json!({"stages":[[{"name":"a","worktree":null}]]}).to_string()).unwrap();
-        fs::write(t.join("state.json"), r#"{"repo":"/src/myrepo","agents":{"a":{"status":"done"}}}"#).unwrap();
+        fs::write(
+            t.join("flowmap.json"),
+            serde_json::json!({"stages":[[{"name":"a","worktree":null}]]}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            t.join("state.json"),
+            r#"{"repo":"/src/myrepo","agents":{"a":{"status":"done"}}}"#,
+        )
+        .unwrap();
         let tree = build(&root);
         assert_eq!(tree.len(), 1);
         let th = &tree[0].children[0];
-        assert_eq!(th.children.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), ["FLOWPLAN", "a"]); // the stray is on disk, not in the tree
+        assert_eq!(
+            th.children
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            ["FLOWPLAN", "a"]
+        ); // the stray is on disk, not in the tree
         assert_eq!(agent_id(&th.children[1].path, "a"), "a");
-        assert_eq!(agent_id(&t.join(STRAY).join("stray-1"), "stray-1"), format!("{STRAY}/stray-1"));
+        assert_eq!(
+            agent_id(&t.join(STRAY).join("stray-1"), "stray-1"),
+            format!("{STRAY}/stray-1")
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

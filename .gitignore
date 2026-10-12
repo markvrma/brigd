@@ -1,4 +1,5 @@
 /target
+/temp/
 .DS_Store
 hello.txt
 .claude/
