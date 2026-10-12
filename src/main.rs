@@ -754,15 +754,6 @@ fn flow_text(flow: &Flow) -> String {
         .collect()
 }
 
-fn first_line(s: &str) -> String {
-    let l = s.lines().next().unwrap_or("");
-    if l.chars().count() > 60 {
-        l.chars().take(57).collect::<String>() + "..."
-    } else {
-        l.into()
-    }
-}
-
 // ---------- running ----------
 
 /// Runs the thread's flow on a background thread while the TUI owns the screen.
