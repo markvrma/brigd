@@ -560,13 +560,15 @@ pub fn plan_lines(
                 Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)),
                 guide(&meta),
             ]));
-            out.push(Line::from(vec![
-                guide(if last { "│       " } else { "│  │    " }),
-                Span::styled(
-                    crate::first_line(&a.task),
-                    dim.add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+            // Blank task lines are dropped, like wrap() drops them in the goal.
+            for l in a.task.lines().filter(|l| !l.trim().is_empty()) {
+                for w in wrap(l, width.saturating_sub(8).max(20)) {
+                    out.push(Line::from(vec![
+                        guide(if last { "│       " } else { "│  │    " }),
+                        Span::styled(w, dim.add_modifier(Modifier::ITALIC)),
+                    ]));
+                }
+            }
         }
     }
     out.push(Line::from(guide("│")));
@@ -3020,7 +3022,10 @@ mod tests {
             model: "haiku".into(),
             effort: "low".into(),
             worktree: wt.map(String::from),
-            task: format!("task of {name}\nmore"),
+            task: format!(
+                "task of {name}\nmore\n\n{}tail-of-{name}",
+                "word ".repeat(40)
+            ),
             files: vec![],
             mode: "default".into(),
         };
@@ -3032,6 +3037,7 @@ mod tests {
             ],
         };
         let text = crate::flow_text(&flow);
+        assert!(text.contains("tail-of-trace-auth"), "{text}");
         assert!(
             text.contains("│  ├─ ◇ check-db  ") && text.ends_with("│\n└  log\n"),
             "{text}"
@@ -3060,7 +3066,7 @@ mod tests {
             rel: None,
         };
         app.tabs.insert(String::new(), one_pane(vec![tab]));
-        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let b = term.backend().buffer();
         let rows: Vec<String> = (0..b.area.height)
@@ -3083,6 +3089,8 @@ mod tests {
                 && has("◇  stage 2 · 1 agent")
         );
         assert!(has("└  log") && has("start check-db in /repo"));
+        // Long multi-line tasks are wrapped whole, not truncated.
+        assert!(has("│  │    more") && has("tail-of-check-db") && has("tail-of-review"));
     }
 
     #[test]
