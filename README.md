@@ -3,11 +3,24 @@
 brigd plans a task as a staged flow of Claude Code agents and runs each agent in its own PTY,
 inside one TUI. Stages run in order; agents within a stage run in parallel.
 
+> **Unofficial.** brigd is an independent project, not affiliated with, endorsed by, or sponsored by Anthropic.
+> "Claude" and "Claude Code" are trademarks of Anthropic.
+
 ## Requirements
 
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI (`claude`), installed and logged in. Claude is the default agent.
-- Rust toolchain (`cargo`), and `git`.
-- Optional: `tmux`. `--bg` opens the TUI in a new tmux window; otherwise it falls back to Terminal.app on macOS.
+- Rust 1.88 or newer (`cargo`), and `git`.
+- Optional: `tmux` or `herdr`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS.
+
+## Install
+
+```sh
+cargo install brigd --locked
+brigd install-skill
+```
+
+From source: `cargo install --git https://github.com/markvrma/brigd --locked`, or see Quick setup below.
+Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Quick setup
 
@@ -98,3 +111,32 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 | `a` | archive it: moved to `<root>/archive/threads`, worktrees kept |
 | `n` | new thread in the highlighted thread's repo (opens the new-thread dialog) |
 | `Ctrl-t` | send Ctrl-t to the focused claude |
+
+## Privacy and security
+
+brigd launches **every** agent with `claude --permission-mode auto`: Claude runs tools (shell commands, file
+edits) without asking first. Agents can read and write anything your user can, and anything they read
+(files, web pages, dependencies) can try to steer them. Only run flows you trust, in repos you trust; use a
+disposable checkout for untrusted code. brigd itself sends nothing anywhere: flow state, prompts and results
+live under `~/.brigd/threads/`, and all network traffic comes from the `claude` CLI under its own terms.
+See [SECURITY.md](SECURITY.md).
+
+## Uninstall
+
+```sh
+cargo uninstall brigd
+rm -rf ~/.claude/skills/brigd-plan   # the installed skill
+rm -rf ~/.brigd                      # thread state; optional
+```
+
+Thread worktrees live under `~/.brigd/worktrees` and add `brigd/<thread>/<key>` branches to your repos;
+delete threads from the TUI (`Ctrl-t d`) first to clean those up.
+
+## License
+
+[MIT](LICENSE)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+Changes are tracked in [CHANGELOG.md](CHANGELOG.md).
