@@ -16,7 +16,7 @@ use ratatui::style::{
     Color::{self, Rgb},
     Modifier, Style,
 };
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1917,8 +1917,7 @@ impl App {
                 let app_cursor = live.parser.lock().unwrap().screen().application_cursor();
                 self.send(&key_bytes(k, app_cursor));
             }
-            Some(Tab::View { text, scroll, .. }) => {
-                let max = text.lines().count().saturating_sub(1) as i32;
+            Some(Tab::View { scroll, .. }) => {
                 let d = match k.code {
                     KeyCode::Up | KeyCode::Char('k') => -1,
                     KeyCode::Down | KeyCode::Char('j') => 1,
@@ -1929,7 +1928,8 @@ impl App {
                     KeyCode::Tab | KeyCode::Esc => return self.focus_main = false,
                     _ => 0,
                 };
-                *scroll = (*scroll as i32 + d).clamp(0, max) as u16;
+                *scroll = (*scroll as i32 + d).clamp(0, u16::MAX as i32) as u16;
+                // draw clamps to the rendered line count
             }
             None => self.focus_main = false,
         }
@@ -2114,10 +2114,8 @@ impl App {
                             p.screen_mut().set_scrollback((s - d).max(0) as usize);
                             // wheel up = further back
                         }
-                        Some(Tab::View { text, scroll, .. }) => {
-                            *scroll = (*scroll as i32 + d)
-                                .clamp(0, text.lines().count().saturating_sub(1) as i32)
-                                as u16
+                        Some(Tab::View { scroll, .. }) => {
+                            *scroll = (*scroll as i32 + d).clamp(0, u16::MAX as i32) as u16
                         }
                         None => {}
                     }
@@ -2368,7 +2366,9 @@ impl App {
             Some(Tab::View { text, scroll, rel: Some(rel), .. }) => {
                 // The diff above, the file's path right-aligned on the body's last row.
                 let [d, foot] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(body);
-                f.render_widget(Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false }).scroll((*scroll, 0)), d);
+                let p = Paragraph::new(diff_lines(text)).wrap(Wrap { trim: false });
+                *scroll = (*scroll).min(p.line_count(d.width).saturating_sub(1).min(u16::MAX as usize) as u16);
+                f.render_widget(p.scroll((*scroll, 0)), d);
                 f.render_widget(Paragraph::new(rel.as_str()).style(Style::new().fg(pal().overlay0)).right_aligned(), foot);
             }
             Some(Tab::View { scroll, .. }) if plan.is_some() => {
@@ -2377,8 +2377,10 @@ impl App {
                 f.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), pad);
             }
             Some(Tab::View { path, text, scroll, .. }) => {
-                let p = if path.extension().is_some_and(|e| e == "md") { Paragraph::new(md_lines(text)) } else { Paragraph::new(text.as_str()) };
-                f.render_widget(p.wrap(Wrap { trim: false }).scroll((*scroll, 0)), body);
+                let (p, area) = if path.extension().is_some_and(|e| e == "md") { (Paragraph::new(md_text(text, pad.width)), pad) } else { (Paragraph::new(text.as_str()), body) };
+                let p = p.wrap(Wrap { trim: false });
+                *scroll = (*scroll).min(p.line_count(area.width).saturating_sub(1).min(u16::MAX as usize) as u16);
+                f.render_widget(p.scroll((*scroll, 0)), area);
             }
             None => f.render_widget(Paragraph::new("\n  Enter or click an agent to open its claude tab, or an output.md to read it."), body),
         }
@@ -2711,132 +2713,72 @@ fn diff_lines(text: &str) -> Vec<Line<'_>> {
         .collect()
 }
 
-/// Markdown → styled lines, one per source line so scroll bounds match `text.lines()`.
-fn md_lines(text: &str) -> Vec<Line<'static>> {
-    let (mut code, dim) = (false, Style::new().fg(pal().overlay0));
-    text.lines()
-        .map(|l| {
-            let t = l.trim_start();
-            let ind = &l[..l.len() - t.len()];
-            if t.starts_with("```") {
-                code = !code;
-                return Line::styled("─".repeat(40), dim);
-            }
-            if code {
-                return Line::styled(
-                    l.to_string(),
-                    Style::new().fg(pal().peach).bg(pal().surface0),
-                );
-            }
-            if let Some(n) = (1..=6).find(|&n| t.starts_with(&format!("{} ", "#".repeat(n)))) {
-                let c = [pal().mauve, pal().sky, pal().blue][(n - 1).min(2)];
-                return Line::from(inline(
-                    &t[n + 1..],
-                    Style::new().fg(c).add_modifier(Modifier::BOLD),
-                ));
-            }
-            if t.len() >= 3
-                && (t.chars().all(|c| c == '-')
-                    || t.chars().all(|c| c == '*')
-                    || t.chars().all(|c| c == '_'))
-            {
-                return Line::styled("─".repeat(40), dim);
-            }
-            if let Some(q) = t.strip_prefix('>') {
-                let mut v = vec![Span::raw(ind.to_string()), Span::styled("│ ", dim)];
-                v.extend(inline(
-                    q.trim_start(),
-                    Style::new()
-                        .fg(pal().subtext0)
-                        .add_modifier(Modifier::ITALIC),
-                ));
-                return Line::from(v);
-            }
-            let num = t
-                .find(". ")
-                .filter(|&i| i > 0 && t[..i].bytes().all(|b| b.is_ascii_digit()));
-            let (mark, rest) = if let Some(r) = t
-                .strip_prefix("- ")
-                .or_else(|| t.strip_prefix("* "))
-                .or_else(|| t.strip_prefix("+ "))
-            {
-                ("•".to_string(), r)
-            } else if let Some(i) = num {
-                (t[..=i].to_string(), &t[i + 2..])
-            } else {
-                return Line::from(
-                    [vec![Span::raw(ind.to_string())], inline(t, Style::new())].concat(),
-                );
-            };
-            Line::from(
-                [
-                    vec![
-                        Span::raw(ind.to_string()),
-                        Span::styled(mark + " ", Style::new().fg(pal().yellow)),
-                    ],
-                    inline(rest, Style::new()),
-                ]
-                .concat(),
-            )
-        })
-        .collect()
+/// tui-markdown styles from the active `pal()` theme; unlisted ones keep the crate defaults.
+#[derive(Clone)]
+struct MdStyle;
+
+impl tui_markdown::StyleSheet for MdStyle {
+    fn heading(&self, level: u8) -> Style {
+        let c = [pal().mauve, pal().sky, pal().blue][(level.max(1) - 1).min(2) as usize];
+        Style::new().fg(c).add_modifier(Modifier::BOLD)
+    }
+    fn heading_marker(&self, _: u8) -> &str {
+        ""
+    }
+    fn code_block_fence(&self) -> &str {
+        ""
+    }
+    fn code(&self) -> Style {
+        Style::new().fg(pal().peach).bg(pal().surface0)
+    }
+    fn blockquote(&self) -> Style {
+        Style::new()
+            .fg(pal().subtext0)
+            .add_modifier(Modifier::ITALIC)
+    }
+    fn table_border(&self) -> Style {
+        Style::new().fg(pal().overlay0)
+    }
+    fn table_header(&self) -> Style {
+        Style::new().fg(pal().text).add_modifier(Modifier::BOLD)
+    }
+    fn link(&self) -> Style {
+        Style::new()
+            .fg(pal().sky)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+    fn list_marker(&self) -> Style {
+        Style::new().fg(pal().yellow)
+    }
+    fn metadata_block(&self) -> Style {
+        Style::new().fg(pal().overlay0)
+    }
+    // Math parsing is always on; keep `$5 and $10` plain.
+    fn math_inline(&self) -> Style {
+        Style::new()
+    }
+    fn math_display(&self) -> Style {
+        Style::new()
+    }
 }
 
-/// Inline `code`, **bold**, *italic*/_italic_, [text](url) spans.
-fn inline(s: &str, base: Style) -> Vec<Span<'static>> {
-    let (mut out, mut buf, mut rest) = (Vec::new(), String::new(), s);
-    let flush = |buf: &mut String, out: &mut Vec<Span<'static>>| {
-        if !buf.is_empty() {
-            out.push(Span::styled(std::mem::take(buf), base));
+/// Markdown → styled text wrapped for `width` columns; tables are fitted to it.
+/// ponytail: re-rendered every frame (~0.3ms typical, 12ms for 150KB in release); cache by (path, width, text len) if big files lag.
+fn md_text(text: &str, width: u16) -> Text<'_> {
+    let mut t = tui_markdown::from_str_with_options(
+        text,
+        &tui_markdown::Options::new(MdStyle).table_width(width),
+    );
+    for l in &mut t.lines {
+        // A thematic break comes out as a bare unstyled `---`; code and front matter lines are styled.
+        if l.style == Style::default()
+            && l.spans.iter().all(|s| s.style == Style::default())
+            && l.spans.iter().map(|s| &*s.content).collect::<String>() == "---"
+        {
+            *l = Line::styled("─".repeat(width as usize), Style::new().fg(pal().overlay0));
         }
-    };
-    while let Some(c) = rest.chars().next() {
-        let r = &rest[c.len_utf8()..];
-        let close =
-            |pat: &str, from: &str| from.find(pat).filter(|&e| e > 0 && !from.starts_with(' '));
-        if c == '`' {
-            if let Some(e) = r.find('`') {
-                flush(&mut buf, &mut out);
-                out.push(Span::styled(
-                    r[..e].to_string(),
-                    Style::new().fg(pal().peach).bg(pal().surface0),
-                ));
-                rest = &r[e + 1..];
-                continue;
-            }
-        } else if rest.starts_with("**") {
-            if let Some(e) = close("**", &rest[2..]) {
-                flush(&mut buf, &mut out);
-                out.extend(inline(&rest[2..2 + e], base.add_modifier(Modifier::BOLD)));
-                rest = &rest[4 + e..];
-                continue;
-            }
-        } else if c == '*' || (c == '_' && !buf.chars().last().is_some_and(char::is_alphanumeric)) {
-            if let Some(e) = close(&c.to_string(), r) {
-                flush(&mut buf, &mut out);
-                out.extend(inline(&r[..e], base.add_modifier(Modifier::ITALIC)));
-                rest = &r[e + 1..];
-                continue;
-            }
-        } else if c == '[' {
-            if let Some((e, u)) = r
-                .find("](")
-                .and_then(|e| r[e + 2..].find(')').map(|u| (e, e + 2 + u)))
-            {
-                flush(&mut buf, &mut out);
-                out.extend(inline(
-                    &r[..e],
-                    base.fg(pal().sky).add_modifier(Modifier::UNDERLINED),
-                ));
-                rest = &r[u + 1..];
-                continue;
-            }
-        }
-        buf.push(c);
-        rest = r;
     }
-    flush(&mut buf, &mut out);
-    out
+    t
 }
 
 #[cfg(test)]
@@ -2904,13 +2846,35 @@ mod tests {
 
     #[test]
     fn markdown_lines() {
-        let l = md_lines("# Title\nsome **bold** x\n```\n**raw**\n```");
-        assert_eq!(l.len(), 5); // one rendered line per source line
-        assert_eq!(l[0].spans[0].content, "Title");
-        assert!(l[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
-        let b = l[1].spans.iter().find(|s| s.content == "bold").unwrap();
-        assert!(b.style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(l[3].spans[0].content, "**raw**"); // no inline parsing in code
+        let t = md_text(
+            "# Title\nsome **bold** x\n```\n**raw**\n---\n```\n\n---",
+            30,
+        );
+        let s: Vec<String> = t
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| &*s.content).collect())
+            .collect();
+        let h = &t.lines[s.iter().position(|l| l == "Title").unwrap()];
+        assert_eq!(h.style.fg, Some(pal().mauve)); // heading style sits on the line, not the spans
+        assert!(h.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!s.iter().any(|l| l.contains("```")));
+        assert!(s.iter().any(|l| l == "**raw**")); // no inline parsing in code
+        assert!(s.iter().any(|l| l == "---")); // a rule inside code stays literal
+        assert!(s.iter().any(|l| l == &"─".repeat(30)));
+    }
+
+    #[test]
+    fn markdown_table() {
+        let t = md_text("| a | b |\n|---|---|\n| a long cell that wraps | x |", 20);
+        let s: Vec<String> = t
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| &*s.content).collect())
+            .collect();
+        assert!(t.lines.iter().all(|l| l.width() <= 20), "{s:#?}");
+        assert!(s[0].starts_with('┌'));
+        assert!(s.iter().any(|l| l.contains("│ a")));
     }
 
     #[test]
