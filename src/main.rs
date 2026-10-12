@@ -18,6 +18,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 const SKILL: &str = include_str!("../skills/brigd-plan/SKILL.md");
+// Installed by `brigd install-skill`; brigd-plan first, the rest back the opt-in plan-review-go path.
+const SKILLS: &[(&str, &str)] = &[
+    ("brigd-plan", SKILL),
+    (
+        "plan-review-go",
+        include_str!("../skills/plan-review-go/SKILL.md"),
+    ),
+    ("grill-me", include_str!("../skills/grill-me/SKILL.md")),
+    ("grilling", include_str!("../skills/grilling/SKILL.md")),
+];
 const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const MODES: &[&str] = &["default", "acceptEdits", "auto"];
@@ -36,7 +46,7 @@ const USAGE: &str = "usage:
   brigd ls                     list threads
   brigd status <name>          per-agent detail
   brigd resume <name>          continue a stopped thread in the TUI
-  brigd install-skill          install brigd-plan into ~/.claude/skills";
+  brigd install-skill          install brigd-plan, plan-review-go, grill-me into ~/.claude/skills";
 
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","stages"],
 "properties":{"goal":{"type":"string"},
@@ -108,7 +118,10 @@ fn real_main() -> Res<()> {
     match a.as_slice() {
         [] => tui::run(None),
         ["stray", ..] => stray(&args[1..]),
-        ["help" | "-h" | "--help"] => Ok(println!("{USAGE}")),
+        ["help" | "-h" | "--help"] => {
+            println!("{USAGE}");
+            Ok(())
+        }
         ["ls"] => ls(),
         ["status", name] => status(name),
         ["resume", name] => {
@@ -150,13 +163,20 @@ fn thread_dir(name: &str) -> PathBuf {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn load(name: &str) -> Res<(Flow, State)> {
     let dir = thread_dir(name);
-    let read = |f: &str| fs::read_to_string(dir.join(f)).map_err(|e| format!("thread {name}: {f}: {e}"));
-    Ok((serde_json::from_str(&read("flowmap.json").or_else(|_| read("flow.json"))?)?, serde_json::from_str(&read("state.json")?)?))
+    let read =
+        |f: &str| fs::read_to_string(dir.join(f)).map_err(|e| format!("thread {name}: {f}: {e}"));
+    Ok((
+        serde_json::from_str(&read("flowmap.json").or_else(|_| read("flow.json"))?)?,
+        serde_json::from_str(&read("state.json")?)?,
+    ))
 }
 
 /// Writes via temp file + rename so a crash never leaves half a journal.
@@ -174,7 +194,9 @@ fn update(state: &Mutex<State>, f: impl FnOnce(&mut State)) -> Res<()> {
 }
 
 fn set_agent(state: &Mutex<State>, agent: &str, status: &str) -> Res<()> {
-    update(state, |s| s.agents.entry(agent.into()).or_default().status = status.into())
+    update(state, |s| {
+        s.agents.entry(agent.into()).or_default().status = status.into()
+    })
 }
 
 /// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
@@ -184,16 +206,34 @@ fn set_agent(state: &Mutex<State>, agent: &str, status: &str) -> Res<()> {
 fn terminate(thread: &str, agent: &str) -> Res<usize> {
     let dir = thread_dir(thread).join(agent);
     let (cwd, repo, state) = if Path::new(agent).starts_with(tree::STRAY) {
-        let cwd = PathBuf::from(fs::read_to_string(dir.join("cwd")).map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?.trim());
+        let cwd = PathBuf::from(
+            fs::read_to_string(dir.join("cwd"))
+                .map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?
+                .trim(),
+        );
         (cwd.clone(), cwd, None)
     } else {
         let (flow, state) = load(thread)?;
-        let a = flow.stages.iter().flatten().find(|a| a.name == agent).ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
+        let a = flow
+            .stages
+            .iter()
+            .flatten()
+            .find(|a| a.name == agent)
+            .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
         let repo = PathBuf::from(&state.repo);
-        (tree::space_cwd(&root(), &repo, thread, a.worktree.as_deref().unwrap_or("")), repo, Some(state))
+        (
+            tree::space_cwd(&root(), &repo, thread, a.worktree.as_deref().unwrap_or("")),
+            repo,
+            Some(state),
+        )
     };
     stop_agent(thread, agent)?;
-    let n = tree::revert(&PathBuf::from(env::var("HOME").unwrap_or_default()), &cwd, &repo, &dir)?;
+    let n = tree::revert(
+        &PathBuf::from(env::var("HOME").unwrap_or_default()),
+        &cwd,
+        &repo,
+        &dir,
+    )?;
     if let Some(state) = state {
         set_agent(&Mutex::new(state), agent, "failed")?;
     }
@@ -214,7 +254,9 @@ fn stop_agent(thread: &str, agent: &str) -> Res<()> {
     }
     // Wait for the process to be gone so it cannot rewrite a file after the revert.
     for i in 0..40 {
-        if !runner::live(thread, agent).is_some_and(|l| l.alive()) && !pid.as_ref().is_some_and(|p| runner::pid_alive(p)) {
+        if !runner::live(thread, agent).is_some_and(|l| l.alive())
+            && !pid.as_ref().is_some_and(|p| runner::pid_alive(p))
+        {
             break;
         }
         if i == 20 {
@@ -233,9 +275,29 @@ fn stop_agent(thread: &str, agent: &str) -> Res<()> {
 /// Stops every running agent of `thread`: its live flow agents and its strays with a live pid.
 /// Unlike terminate it reverts nothing (an archived thread keeps its work).
 fn stop_thread(thread: &str) {
-    let mut agents: Vec<String> = runner::registry().lock().unwrap().values().filter(|a| a.thread == thread && a.alive()).map(|a| a.agent.clone()).collect();
-    let strays = fs::read_dir(thread_dir(thread).join(tree::STRAY)).into_iter().flatten().flatten().map(|e| e.path());
-    agents.extend(strays.filter(|d| fs::read_to_string(d.join("pid")).is_ok_and(|p| runner::pid_alive(&p))).filter_map(|d| Some(format!("{}/{}", tree::STRAY, d.file_name()?.to_string_lossy()))));
+    let mut agents: Vec<String> = runner::registry()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|a| a.thread == thread && a.alive())
+        .map(|a| a.agent.clone())
+        .collect();
+    let strays = fs::read_dir(thread_dir(thread).join(tree::STRAY))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path());
+    agents.extend(
+        strays
+            .filter(|d| fs::read_to_string(d.join("pid")).is_ok_and(|p| runner::pid_alive(&p)))
+            .filter_map(|d| {
+                Some(format!(
+                    "{}/{}",
+                    tree::STRAY,
+                    d.file_name()?.to_string_lossy()
+                ))
+            }),
+    );
     for a in agents {
         let _ = stop_agent(thread, &a);
     }
@@ -261,21 +323,52 @@ fn archive_thread(root: &Path, thread: &str) -> Res<PathBuf> {
 /// Removes `thread` for good: its git worktrees (in its state.json repo) and their
 /// brigd/<thread>/* branches, then <root>/threads/<thread> and <root>/worktrees/<thread>.
 fn delete_thread(root: &Path, thread: &str) -> Res<()> {
-    let (tdir, wdir) = (root.join("threads").join(thread), root.join("worktrees").join(thread));
-    let state: serde_json::Value = fs::read_to_string(tdir.join("state.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-    let repo = state["repo"].as_str().map(PathBuf::from).filter(|r| r.exists());
-    let git = |args: &[&str]| repo.as_ref().and_then(|r| Command::new("git").arg("-C").arg(r).args(args).output().ok());
+    let (tdir, wdir) = (
+        root.join("threads").join(thread),
+        root.join("worktrees").join(thread),
+    );
+    let state: serde_json::Value = fs::read_to_string(tdir.join("state.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let repo = state["repo"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|r| r.exists());
+    let git = |args: &[&str]| {
+        repo.as_ref().and_then(|r| {
+            Command::new("git")
+                .arg("-C")
+                .arg(r)
+                .args(args)
+                .output()
+                .ok()
+        })
+    };
     for wt in fs::read_dir(&wdir).into_iter().flatten().flatten() {
-        let _ = git(&["worktree", "remove", "--force", &wt.path().to_string_lossy()]);
+        let _ = git(&[
+            "worktree",
+            "remove",
+            "--force",
+            &wt.path().to_string_lossy(),
+        ]);
     }
     for d in [&tdir, &wdir] {
         match fs::remove_dir_all(d) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(format!("{}: {e}", d.display()).into()),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                return Err(format!("{}: {e}", d.display()).into())
+            }
             _ => {}
         }
     }
     let _ = git(&["worktree", "prune"]); // forgets any worktree `remove` refused
-    let refs = git(&["for-each-ref", "--format=%(refname:short)", &format!("refs/heads/brigd/{thread}/")]).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let refs = git(&[
+        "for-each-ref",
+        "--format=%(refname:short)",
+        &format!("refs/heads/brigd/{thread}/"),
+    ])
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .unwrap_or_default();
     let mut kept = vec![];
     for b in refs.lines() {
         if !git(&["branch", "-D", b]).is_some_and(|o| o.status.success()) {
@@ -292,17 +385,28 @@ fn delete_thread(root: &Path, thread: &str) -> Res<()> {
 /// execute never prints: the TUI owns the screen and shows this file.
 /// Log lines go under the plan's last line, LOG_MARK, which the TUI's FLOWPLAN view splits on.
 fn log(thread: &str, msg: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(thread_dir(thread).join("FLOWPLAN")) {
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(thread_dir(thread).join("FLOWPLAN"))
+    {
         let _ = writeln!(f, "   {msg}");
     }
 }
 
 fn check_new_thread(name: &str) -> Res<()> {
     if RESERVED.contains(&name) || !valid_name(name, THREAD_MAX) {
-        return Err(format!("bad thread name {name:?}: [a-z][a-z0-9_-], max {THREAD_MAX}, not one of {RESERVED:?}").into());
+        return Err(format!(
+            "bad thread name {name:?}: [a-z][a-z0-9_-], max {THREAD_MAX}, not one of {RESERVED:?}"
+        )
+        .into());
     }
     if thread_dir(name).exists() {
-        return Err(format!("thread {name} exists: `brigd resume {name}`, or delete {} to reuse the name", thread_dir(name).display()).into());
+        return Err(format!(
+            "thread {name} exists: `brigd resume {name}`, or delete {} to reuse the name",
+            thread_dir(name).display()
+        )
+        .into());
     }
     Ok(())
 }
@@ -312,7 +416,13 @@ fn check_new_thread(name: &str) -> Res<()> {
 fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) -> Res<State> {
     let dir = root.join("threads").join(name);
     fs::create_dir_all(&dir)?;
-    let state = State { thread: name.into(), repo: repo.into(), status: "planned".into(), updated: now(), ..Default::default() };
+    let state = State {
+        thread: name.into(),
+        repo: repo.into(),
+        status: "planned".into(),
+        updated: now(),
+        ..Default::default()
+    };
     write_json(&dir.join("state.json"), &state)?;
     write_json(&dir.join("flowmap.json"), flow)?;
     Ok(state)
@@ -320,7 +430,10 @@ fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) -> Res<State>
 
 fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     check_new_thread(name)?;
-    let repo = env::current_dir()?.canonicalize()?.to_string_lossy().into_owned();
+    let repo = env::current_dir()?
+        .canonicalize()?
+        .to_string_lossy()
+        .into_owned();
     let state = create_thread(&root(), name, &repo, &flow)?;
     let dir = thread_dir(name);
     let flow_path = dir.join("flowmap.json");
@@ -328,7 +441,10 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
         let plan = dir.join("FLOWPLAN");
         fs::write(&plan, flow_text(&flow))?;
         let at = launch_bg(name, &state.repo)?;
-        println!("brigd: thread {name} running in {at}; FLOWPLAN at {}", plan.display());
+        println!(
+            "brigd: thread {name} running in {at}; FLOWPLAN at {}",
+            plan.display()
+        );
         return Ok(());
     }
     loop {
@@ -346,12 +462,18 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
             "e" | "E" => {
                 let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".into());
                 Command::new(editor).arg(&flow_path).status()?;
-                match serde_json::from_str::<Flow>(&fs::read_to_string(&flow_path)?).map_err(|e| e.to_string()).and_then(|f| validate(&f).map(|_| f)) {
+                match serde_json::from_str::<Flow>(&fs::read_to_string(&flow_path)?)
+                    .map_err(|e| e.to_string())
+                    .and_then(|f| validate(&f).map(|_| f))
+                {
                     Ok(f) => flow = f,
                     Err(e) => eprintln!("edited flow invalid, keeping previous one: {e}"),
                 }
             }
-            _ => return Ok(println!("saved, not run. `brigd resume {name}` runs it.")),
+            _ => {
+                println!("saved, not run. `brigd resume {name}` runs it.");
+                return Ok(());
+            }
         }
     }
 }
@@ -407,20 +529,38 @@ fn surfaces(var: impl Fn(&str) -> Option<String>) -> Vec<Surface> {
 fn launch_bg(name: &str, repo: &str) -> Res<String> {
     let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     // A tmux window inherits this process's env: drop the calling Claude session's vars so agents start clean.
-    let unset: String = PARENT_SESSION_VARS.iter().map(|v| format!("-u {v} ")).collect();
-    let cmd = format!("env {unset}{} resume {name}", q(&env::current_exe()?.to_string_lossy()));
+    let unset: String = PARENT_SESSION_VARS
+        .iter()
+        .map(|v| format!("-u {v} "))
+        .collect();
+    let cmd = format!(
+        "env {unset}{} resume {name}",
+        q(&env::current_exe()?.to_string_lossy())
+    );
     let label = format!("brigd-{name}");
     let mut errs = vec![];
     for s in surfaces(|k| env::var(k).ok()) {
         let r = match &s {
             Surface::Herdr(ws) => herdr_tab(ws, repo, &label, &cmd),
             // `|| read` keeps the window open on an error so it can be read.
-            Surface::Tmux => run_ok(Command::new("tmux").args(["new-window", "-d", "-n", &label, "-c", repo, &format!("{cmd} || read _")]))
-                .map(|_| format!("tmux window {label} (tmux select-window -t {label})")),
+            Surface::Tmux => run_ok(Command::new("tmux").args([
+                "new-window",
+                "-d",
+                "-n",
+                &label,
+                "-c",
+                repo,
+                &format!("{cmd} || read _"),
+            ]))
+            .map(|_| format!("tmux window {label} (tmux select-window -t {label})")),
             Surface::Terminal => {
                 let sh = format!("cd {} && {cmd}", q(repo));
-                let script = format!("tell application \"Terminal\" to do script \"{}\"", sh.replace('\\', "\\\\").replace('"', "\\\""));
-                run_ok(Command::new("osascript").args(["-e", &script])).map(|_| "a new Terminal window".to_string())
+                let script = format!(
+                    "tell application \"Terminal\" to do script \"{}\"",
+                    sh.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                run_ok(Command::new("osascript").args(["-e", &script]))
+                    .map(|_| "a new Terminal window".to_string())
             }
         };
         match r {
@@ -428,15 +568,31 @@ fn launch_bg(name: &str, repo: &str) -> Res<String> {
             Err(e) => errs.push(format!("{s:?}: {e}")),
         }
     }
-    let why = if errs.is_empty() { "not in herdr or tmux, not on macOS".into() } else { errs.join("; ") };
+    let why = if errs.is_empty() {
+        "not in herdr or tmux, not on macOS".into()
+    } else {
+        errs.join("; ")
+    };
     Err(format!("no terminal to run thread {name} in ({why}); it is saved, `brigd resume {name}` in a terminal runs it").into())
 }
 
 /// Opens an unfocused herdr tab in workspace `ws` and runs `cmd` in its shell.
 fn herdr_tab(ws: &str, repo: &str, label: &str, cmd: &str) -> Res<String> {
-    let out = run_ok(Command::new("herdr").args(["tab", "create", "--workspace", ws, "--cwd", repo, "--label", label, "--no-focus"]))?;
+    let out = run_ok(Command::new("herdr").args([
+        "tab",
+        "create",
+        "--workspace",
+        ws,
+        "--cwd",
+        repo,
+        "--label",
+        label,
+        "--no-focus",
+    ]))?;
     let v: serde_json::Value = serde_json::from_str(&out)?;
-    let pane = v["result"]["root_pane"]["pane_id"].as_str().ok_or_else(|| format!("no root pane in {out}"))?;
+    let pane = v["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .ok_or_else(|| format!("no root pane in {out}"))?;
     // A fresh pane reports busy for a few seconds while its shell starts.
     let mut last = String::new();
     for _ in 0..20 {
@@ -453,7 +609,10 @@ fn herdr_tab(ws: &str, repo: &str, label: &str, cmd: &str) -> Res<String> {
 fn run_ok(c: &mut Command) -> Res<String> {
     let out = c.stdin(Stdio::null()).output()?;
     if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string().into());
+        return Err(String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .to_string()
+            .into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -467,16 +626,40 @@ fn plan(task: &str, repo: &Path) -> Res<Flow> {
         // ponytail: skill text passed as system prompt so it works uninstalled; install-skill is for interactive /brigd-plan.
         let mut cmd = Command::new("claude");
         // brigd may run under Claude Code; the planner is a session of its own.
-        PARENT_SESSION_VARS.iter().for_each(|v| _ = cmd.env_remove(v));
+        PARENT_SESSION_VARS
+            .iter()
+            .for_each(|v| _ = cmd.env_remove(v));
         let out = cmd
             .current_dir(repo)
-            .args(["-p", &prompt, "--model", "opus", "--effort", "high", "--output-format", "json"])
-            .args(["--no-session-persistence", "--json-schema", SCHEMA, "--tools", "Read,Grep,Glob"])
+            .args([
+                "-p",
+                &prompt,
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--output-format",
+                "json",
+            ])
+            .args([
+                "--no-session-persistence",
+                "--json-schema",
+                SCHEMA,
+                "--tools",
+                "Read,Grep,Glob",
+            ])
             .args(["--append-system-prompt", SKILL, "--permission-mode", "auto"])
             .output()?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .map_err(|e| format!("planner output not JSON ({e}): {}", String::from_utf8_lossy(&out.stderr)))?;
-        let so = v.get("structured_output").cloned().ok_or_else(|| format!("planner returned no structured_output: {v}"))?;
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
+            format!(
+                "planner output not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })?;
+        let so = v
+            .get("structured_output")
+            .cloned()
+            .ok_or_else(|| format!("planner returned no structured_output: {v}"))?;
         let flow: Flow = serde_json::from_value(so.clone())?;
         match validate(&flow) {
             Ok(()) => return Ok(flow),
@@ -492,7 +675,8 @@ fn valid_name(s: &str, max: usize) -> bool {
     !b.is_empty()
         && b.len() <= max
         && b[0].is_ascii_lowercase()
-        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
 fn validate(flow: &Flow) -> Result<(), String> {
@@ -509,7 +693,9 @@ fn validate(flow: &Flow) -> Result<(), String> {
         for a in stage {
             let who = format!("stage {n} agent {:?}", a.name);
             if !valid_name(&a.name, AGENT_MAX) {
-                return Err(format!("{who}: name must be [a-z][a-z0-9_-], max {AGENT_MAX}"));
+                return Err(format!(
+                    "{who}: name must be [a-z][a-z0-9_-], max {AGENT_MAX}"
+                ));
             }
             if a.name == "log" {
                 return Err(format!("{who}: \"log\" is reserved (the thread log file)"));
@@ -528,11 +714,17 @@ fn validate(flow: &Flow) -> Result<(), String> {
             }
             let wt = a.worktree.as_deref().unwrap_or("");
             if !wt.is_empty() && !valid_name(wt, AGENT_MAX) {
-                return Err(format!("{who}: worktree must be null or [a-z][a-z0-9_-], max {AGENT_MAX}"));
+                return Err(format!(
+                    "{who}: worktree must be null or [a-z][a-z0-9_-], max {AGENT_MAX}"
+                ));
             }
             let c = editors.entry(wt).or_default();
             *c += WRITE_MODES.contains(&a.mode.as_str()) as usize;
-            let space = if wt.is_empty() { "main repo".into() } else { format!("worktree {wt:?}") };
+            let space = if wt.is_empty() {
+                "main repo".into()
+            } else {
+                format!("worktree {wt:?}")
+            };
             if *c > 1 {
                 return Err(format!("stage {n}: two editing agents ({WRITE_MODES:?}) in {space}; move one to the next stage"));
             }
@@ -550,12 +742,25 @@ const LOG_MARK: &str = "└  log";
 
 /// The TUI's FLOWPLAN tree (tui::plan_lines) as plain text, every step pending, ending at LOG_MARK.
 fn flow_text(flow: &Flow) -> String {
-    tui::plan_lines(flow, |_| "pending", 0, 100).iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>() + "\n").collect()
+    tui::plan_lines(flow, |_| "pending", 0, 100)
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
 }
 
 fn first_line(s: &str) -> String {
     let l = s.lines().next().unwrap_or("");
-    if l.chars().count() > 60 { l.chars().take(57).collect::<String>() + "..." } else { l.into() }
+    if l.chars().count() > 60 {
+        l.chars().take(57).collect::<String>() + "..."
+    } else {
+        l.into()
+    }
 }
 
 // ---------- running ----------
@@ -568,8 +773,13 @@ fn run_in_tui(name: &str, flow: Flow, state: State) -> Res<()> {
     match job.is_finished().then(|| job.join()) {
         Some(Ok(Ok(()))) => println!("thread {name} done"),
         Some(Ok(Err(e))) => println!("thread {name}: {e}"),
-        Some(Err(_)) => println!("thread {name}: runner panicked, see {}", thread_dir(name).join("FLOWPLAN").display()),
-        None => println!("left brigd, agents stopped. `brigd resume {name}` continues thread {name}."),
+        Some(Err(_)) => println!(
+            "thread {name}: runner panicked, see {}",
+            thread_dir(name).join("FLOWPLAN").display()
+        ),
+        None => {
+            println!("left brigd, agents stopped. `brigd resume {name}` continues thread {name}.")
+        }
     }
     Ok(())
 }
@@ -585,15 +795,25 @@ fn execute(name: &str, flow: &Flow, state: State) -> Res<()> {
     loop {
         // flowmap.json is live: agents may rewrite later stages, so reread it before every stage.
         let path = thread_dir(name).join("flowmap.json");
-        match fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Flow>(&t).map_err(|e| e.to_string())).and_then(|f| validate(&f).map(|_| f)) {
+        match fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str::<Flow>(&t).map_err(|e| e.to_string()))
+            .and_then(|f| validate(&f).map(|_| f))
+        {
             Ok(f) => flow = f,
-            Err(e) => log(name, &format!("{} invalid, keeping previous flow: {e}", path.display())),
+            Err(e) => log(
+                name,
+                &format!("{} invalid, keeping previous flow: {e}", path.display()),
+            ),
         }
         if i >= flow.stages.len() {
             break;
         }
         update(&state, |s| s.stage = i)?;
-        log(name, &format!("── {name}: stage {}/{} ──", i + 1, flow.stages.len()));
+        log(
+            name,
+            &format!("── {name}: stage {}/{} ──", i + 1, flow.stages.len()),
+        );
         let outcome = run_stage(name, &flow, i, &state);
         if !matches!(outcome, Ok(true)) {
             update(&state, |s| s.status = "failed".into())?;
@@ -618,7 +838,12 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
     let repo = PathBuf::from(state.lock().unwrap().repo.clone());
     let mut jobs = Vec::new();
     for a in &flow.stages[i] {
-        let done = state.lock().unwrap().agents.get(&a.name).is_some_and(|s| s.status == "done");
+        let done = state
+            .lock()
+            .unwrap()
+            .agents
+            .get(&a.name)
+            .is_some_and(|s| s.status == "done");
         if done {
             continue;
         }
@@ -627,22 +852,42 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
             continue;
         }
         let key = a.worktree.as_deref().unwrap_or("");
-        let cwd = if key.is_empty() { repo.clone() } else { ensure_worktree(&repo, thread, key)? };
+        let cwd = if key.is_empty() {
+            repo.clone()
+        } else {
+            ensure_worktree(&repo, thread, key)?
+        };
         let adir = dir.join(&a.name);
         fs::create_dir_all(&adir)?;
         fs::write(adir.join("prompt.md"), task_prompt(thread, flow, i, a))?;
-        let prompt = format!("Read {} and do the task in it.", adir.join("prompt.md").display());
+        let prompt = format!(
+            "Read {} and do the task in it.",
+            adir.join("prompt.md").display()
+        );
         log(thread, &format!("start {} in {}", a.name, cwd.display()));
         record_base(&cwd, &adir);
         // A trust dialog for a new worktree shows in the agent's own terminal; Mark answers it there.
-        let live = runner::start_claude(thread, &a.name, &cwd, &adir, &claude_flags(thread, a), &prompt)?;
+        let live = runner::start_claude(
+            thread,
+            &a.name,
+            &cwd,
+            &adir,
+            &claude_flags(thread, a),
+            &prompt,
+        )?;
         set_agent(state, &a.name, "running")?;
         jobs.push((a, live));
     }
 
     let results: Vec<bool> = thread::scope(|s| {
-        let handles: Vec<_> = jobs.into_iter().map(|(a, live)| s.spawn(move || supervise(thread, a, live, state))).collect();
-        handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|(a, live)| s.spawn(move || supervise(thread, a, live, state)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .collect()
     });
     Ok(results.into_iter().all(|ok| ok))
 }
@@ -650,7 +895,14 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
 /// The commit an agent started from, for its diffs; a relaunch keeps the first one.
 fn record_base(cwd: &Path, dir: &Path) {
     if !dir.join("base").exists() {
-        if let Some(o) = Command::new("git").arg("-C").arg(cwd).args(["rev-parse", "HEAD"]).output().ok().filter(|o| o.status.success()) {
+        if let Some(o) = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        {
             let _ = fs::write(dir.join("base"), &o.stdout);
         }
     }
@@ -669,13 +921,20 @@ fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
     );
     let s = |x: &str| x.to_string();
     vec![
-        s("--model"), a.model.clone(), s("--effort"), a.effort.clone(), s("--permission-mode"), s("auto"), // every brigd agent runs in auto mode; `mode` only marks editors
-        s("-n"), a.name.clone(),
+        s("--model"),
+        a.model.clone(),
+        s("--effort"),
+        a.effort.clone(),
+        s("--permission-mode"),
+        s("auto"), // every brigd agent runs in auto mode; `mode` only marks editors
+        s("-n"),
+        a.name.clone(),
         // The thread dir sits outside the agent's cwd; grant it so reading the task and writing the result never prompt.
         format!("--add-dir={}", dir.display()),
         // Edit rules cover every file-writing tool; claude rejects Write(path) rules.
         s("--allowedTools=Read(~/.brigd/threads/**),Edit(~/.brigd/threads/**)"),
-        s("--append-system-prompt"), sys,
+        s("--append-system-prompt"),
+        sys,
     ]
 }
 
@@ -687,14 +946,21 @@ fn ensure_worktree(repo: &Path, thread: &str, key: &str) -> Res<PathBuf> {
     }
     fs::create_dir_all(path.parent().unwrap_or(&path))?;
     let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).output();
-    let (branch, p) = (format!("brigd/{thread}/{key}"), path.to_string_lossy().into_owned());
+    let (branch, p) = (
+        format!("brigd/{thread}/{key}"),
+        path.to_string_lossy().into_owned(),
+    );
     let _ = git(&["worktree", "prune"]); // forget checkouts deleted by hand
     let mut out = git(&["worktree", "add", "-b", &branch, &p])?;
     if !out.status.success() {
         out = git(&["worktree", "add", &p, &branch])?; // the branch outlived an earlier checkout
     }
     if !out.status.success() {
-        return Err(format!("git worktree add {p}: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
+        return Err(format!(
+            "git worktree add {p}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )
+        .into());
     }
     Ok(path)
 }
@@ -752,7 +1018,8 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
     let home = PathBuf::from(env::var("HOME").unwrap_or_default());
     let sync = || {
         if let Ok(s) = fs::read_to_string(live.dir.join("session")) {
-            let _ = tree::sync_subagents(&tree::subagents_dir(&home, &live.cwd, s.trim()), &live.dir);
+            let _ =
+                tree::sync_subagents(&tree::subagents_dir(&home, &live.cwd, s.trim()), &live.dir);
         }
     };
     let (mut tick, mut idle_for, mut nudged_at, mut blocked) = (0u32, 0, None::<u32>, false);
@@ -772,7 +1039,10 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             break true;
         }
         if !alive {
-            log(thread, &format!("{} exited without {}", a.name, out.display()));
+            log(
+                thread,
+                &format!("{} exited without {}", a.name, out.display()),
+            );
             break false;
         }
         if status == "blocked" {
@@ -798,7 +1068,10 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             continue;
         }
         if nudged_at.is_some() {
-            log(thread, &format!("{} stopped without {}", a.name, out.display()));
+            log(
+                thread,
+                &format!("{} stopped without {}", a.name, out.display()),
+            );
             break false;
         }
         nudged_at = Some(tick);
@@ -850,9 +1123,34 @@ fn stray(args: &[String]) -> Res<()> {
 
 /// Args that pick their own session, print, or don't start a chat: no stray, plain claude.
 fn stray_passthrough(args: &[String]) -> bool {
-    const SUBCOMMANDS: &[&str] = &["mcp", "plugin", "doctor", "update", "install", "setup-token", "config", "auth"];
-    const FLAGS: &[&str] = &["-p", "--print", "-r", "--resume", "-c", "--continue", "--session-id", "-v", "--version", "-h", "--help"];
-    args.first().is_some_and(|a| SUBCOMMANDS.contains(&a.as_str())) || args.iter().any(|a| FLAGS.contains(&a.split('=').next().unwrap_or(a)))
+    const SUBCOMMANDS: &[&str] = &[
+        "mcp",
+        "plugin",
+        "doctor",
+        "update",
+        "install",
+        "setup-token",
+        "config",
+        "auth",
+    ];
+    const FLAGS: &[&str] = &[
+        "-p",
+        "--print",
+        "-r",
+        "--resume",
+        "-c",
+        "--continue",
+        "--session-id",
+        "-v",
+        "--version",
+        "-h",
+        "--help",
+    ];
+    args.first()
+        .is_some_and(|a| SUBCOMMANDS.contains(&a.as_str()))
+        || args
+            .iter()
+            .any(|a| FLAGS.contains(&a.split('=').next().unwrap_or(a)))
 }
 
 /// Creates and returns <parent>/stray-<n>, the first n not taken (create_dir, so two at once never share one).
@@ -877,12 +1175,19 @@ fn shim_dir() -> PathBuf {
 /// The first executable `claude` on PATH outside the shim dir (and not brigd itself).
 fn real_claude() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let (shim, me) = (shim_dir(), env::current_exe().ok().and_then(|p| p.canonicalize().ok()));
+    let (shim, me) = (
+        shim_dir(),
+        env::current_exe().ok().and_then(|p| p.canonicalize().ok()),
+    );
     let shim_c = shim.canonicalize().ok();
     env::split_paths(&env::var_os("PATH")?)
         .filter(|d| *d != shim && (shim_c.is_none() || d.canonicalize().ok() != shim_c))
         .map(|d| d.join("claude"))
-        .find(|c| c.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) && c.canonicalize().ok() != me)
+        .find(|c| {
+            c.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                && c.canonicalize().ok() != me
+        })
 }
 
 /// Writes the `claude` shim and the zsh startup wrappers (an rc that prepends
@@ -897,7 +1202,11 @@ fn ensure_shim() -> Res<PathBuf> {
     let zrc = "if [ -n \"$BRIGD_ZDOTDIR\" ]; then ZDOTDIR=$BRIGD_ZDOTDIR; else unset ZDOTDIR; fi\n\
                [ -f \"${ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${ZDOTDIR:-$HOME}/.zshrc\"\nPATH=\"$BRIGD_SHIM:$PATH\"\n";
     let z = root().join("zsh");
-    for (path, text) in [(dir.join("claude"), shim), (z.join(".zshenv"), zenv), (z.join(".zshrc"), zrc)] {
+    for (path, text) in [
+        (dir.join("claude"), shim),
+        (z.join(".zshenv"), zenv),
+        (z.join(".zshrc"), zrc),
+    ] {
         if fs::read_to_string(&path).ok().as_deref() != Some(text) {
             fs::create_dir_all(path.parent().unwrap_or(&dir))?;
             fs::write(&path, text)?;
@@ -927,40 +1236,84 @@ fn ls() -> Res<()> {
         if let Ok((flow, st)) = load(&name) {
             let total: usize = flow.stages.iter().map(Vec::len).sum();
             let done = st.agents.values().filter(|a| a.status == "done").count();
-            let stage = format!("{}/{}", (st.stage + 1).min(flow.stages.len()), flow.stages.len());
-            rows.push((st.updated, format!("{name:<13} {:<8} {stage:<6} {done}/{total:<5} {:<9} {}", st.status, ago(st.updated), st.repo)));
+            let stage = format!(
+                "{}/{}",
+                (st.stage + 1).min(flow.stages.len()),
+                flow.stages.len()
+            );
+            rows.push((
+                st.updated,
+                format!(
+                    "{name:<13} {:<8} {stage:<6} {done}/{total:<5} {:<9} {}",
+                    st.status,
+                    ago(st.updated),
+                    st.repo
+                ),
+            ));
         }
     }
     if rows.is_empty() {
-        return Ok(println!("no threads. start one: brigd <name> \"task\""));
+        println!("no threads. start one: brigd <name> \"task\"");
+        return Ok(());
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
-    println!("{:<13} {:<8} {:<6} {:<7} {:<9} REPO", "NAME", "STATUS", "STAGE", "AGENTS", "UPDATED");
+    println!(
+        "{:<13} {:<8} {:<6} {:<7} {:<9} REPO",
+        "NAME", "STATUS", "STAGE", "AGENTS", "UPDATED"
+    );
     rows.iter().for_each(|r| println!("{}", r.1));
     Ok(())
 }
 
 fn status(name: &str) -> Res<()> {
     let (flow, st) = load(name)?;
-    println!("{name}: {} (stage {}/{}), updated {}\nrepo: {}\ngoal: {}", st.status, (st.stage + 1).min(flow.stages.len()), flow.stages.len(), ago(st.updated), st.repo, flow.goal);
+    println!(
+        "{name}: {} (stage {}/{}), updated {}\nrepo: {}\ngoal: {}",
+        st.status,
+        (st.stage + 1).min(flow.stages.len()),
+        flow.stages.len(),
+        ago(st.updated),
+        st.repo,
+        flow.goal
+    );
     for (i, stage) in flow.stages.iter().enumerate() {
         println!("stage {}", i + 1);
         for a in stage {
             let s = st.agents.get(&a.name).cloned().unwrap_or_default();
-            let status = if s.status.is_empty() { "pending" } else { &s.status };
+            let status = if s.status.is_empty() {
+                "pending"
+            } else {
+                &s.status
+            };
             let out = output_path(name, &a.name);
-            let out = if out.exists() { out.display().to_string() } else { "-".into() };
-            println!("  {:<19} {:<8} {:<7} wt={:<12} {}", a.name, status, a.model, a.worktree.as_deref().unwrap_or("-"), out);
+            let out = if out.exists() {
+                out.display().to_string()
+            } else {
+                "-".into()
+            };
+            println!(
+                "  {:<19} {:<8} {:<7} wt={:<12} {}",
+                a.name,
+                status,
+                a.model,
+                a.worktree.as_deref().unwrap_or("-"),
+                out
+            );
         }
     }
     Ok(())
 }
 
 fn install_skill() -> Res<()> {
-    let dir = PathBuf::from(env::var("HOME")?).join(".claude/skills/brigd-plan");
-    fs::create_dir_all(&dir)?;
-    fs::write(dir.join("SKILL.md"), SKILL)?;
-    Ok(println!("installed {}", dir.join("SKILL.md").display()))
+    for (name, text) in SKILLS {
+        let dir = PathBuf::from(env::var("HOME")?)
+            .join(".claude/skills")
+            .join(name);
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("SKILL.md"), text)?;
+        println!("installed {}", dir.join("SKILL.md").display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -968,23 +1321,74 @@ mod tests {
     use super::*;
 
     fn agent(name: &str, wt: Option<&str>, mode: &str) -> Agent {
-        Agent { name: name.into(), model: "haiku".into(), effort: "low".into(), worktree: wt.map(String::from), task: "t".into(), files: vec![], mode: mode.into() }
+        Agent {
+            name: name.into(),
+            model: "haiku".into(),
+            effort: "low".into(),
+            worktree: wt.map(String::from),
+            task: "t".into(),
+            files: vec![],
+            mode: mode.into(),
+        }
     }
 
     #[test]
     fn validate_rules() {
-        let ok = Flow { goal: "g".into(), stages: vec![vec![agent("a", None, "default"), agent("b", Some("x"), "acceptEdits")], vec![agent("c", Some("x"), "acceptEdits")]] };
+        let ok = Flow {
+            goal: "g".into(),
+            stages: vec![
+                vec![
+                    agent("a", None, "default"),
+                    agent("b", Some("x"), "acceptEdits"),
+                ],
+                vec![agent("c", Some("x"), "acceptEdits")],
+            ],
+        };
         assert!(validate(&ok).is_ok());
-        let dup = Flow { goal: "g".into(), stages: vec![vec![agent("a", None, "default")], vec![agent("a", None, "default")]] };
+        let dup = Flow {
+            goal: "g".into(),
+            stages: vec![
+                vec![agent("a", None, "default")],
+                vec![agent("a", None, "default")],
+            ],
+        };
         assert!(validate(&dup).unwrap_err().contains("duplicate"));
-        let two_writers = Flow { goal: "g".into(), stages: vec![vec![agent("a", Some("x"), "acceptEdits"), agent("b", Some("x"), "auto")]] };
+        let two_writers = Flow {
+            goal: "g".into(),
+            stages: vec![vec![
+                agent("a", Some("x"), "acceptEdits"),
+                agent("b", Some("x"), "auto"),
+            ]],
+        };
         assert!(validate(&two_writers).unwrap_err().contains("two editing"));
-        let crowded = Flow { goal: "g".into(), stages: vec![(0..6).map(|i| agent(&format!("a{i}"), None, "default")).collect()] };
+        let crowded = Flow {
+            goal: "g".into(),
+            stages: vec![(0..6)
+                .map(|i| agent(&format!("a{i}"), None, "default"))
+                .collect()],
+        };
         assert!(validate(&crowded).is_ok()); // no per-space cap without panes
-        assert!(validate(&Flow { goal: "g".into(), stages: vec![vec![agent("log", None, "default")]] }).unwrap_err().contains("reserved"));
-        assert!(validate(&Flow { goal: "g".into(), stages: vec![vec![]] }).is_err());
-        assert!(validate(&Flow { goal: "g".into(), stages: vec![vec![agent("Bad", None, "default")]] }).is_err());
-        assert!(validate(&Flow { goal: "g".into(), stages: vec![vec![agent("a", None, "plan")]] }).is_err());
+        assert!(validate(&Flow {
+            goal: "g".into(),
+            stages: vec![vec![agent("log", None, "default")]]
+        })
+        .unwrap_err()
+        .contains("reserved"));
+        assert!(validate(&Flow {
+            goal: "g".into(),
+            stages: vec![vec![]]
+        })
+        .is_err());
+        assert!(validate(&Flow {
+            goal: "g".into(),
+            stages: vec![vec![agent("Bad", None, "default")]]
+        })
+        .is_err());
+        assert!(validate(&Flow {
+            goal: "g".into(),
+            stages: vec![vec![agent("a", None, "plan")]]
+        })
+        .is_err());
         assert!(!valid_name("a-very-long-thread", THREAD_MAX));
         assert!(RESERVED.contains(&"ls"));
     }
@@ -1006,40 +1410,91 @@ case "$d" in *nudge) printf idle > "$d/status"; read line; echo "$line" > "$d/nu
 echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
 "#;
         fs::write(bin.join("claude"), fake).unwrap();
-        Command::new("chmod").arg("+x").arg(bin.join("claude")).status().unwrap();
-        let git = |a: &[&str]| assert!(Command::new("git").arg("-C").arg(&repo).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap().status.success());
+        Command::new("chmod")
+            .arg("+x")
+            .arg(bin.join("claude"))
+            .status()
+            .unwrap();
+        let git = |a: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(a)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         env::set_var("HOME", &t);
-        env::set_var("PATH", format!("{}:{}", bin.display(), env::var("PATH").unwrap()));
+        env::set_var(
+            "PATH",
+            format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
+        );
 
-        let flow = Flow { goal: "g".into(), stages: vec![vec![agent("first", None, "default")], vec![agent("nudge", Some("wt"), "acceptEdits")]] };
+        let flow = Flow {
+            goal: "g".into(),
+            stages: vec![
+                vec![agent("first", None, "default")],
+                vec![agent("nudge", Some("wt"), "acceptEdits")],
+            ],
+        };
         let repo_s = repo.canonicalize().unwrap().to_string_lossy().into_owned();
         fs::create_dir_all(thread_dir("th")).unwrap();
         write_json(&thread_dir("th").join("flowmap.json"), &flow).unwrap();
-        let state = State { thread: "th".into(), repo: repo_s.clone(), status: "planned".into(), ..Default::default() };
+        let state = State {
+            thread: "th".into(),
+            repo: repo_s.clone(),
+            status: "planned".into(),
+            ..Default::default()
+        };
         execute("th", &flow, state).unwrap();
 
         let (_, st) = load("th").unwrap();
         assert_eq!(st.status, "done");
         assert!(st.agents.values().all(|a| a.status == "done"));
         let d = thread_dir("th");
-        assert_eq!(fs::read_to_string(d.join("first/cwd")).unwrap().trim(), repo_s);
+        assert_eq!(
+            fs::read_to_string(d.join("first/cwd")).unwrap().trim(),
+            repo_s
+        );
         let wt = t.join(".brigd/worktrees/th/wt");
-        assert_eq!(fs::read_to_string(d.join("nudge/cwd")).unwrap().trim(), wt.canonicalize().unwrap().to_string_lossy());
-        assert!(fs::read_to_string(d.join("nudge/nudged")).unwrap().starts_with("You stopped without writing"));
-        assert!(fs::read_to_string(d.join("nudge/prompt.md")).unwrap().contains(&d.join("first/output.md").display().to_string()));
-        assert!(fs::read_to_string(d.join("first/prompt.md")).unwrap().contains(&d.join("flowmap.json").display().to_string()));
+        assert_eq!(
+            fs::read_to_string(d.join("nudge/cwd")).unwrap().trim(),
+            wt.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(fs::read_to_string(d.join("nudge/nudged"))
+            .unwrap()
+            .starts_with("You stopped without writing"));
+        assert!(fs::read_to_string(d.join("nudge/prompt.md"))
+            .unwrap()
+            .contains(&d.join("first/output.md").display().to_string()));
+        assert!(fs::read_to_string(d.join("first/prompt.md"))
+            .unwrap()
+            .contains(&d.join("flowmap.json").display().to_string()));
         let args = fs::read_to_string(d.join("first/args")).unwrap();
-        assert!(args.contains("--session-id\n") && args.contains("--settings\n") && args.contains("--add-dir="));
-        assert_eq!(fs::read_to_string(d.join("first/session")).unwrap().len(), 36);
-        assert!(fs::read_to_string(d.join("FLOWPLAN")).unwrap().contains("nudging"));
+        assert!(
+            args.contains("--session-id\n")
+                && args.contains("--settings\n")
+                && args.contains("--add-dir=")
+        );
+        assert_eq!(
+            fs::read_to_string(d.join("first/session")).unwrap().len(),
+            36
+        );
+        assert!(fs::read_to_string(d.join("FLOWPLAN"))
+            .unwrap()
+            .contains("nudging"));
         let _ = fs::remove_dir_all(&t);
     }
 
     #[test]
     fn stray_names_and_passthrough() {
-        let d = env::temp_dir().join(format!("brigd-stray-{}", std::process::id())).join(tree::STRAY);
+        let d = env::temp_dir()
+            .join(format!("brigd-stray-{}", std::process::id()))
+            .join(tree::STRAY);
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(d.join("stray-1")).unwrap();
         fs::create_dir_all(d.join("stray-3")).unwrap();
@@ -1047,8 +1502,20 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         assert_eq!(new_stray_dir(&d).unwrap(), d.join("stray-4"));
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(!stray_passthrough(&v(&[])));
-        assert!(!stray_passthrough(&v(&["--model", "opus", "fix the mcp bug"])));
-        for a in [&["-p", "hi"][..], &["--resume=abc"], &["-c"], &["--session-id", "x"], &["--version"], &["mcp", "list"], &["--model", "opus", "-h"]] {
+        assert!(!stray_passthrough(&v(&[
+            "--model",
+            "opus",
+            "fix the mcp bug"
+        ])));
+        for a in [
+            &["-p", "hi"][..],
+            &["--resume=abc"],
+            &["-c"],
+            &["--session-id", "x"],
+            &["--version"],
+            &["mcp", "list"],
+            &["--model", "opus", "-h"],
+        ] {
             assert!(stray_passthrough(&v(a)), "{a:?}");
         }
         let _ = fs::remove_dir_all(d.parent().unwrap());
@@ -1056,7 +1523,9 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
 
     #[test]
     fn background_decision() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string());
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string())
+        };
         assert!(!background(false, true, env(&[])));
         assert!(background(true, true, env(&[])));
         assert!(background(false, false, env(&[])));
@@ -1068,8 +1537,15 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
             }
             v
         };
-        const ALL: &[(&str, &str)] = &[("HERDR_ENV", "1"), ("HERDR_WORKSPACE_ID", "w1"), ("TMUX", "/tmp/t,1,0")];
-        assert_eq!(surfaces(env(ALL)), mac(vec![Surface::Herdr("w1".into()), Surface::Tmux]));
+        const ALL: &[(&str, &str)] = &[
+            ("HERDR_ENV", "1"),
+            ("HERDR_WORKSPACE_ID", "w1"),
+            ("TMUX", "/tmp/t,1,0"),
+        ];
+        assert_eq!(
+            surfaces(env(ALL)),
+            mac(vec![Surface::Herdr("w1".into()), Surface::Tmux])
+        );
         assert_eq!(surfaces(env(&[("HERDR_ENV", "1")])), mac(vec![]));
         assert_eq!(surfaces(env(&[])), mac(vec![]));
     }
@@ -1084,7 +1560,10 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         assert_eq!(to, root.join("archive/threads/th"));
         assert!(!root.join("threads/th").exists() && to.join("a/output.md").exists());
         fs::create_dir_all(root.join("threads/th")).unwrap();
-        assert!(archive_thread(&root, "th").unwrap_err().to_string().contains("already exists"));
+        assert!(archive_thread(&root, "th")
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
         assert!(root.join("threads/th").exists());
         let _ = fs::remove_dir_all(&root);
     }
@@ -1095,21 +1574,45 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         let _ = fs::remove_dir_all(&root);
         let repo = root.join("repo");
         fs::create_dir_all(&repo).unwrap();
-        let git = |a: &[&str]| Command::new("git").arg("-C").arg(&repo).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(a).output().unwrap();
+        let git = |a: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(a)
+                .output()
+                .unwrap()
+        };
         git(&["init", "-q"]);
         git(&["commit", "-q", "--allow-empty", "-m", "init"]);
         git(&["branch", "brigd/other/k"]);
         for k in ["k1", "k2"] {
             let wt = root.join("worktrees/th").join(k);
-            assert!(git(&["worktree", "add", "-q", "-b", &format!("brigd/th/{k}"), &wt.to_string_lossy()]).status.success());
+            assert!(git(&[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("brigd/th/{k}"),
+                &wt.to_string_lossy()
+            ])
+            .status
+            .success());
         }
         fs::create_dir_all(root.join("threads/th")).unwrap();
-        fs::write(root.join("threads/th/state.json"), format!(r#"{{"repo":{:?}}}"#, repo.to_string_lossy())).unwrap();
+        fs::write(
+            root.join("threads/th/state.json"),
+            format!(r#"{{"repo":{:?}}}"#, repo.to_string_lossy()),
+        )
+        .unwrap();
         delete_thread(&root, "th").unwrap();
         assert!(!root.join("threads/th").exists() && !root.join("worktrees/th").exists());
         let out = |a: &[&str]| String::from_utf8_lossy(&git(a).stdout).into_owned();
         assert_eq!(out(&["worktree", "list"]).lines().count(), 1);
-        assert_eq!(out(&["branch", "--list", "brigd/*", "--format=%(refname:short)"]).trim(), "brigd/other/k");
+        assert_eq!(
+            out(&["branch", "--list", "brigd/*", "--format=%(refname:short)"]).trim(),
+            "brigd/other/k"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1118,10 +1621,18 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         let root = env::temp_dir().join(format!("brigd-create-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("threads/th")).unwrap(); // reserved by the TUI
-        let flow = Flow { goal: "g".into(), stages: vec![vec![agent("a", None, "default")]] };
+        let flow = Flow {
+            goal: "g".into(),
+            stages: vec![vec![agent("a", None, "default")]],
+        };
         create_thread(&root, "th", "/some/repo", &flow).unwrap();
-        let st: State = serde_json::from_str(&fs::read_to_string(root.join("threads/th/state.json")).unwrap()).unwrap();
-        assert_eq!((st.repo.as_str(), st.status.as_str()), ("/some/repo", "planned"));
+        let st: State =
+            serde_json::from_str(&fs::read_to_string(root.join("threads/th/state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            (st.repo.as_str(), st.status.as_str()),
+            ("/some/repo", "planned")
+        );
         assert!(root.join("threads/th/flowmap.json").exists());
         let _ = fs::remove_dir_all(&root);
     }

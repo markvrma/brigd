@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in brigd is broken
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: brigd version
+      description: "brigd has no --version flag yet, so give the git commit (`git rev-parse --short HEAD`) or install date."
+    validations: {required: true}
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: macOS 15 arm64 / Ubuntu 24.04 x86_64
+    validations: {required: true}
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`.
+    validations: {required: true}
+  - type: dropdown
+    id: launcher
+    attributes:
+      label: How `--bg` opened the TUI
+      options: [tmux, herdr, Terminal.app, Not using --bg]
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      placeholder: iTerm2, Terminal.app, kitty, tmux inside Alacritty ...
+    validations: {required: true}
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the flow JSON if the bug depends on it (remove anything private).
+      placeholder: "1. brigd demo --flow flow.json\n2. ..."
+    validations: {required: true}
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behaviour
+    validations: {required: true}
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output
+      description: Output of `brigd status <name>` or a screenshot of the TUI. Remove secrets and private paths first.
+      render: shell

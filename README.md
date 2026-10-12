@@ -3,16 +3,39 @@
 brigd plans a task as a staged flow of Claude Code agents and runs each agent in its own PTY,
 inside one TUI. Stages run in order; agents within a stage run in parallel.
 
+> **Unofficial.** brigd is an independent project, not affiliated with, endorsed by, or sponsored by Anthropic.
+> "Claude" and "Claude Code" are trademarks of Anthropic.
+
 ## Requirements
 
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI (`claude`), installed and logged in. Claude is the default agent.
-- Rust toolchain (`cargo`), and `git`.
-- Optional: `tmux`. `--bg` opens the TUI in a new tmux window; otherwise it falls back to Terminal.app on macOS.
+- Rust 1.89 or newer (`cargo`), and `git`.
+- macOS or Linux. Windows is not supported (needs a Unix PTY and `$HOME`). Agent terminals assume `zsh` (falls back to `/bin/sh`).
+- Optional: `tmux` or `herdr`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS. On Linux, `--bg` needs tmux or herdr; plain `brigd` and `resume` work anywhere.
+  Clipboard copy uses OSC 52 (terminal support required) and `pbcopy` on macOS.
+
+## Install
+
+```sh
+cargo install brigd --locked
+brigd install-skill
+```
+
+From source: `cargo install --git https://github.com/markvrma/brigd --locked`, or see Quick setup below.
+Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Quick setup
 
+One line (clones to `~/brigd`, or `$BRIGD_DIR`):
+
 ```sh
-git clone git@github-personal:markvrma/brigd.git && cd brigd && ./setup.sh
+curl -fsSL https://raw.githubusercontent.com/markvrma/brigd/main/setup.sh | bash
+```
+
+Or from a clone:
+
+```sh
+git clone https://github.com/markvrma/brigd.git && cd brigd && ./setup.sh
 ```
 
 Manual equivalent:
@@ -26,9 +49,13 @@ Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Skills
 
-`brigd install-skill` installs the **brigd-plan** skill to `~/.claude/skills/brigd-plan`.
+`brigd install-skill` installs **brigd-plan**, **plan-review-go**, **grill-me** and **grilling** to `~/.claude/skills/`.
 In Claude Code, `/brigd-plan <task>` splits a task into stages of parallel agents and returns a
 flow JSON that `brigd <name> --flow flow.json` runs.
+
+`brigd <name> "... use plan-review-go"` opts into a review path: stage 1 is an agent that runs plan-review-go with
+you, then rewrites the later stages. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
+**ponytail** plugin (`ponytail-review`, installed by `setup.sh`); never used unless you ask.
 
 ## Starting a thread
 
@@ -86,3 +113,32 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 | `a` | archive it: moved to `<root>/archive/threads`, worktrees kept |
 | `n` | new thread in the highlighted thread's repo (opens the new-thread dialog) |
 | `Ctrl-t` | send Ctrl-t to the focused claude |
+
+## Privacy and security
+
+brigd launches **every** agent with `claude --permission-mode auto`: Claude runs tools (shell commands, file
+edits) without asking first. Agents can read and write anything your user can, and anything they read
+(files, web pages, dependencies) can try to steer them. Only run flows you trust, in repos you trust; use a
+disposable checkout for untrusted code. brigd itself sends nothing anywhere: flow state, prompts and results
+live under `~/.brigd/threads/`, and all network traffic comes from the `claude` CLI under its own terms.
+See [SECURITY.md](SECURITY.md).
+
+## Uninstall
+
+```sh
+cargo uninstall brigd
+rm -rf ~/.claude/skills/brigd-plan   # the installed skill
+rm -rf ~/.brigd                      # thread state; optional
+```
+
+Thread worktrees live under `~/.brigd/worktrees` and add `brigd/<thread>/<key>` branches to your repos;
+delete threads from the TUI (`Ctrl-t d`) first to clean those up.
+
+## License
+
+[MIT](LICENSE)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+Changes are tracked in [CHANGELOG.md](CHANGELOG.md).

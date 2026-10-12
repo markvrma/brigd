@@ -25,7 +25,11 @@ pub fn registry() -> Registry {
 }
 
 pub fn live(thread: &str, agent: &str) -> Option<Arc<LiveAgent>> {
-    registry().lock().unwrap().get(&(thread.into(), agent.into())).cloned()
+    registry()
+        .lock()
+        .unwrap()
+        .get(&(thread.into(), agent.into()))
+        .cloned()
 }
 
 pub struct LiveAgent {
@@ -42,8 +46,19 @@ pub struct LiveAgent {
 }
 
 impl LiveAgent {
-    pub fn spawn(mut cmd: CommandBuilder, thread: &str, agent: &str, cwd: &Path, dir: &Path) -> Res<LiveAgent> {
-        let pair = native_pty_system().openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })?;
+    pub fn spawn(
+        mut cmd: CommandBuilder,
+        thread: &str,
+        agent: &str,
+        cwd: &Path,
+        dir: &Path,
+    ) -> Res<LiveAgent> {
+        let pair = native_pty_system().openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
@@ -66,7 +81,10 @@ impl LiveAgent {
                 // ponytail: a query split across two reads is missed.
                 if buf[..n].windows(4).any(|w| w == b"\x1b[6n") {
                     let (r, c) = p.screen().cursor_position();
-                    let _ = w.lock().unwrap().write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
+                    let _ = w
+                        .lock()
+                        .unwrap()
+                        .write_all(format!("\x1b[{};{}R", r + 1, c + 1).as_bytes());
                 }
             }
         });
@@ -89,8 +107,17 @@ impl LiveAgent {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) -> Res<()> {
-        self.master.lock().unwrap().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
-        self.parser.lock().unwrap().screen_mut().set_size(rows, cols);
+        self.master.lock().unwrap().resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
         Ok(())
     }
 
@@ -116,9 +143,14 @@ pub fn read_status(dir: &Path, cwd: &Path) -> String {
             return s.trim().into();
         }
     }
-    let Ok(session) = fs::read_to_string(dir.join("session")) else { return "starting".into() };
+    let Ok(session) = fs::read_to_string(dir.join("session")) else {
+        return "starting".into();
+    };
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let path = home.join(".claude/projects").join(crate::tree::slug(cwd)).join(format!("{}.jsonl", session.trim()));
+    let path = home
+        .join(".claude/projects")
+        .join(crate::tree::slug(cwd))
+        .join(format!("{}.jsonl", session.trim()));
     transcript_status(&path).unwrap_or_else(|| "starting".into())
 }
 
@@ -126,14 +158,19 @@ pub fn read_status(dir: &Path, cwd: &Path) -> String {
 fn transcript_status(path: &Path) -> Option<String> {
     let mut f = fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024))).ok()?;
+    f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)))
+        .ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
     for line in text.lines().rev() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         match v["type"].as_str() {
-            Some("assistant") if v["message"]["stop_reason"] == "end_turn" => return Some("idle".into()),
+            Some("assistant") if v["message"]["stop_reason"] == "end_turn" => {
+                return Some("idle".into())
+            }
             Some("assistant" | "user") => return Some("working".into()),
             _ => {}
         }
@@ -143,7 +180,11 @@ fn transcript_status(path: &Path) -> Option<String> {
 
 /// Is `pid` a running process? (`kill -0`)
 pub fn pid_alive(pid: &str) -> bool {
-    std::process::Command::new("kill").args(["-0", pid.trim()]).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+    std::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// <agent dir>/terminated: written when Mark terminates the agent, cleared when it is started again.
@@ -156,7 +197,14 @@ pub fn new_uuid() -> Res<String> {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    Ok(format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]))
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
 }
 
 fn sh_quote(s: &str) -> String {
@@ -182,7 +230,10 @@ pub fn hooks_json(dir: &Path) -> String {
 
 pub fn register(a: LiveAgent) -> Arc<LiveAgent> {
     let a = Arc::new(a);
-    registry().lock().unwrap().insert((a.thread.clone(), a.agent.clone()), a.clone());
+    registry()
+        .lock()
+        .unwrap()
+        .insert((a.thread.clone(), a.agent.clone()), a.clone());
     a
 }
 
@@ -193,12 +244,24 @@ pub fn session_args(dir: &Path) -> Res<[String; 4]> {
     let _ = fs::remove_file(dir.join(TERMINATED));
     let session = new_uuid()?;
     fs::write(dir.join("session"), &session)?;
-    Ok(["--session-id".into(), session, "--settings".into(), hooks_json(dir)])
+    Ok([
+        "--session-id".into(),
+        session,
+        "--settings".into(),
+        hooks_json(dir),
+    ])
 }
 
 /// Starts `claude <flags> --session-id <new> --settings <hooks> "<prompt>"` in `cwd`,
 /// saves the session id to <dir>/session and registers the agent.
-pub fn start_claude(thread: &str, agent: &str, cwd: &Path, dir: &Path, flags: &[String], prompt: &str) -> Res<Arc<LiveAgent>> {
+pub fn start_claude(
+    thread: &str,
+    agent: &str,
+    cwd: &Path,
+    dir: &Path,
+    flags: &[String],
+    prompt: &str,
+) -> Res<Arc<LiveAgent>> {
     fs::create_dir_all(dir)?;
     let mut cmd = CommandBuilder::new("claude");
     cmd.args(flags);
@@ -218,14 +281,29 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     let mut cmd = CommandBuilder::new("claude");
     let cwd = if Path::new(agent).starts_with(crate::tree::STRAY) {
         cmd.args(["--permission-mode", "auto"]);
-        PathBuf::from(fs::read_to_string(dir.join("cwd")).map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?.trim())
+        PathBuf::from(
+            fs::read_to_string(dir.join("cwd"))
+                .map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?
+                .trim(),
+        )
     } else {
         let (flow, state) = crate::load(thread)?;
-        let a = flow.stages.iter().flatten().find(|a| a.name == agent).ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
+        let a = flow
+            .stages
+            .iter()
+            .flatten()
+            .find(|a| a.name == agent)
+            .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
         cmd.args(crate::claude_flags(thread, a));
-        crate::tree::space_cwd(&crate::root(), Path::new(&state.repo), thread, a.worktree.as_deref().unwrap_or(""))
+        crate::tree::space_cwd(
+            &crate::root(),
+            Path::new(&state.repo),
+            thread,
+            a.worktree.as_deref().unwrap_or(""),
+        )
     };
-    let session = fs::read_to_string(dir.join("session")).map_err(|e| format!("{thread}/{agent}: no session: {e}"))?;
+    let session = fs::read_to_string(dir.join("session"))
+        .map_err(|e| format!("{thread}/{agent}: no session: {e}"))?;
     let _ = fs::remove_file(dir.join("status"));
     let _ = fs::remove_file(dir.join(TERMINATED));
     // ponytail: assumes --resume keeps the session id (subagent scan reads <session>/subagents); re-read it if not.
@@ -255,11 +333,20 @@ mod tests {
     #[test]
     fn cursor_query_is_answered() {
         let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", r"stty raw -echo; printf '\033[6n'; dd bs=1 count=6 2>/dev/null | od -c | head -1"]);
+        cmd.args([
+            "-c",
+            r"stty raw -echo; printf '\033[6n'; dd bs=1 count=6 2>/dev/null | od -c | head -1",
+        ]);
         let tmp = std::env::temp_dir();
         let a = LiveAgent::spawn(cmd, "t", "a", &tmp, &tmp).unwrap();
         for _ in 0..50 {
-            if a.parser.lock().unwrap().screen().contents().contains("033   [   1   ;   1   R") {
+            if a.parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("033   [   1   ;   1   R")
+            {
                 return;
             }
             thread::sleep(std::time::Duration::from_millis(100));
@@ -273,7 +360,13 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         let v: serde_json::Value = serde_json::from_str(&hooks_json(Path::new("/x/it's"))).unwrap();
-        assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], r"printf idle > '/x/it'\''s/status'");
-        assert_eq!(v["hooks"]["Notification"][0]["matcher"], "permission_prompt");
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            r"printf idle > '/x/it'\''s/status'"
+        );
+        assert_eq!(
+            v["hooks"]["Notification"][0]["matcher"],
+            "permission_prompt"
+        );
     }
 }

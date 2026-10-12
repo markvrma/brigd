@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/markvrma/brigd/issues/new?template=feature_request.yml
+    about: Not sure it's a bug? Describe it as a feature request or start there.
+  - name: Security vulnerability
+    url: https://github.com/markvrma/brigd/security/advisories/new
+    about: Report security issues privately, not as a public issue.
