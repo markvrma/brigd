@@ -21,6 +21,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -283,6 +284,10 @@ struct App {
     clip: Option<String>,
     /// Open FLOWPLAN tab path -> its thread's flowmap.json and state.json, which the view draws from.
     plans: HashMap<PathBuf, (crate::Flow, crate::State)>,
+    /// (FLOWPLAN path, agent) whose task shows in full. In memory only.
+    expanded: HashSet<(PathBuf, String)>,
+    /// Task "..." (or expanded task line) rects from the last draw -> the (FLOWPLAN path, agent) it toggles.
+    task_btns: Vec<(Rect, (PathBuf, String))>,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until Mark quits.
@@ -489,9 +494,14 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
 
 /// The flow as an npx-style step tree ending at crate::LOG_MARK; also the plain FLOWPLAN
 /// text (crate::flow_text). `status(agent)`: pending / running / blocked / done / failed.
+/// A task shows its first TASK_WORDS words and a "..." unless `expanded(agent)`. Each task
+/// line pushes (line index, clickable columns, agent) to `hits`: the "..." when collapsed,
+/// the whole line when expanded.
 pub fn plan_lines(
     flow: &crate::Flow,
     status: impl Fn(&str) -> &'static str,
+    expanded: impl Fn(&str) -> bool,
+    hits: &mut Vec<(usize, Range<u16>, String)>,
     frame: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -560,11 +570,37 @@ pub fn plan_lines(
                 Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)),
                 guide(&meta),
             ]));
+            let tw = width.saturating_sub(8).max(20);
+            let lead = if last { "│       " } else { "│  │    " };
+            let words: Vec<&str> = a.task.split_whitespace().collect();
+            if words.len() > TASK_WORDS && !expanded(&a.name) {
+                let ws = wrap(&words[..TASK_WORDS].join(" "), tw);
+                let n = ws.len();
+                for (k, w) in ws.into_iter().enumerate() {
+                    let mut l = vec![guide(lead)];
+                    if k + 1 == n {
+                        let x = (lead.chars().count() + w.chars().count() + 1) as u16;
+                        hits.push((out.len(), x..x + 3, a.name.clone()));
+                        l.push(Span::styled(w + " ", dim.add_modifier(Modifier::ITALIC)));
+                        l.push(Span::styled(
+                            "...",
+                            Style::new().fg(c).add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        l.push(Span::styled(w, dim.add_modifier(Modifier::ITALIC)));
+                    }
+                    out.push(Line::from(l));
+                }
+                continue;
+            }
             // Blank task lines are dropped, like wrap() drops them in the goal.
             for l in a.task.lines().filter(|l| !l.trim().is_empty()) {
-                for w in wrap(l, width.saturating_sub(8).max(20)) {
+                for w in wrap(l, tw) {
+                    if words.len() > TASK_WORDS {
+                        hits.push((out.len(), 0..u16::MAX, a.name.clone()));
+                    }
                     out.push(Line::from(vec![
-                        guide(if last { "│       " } else { "│  │    " }),
+                        guide(lead),
                         Span::styled(w, dim.add_modifier(Modifier::ITALIC)),
                     ]));
                 }
@@ -575,6 +611,9 @@ pub fn plan_lines(
     out.push(Line::from(guide(crate::LOG_MARK)));
     out
 }
+
+/// Words a collapsed FLOWPLAN task shows before its "...".
+const TASK_WORDS: usize = 10;
 
 /// A step's glyph: pending ◇, running spinner, blocked !, done ✔, failed ✖.
 fn step(st: &str, frame: usize) -> Span<'static> {
@@ -1122,7 +1161,13 @@ impl App {
     }
 
     /// A FLOWPLAN tab's view: the step tree with live statuses, then the run log's tail.
-    fn plan_view(&self, path: &Path, text: &str, width: usize) -> Option<Vec<Line<'static>>> {
+    fn plan_view(
+        &self,
+        path: &Path,
+        text: &str,
+        width: usize,
+        hits: &mut Vec<(usize, Range<u16>, String)>,
+    ) -> Option<Vec<Line<'static>>> {
         let (flow, state) = self.plans.get(path)?;
         // Saved done/failed wins (a done agent idles on, live); else the live hook status.
         let status = |a: &str| match state.agents.get(a).map(|s| s.status.as_str()) {
@@ -1141,7 +1186,8 @@ impl App {
         let frame = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() / 80) as usize;
-        let mut lines = plan_lines(flow, status, frame, width);
+        let expanded = |a: &str| self.expanded.contains(&(path.to_path_buf(), a.to_string()));
+        let mut lines = plan_lines(flow, status, expanded, hits, frame, width);
         // The log follows LOG_MARK; a FLOWPLAN from before the marker starts its log at the first "──" line.
         let all: Vec<&str> = text.lines().collect();
         let start = all
@@ -2044,6 +2090,15 @@ impl App {
                     .map(|(_, t)| t.clone())
                 {
                     self.toggle_pause(&t);
+                } else if let Some(k) = self
+                    .task_btns
+                    .iter()
+                    .find(|(r, _)| r.contains(at))
+                    .map(|(_, k)| k.clone())
+                {
+                    if !self.expanded.remove(&k) {
+                        self.expanded.insert(k);
+                    }
                 } else if let Some((i, arrow)) =
                     hit(self.side_inner, self.offset, &self.rows, m.column, m.row)
                 {
@@ -2340,13 +2395,18 @@ impl App {
             body.width.saturating_sub(2),
             body.height.saturating_sub(1),
         );
+        let mut hits = vec![];
         let mut plan = tabs.list.get(tabs.active).and_then(|t| match t {
             Tab::View {
                 path,
                 text,
                 rel: None,
                 ..
-            } => self.plan_view(path, text, pad.width as usize),
+            } => self.plan_view(path, text, pad.width as usize, &mut hits),
+            _ => None,
+        });
+        let plan_path = tabs.list.get(tabs.active).and_then(|t| match t {
+            Tab::View { path, .. } => Some(path.clone()),
             _ => None,
         });
         let t = &mut self.tabs.get_mut(&self.thread).unwrap().list[j];
@@ -2377,6 +2437,17 @@ impl App {
                 let lines = plan.take().unwrap_or_default();
                 *scroll = (*scroll).min(lines.len().saturating_sub(1) as u16);
                 f.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), pad);
+                // One screen row per line (no wrap): line i sits at pad.y + i - scroll.
+                let top = *scroll as usize;
+                for (i, xs, a) in hits {
+                    if i < top || i - top >= pad.height as usize {
+                        continue;
+                    }
+                    let x = pad.x.saturating_add(xs.start).min(pad.right());
+                    let w = xs.end.min(pad.right().saturating_sub(pad.x)).saturating_sub(xs.start);
+                    let rect = Rect::new(x, pad.y + (i - top) as u16, w, 1);
+                    self.task_btns.push((rect, (plan_path.clone().unwrap_or_default(), a)));
+                }
             }
             Some(Tab::View { path, text, scroll, .. }) => {
                 let (p, area) = if path.extension().is_some_and(|e| e == "md") { (Paragraph::new(md_text(text, pad.width)), pad) } else { (Paragraph::new(text.as_str()), body) };
@@ -2485,6 +2556,7 @@ impl App {
                 Rect::new(l.right(), main.y, 1, main.height),
             );
         }
+        self.task_btns.clear();
         for (j, (bar, body)) in rects.into_iter().enumerate() {
             self.draw_pane(f, j, bar, body);
         }
@@ -3089,8 +3161,64 @@ mod tests {
                 && has("◇  stage 2 · 1 agent")
         );
         assert!(has("└  log") && has("start check-db in /repo"));
-        // Long multi-line tasks are wrapped whole, not truncated.
-        assert!(has("│  │    more") && has("tail-of-check-db") && has("tail-of-review"));
+        // Long tasks collapse to their first 10 words and a "...".
+        assert!(
+            has("│  │    task of check-db more word word word word word word ...")
+                && !has("tail-of-check-db"),
+            "{}",
+            rows.join("\n")
+        );
+        // Clicking check-db's "..." expands it: wrapped whole, not truncated. Again collapses.
+        let click = |app: &mut App| {
+            let r = app
+                .task_btns
+                .iter()
+                .find(|(_, (_, a))| a == "check-db")
+                .unwrap()
+                .0;
+            let dots: String = rows[r.y as usize]
+                .chars()
+                .skip(r.x as usize)
+                .take(3)
+                .collect();
+            assert_eq!(dots, "...");
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x,
+                row: r.y,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        click(&mut app);
+        term.draw(|f| app.draw(f)).unwrap();
+        let shown = |term: &Terminal<ratatui::backend::TestBackend>, s: &str| {
+            let b = term.backend().buffer();
+            (0..b.area.height).any(|y| {
+                (0..b.area.width)
+                    .map(|x| b.cell((x, y)).map_or(" ", |c| c.symbol()))
+                    .collect::<String>()
+                    .contains(s)
+            })
+        };
+        assert!(
+            shown(&term, "│  │    more")
+                && shown(&term, "tail-of-check-db")
+                && !shown(&term, "tail-of-review")
+        );
+        let r = app
+            .task_btns
+            .iter()
+            .find(|(_, (_, a))| a == "check-db")
+            .unwrap()
+            .0;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x + 3,
+            row: r.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(!shown(&term, "tail-of-check-db"));
     }
 
     #[test]
