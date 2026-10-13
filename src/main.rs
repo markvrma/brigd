@@ -742,7 +742,7 @@ const LOG_MARK: &str = "└  log";
 
 /// The TUI's FLOWPLAN tree (tui::plan_lines) as plain text, every step pending, ending at LOG_MARK.
 fn flow_text(flow: &Flow) -> String {
-    tui::plan_lines(flow, |_| "pending", 0, 100)
+    tui::plan_lines(flow, |_| "pending", |_| true, &mut vec![], 0, 100)
         .iter()
         .map(|l| {
             l.spans
