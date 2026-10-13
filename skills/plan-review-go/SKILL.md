@@ -11,6 +11,25 @@ Turn a task request into a reviewed, approved plan before writing any code.
 
 Task: `$ARGUMENTS`
 
+## Running inside brigd
+
+If the prompt starts with `# brigd task:` and has a `## Flow map` section naming a
+flowmap.json path, you are a brigd stage-1 agent. Run steps 0-5 as usual. Step 6
+changes: after the user approves, do NOT implement. Instead:
+
+a. Read the brigd-plan skill (`~/.claude/skills/brigd-plan/SKILL.md`, or
+   `skills/brigd-plan/SKILL.md` in the brigd repo) for its rules.
+b. Append stages 2..N to the flowmap.json that implement the approved plan. Keep
+   every existing stage unchanged.
+c. Re-read the file; check it parses as valid JSON matching the schema: names match
+   `^[a-z][a-z0-9_-]{0,18}$`, are unique and not `log`; at most one editing agent
+   per worktree per stage; real file paths.
+d. Write the approved plan and the list of added stages to the output.md path given
+   in the prompt, ending with `## Files changed` listing the flowmap.json.
+
+If the user stops at the permission step, write output.md with the plan and add no
+stages.
+
 Run these steps in order. Do not skip ahead.
 
 ## 0. Discover skills
@@ -65,4 +84,5 @@ Turn the final plan into a todo list (TodoWrite), one item per concrete step.
 ## 6. Ask permission
 
 Stop. Ask the user: "Plan ready. Start work?" — do NOT begin implementation
-until the user confirms. Once confirmed, work the todo list.
+until the user confirms. Once confirmed, work the todo list (inside brigd:
+append stages instead, see above).

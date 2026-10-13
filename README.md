@@ -53,8 +53,8 @@ Make sure `~/.cargo/bin` is on your `PATH`.
 In Claude Code, `/brigd-plan <task>` splits a task into stages of parallel agents and returns a
 flow JSON that `brigd <name> --flow flow.json` runs.
 
-`brigd <name> "... use plan-review-go"` opts into a review path: stage 1 is an agent that runs plan-review-go with
-you, then rewrites the later stages. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
+`brigd <name> "... use plan-review-go"` opts into a review path: stage 1 is the only planned stage, an agent that runs
+plan-review-go with you; once you approve, it appends all later stages to flowmap.json. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
 **ponytail** plugin (`ponytail-review`, installed by `setup.sh`); never used unless you ask.
 
 ## Starting a thread
