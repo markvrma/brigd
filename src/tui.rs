@@ -1976,12 +1976,17 @@ impl App {
             .collect();
         for name in queued {
             // Claim on disk before spawning so the next tick never sees it queued again.
+            // The status cache may be a tick old: only claim what is still queued on disk.
             let claimed = crate::load(&name).and_then(|(_, mut st)| {
+                if st.status != "queued" {
+                    return Ok(false);
+                }
                 st.status = "running".into();
-                crate::write_json(&crate::thread_dir(&name).join("state.json"), &st)
+                crate::write_json(&crate::thread_dir(&name).join("state.json"), &st).map(|_| true)
             });
             match claimed {
-                Ok(()) => {
+                Ok(false) => {}
+                Ok(true) => {
                     self.flash(format!("running queued thread {name}"));
                     self.run_planned(name);
                 }

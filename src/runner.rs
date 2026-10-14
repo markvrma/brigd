@@ -278,7 +278,7 @@ pub fn start_claude(
 
 /// The pid in <dir>/pid if it is a live claude on <dir>/session, else None (stale files are ignored).
 /// A missing session file never matches, so an agent without one is never blocked.
-fn running_elsewhere(dir: &Path) -> Option<u32> {
+pub fn running_elsewhere(dir: &Path) -> Option<u32> {
     let pid: u32 = fs::read_to_string(dir.join("pid"))
         .ok()?
         .trim()

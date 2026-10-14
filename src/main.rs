@@ -135,10 +135,21 @@ fn real_main() -> Res<()> {
             if !plan.exists() {
                 fs::write(plan, flow_text(&flow))?;
             }
+            if let Some(pid) = thread_busy(name, &state) {
+                return Err(format!("thread {name} is already running (pid {pid})").into());
+            }
+            if bg && state.status == "queued" {
+                println!("brigd: thread {name} is already queued");
+                return Ok(());
+            }
             match resume_how(bg, tui_alive()) {
                 How::Here => run_in_tui(name, flow, state),
                 How::Queue => {
-                    let mut state = state;
+                    // Re-read so a stale snapshot never overwrites a thread that moved on.
+                    let mut state = load(name)?.1;
+                    if let Some(pid) = thread_busy(name, &state) {
+                        return Err(format!("thread {name} is already running (pid {pid})").into());
+                    }
                     state.status = "queued".into();
                     state.updated = now();
                     write_json(&thread_dir(name).join("state.json"), &state)?;
@@ -534,6 +545,18 @@ fn tui_pid() -> Option<u32> {
 
 fn tui_alive() -> bool {
     tui_pid().is_some_and(pid_alive)
+}
+
+/// A live claude (this or another brigd) on a thread marked running. A running status alone
+/// can be stale after a crash, so the agents' pid files decide.
+fn thread_busy(name: &str, state: &State) -> Option<u32> {
+    if state.status != "running" {
+        return None;
+    }
+    state
+        .agents
+        .keys()
+        .find_map(|a| runner::running_elsewhere(&thread_dir(name).join(a)))
 }
 
 /// The TUI claims a thread only if it is queued, this TUI owns tui.pid, and this
