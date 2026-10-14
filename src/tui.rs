@@ -892,7 +892,7 @@ fn flatten(
     out: &mut Vec<Row>,
 ) {
     let folder = !n.children.is_empty();
-    let default_open = matches!(n.kind, Kind::Space | Kind::Thread | Kind::Folder);
+    let default_open = matches!(n.kind, Kind::Space | Kind::Folder);
     let open = folder && default_open != toggled.contains(&(space.into(), n.path.clone()));
     let thread = if n.kind == Kind::Thread {
         n.label.as_str()
@@ -2995,7 +2995,12 @@ mod tests {
         );
         let mut rows = Vec::new();
         flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut rows);
-        // Spaces and threads start open, agents folded.
+        // Spaces start open, threads folded.
+        assert_eq!(rows.len(), 2);
+        let open_t = HashSet::from([(tree.path.clone(), PathBuf::from("/t"))]);
+        let mut rows = Vec::new();
+        flatten(&tree, 0, &tree.path, "", &open_t, &mut rows);
+        // Thread unfolded: agents folded.
         let labels: Vec<_> = rows
             .iter()
             .map(|r| (r.depth, r.label.as_str(), r.thread.as_str()))
@@ -3025,11 +3030,12 @@ mod tests {
         );
         let mut rows = Vec::new();
         flatten(&two, 0, &two.path, "", &HashSet::new(), &mut rows);
-        flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut rows);
+        flatten(&tree, 0, &tree.path, "", &open_t, &mut rows);
         let ys: Vec<_> = layout(&rows, 0, 20).into_iter().map(|(y, _)| y).collect();
         assert_eq!(ys, [0, 1, 3, 5, 6, 7, 8]); // r t _ u _ repo t a b
                                                // Unfolding agent "a" shows its output.md.
-        let toggled = HashSet::from([(tree.path.clone(), PathBuf::from("/a"))]);
+        let mut toggled = open_t.clone();
+        toggled.insert((tree.path.clone(), PathBuf::from("/a")));
         let mut rows = Vec::new();
         flatten(&tree, 0, &tree.path, "", &toggled, &mut rows);
         assert_eq!((rows[3].kind.clone(), rows[3].depth), (Kind::Output, 3));
@@ -3358,7 +3364,8 @@ mod tests {
         .map(|(a, b)| (a.to_string(), b.to_string()));
         add_terminals(&mut tree, &terms);
         let mut rows = Vec::new();
-        flatten(&tree[0], 0, &tree[0].path, "", &HashSet::new(), &mut rows);
+        let open = HashSet::from(["/t", "/u"].map(|p| (tree[0].path.clone(), PathBuf::from(p))));
+        flatten(&tree[0], 0, &tree[0].path, "", &open, &mut rows);
         let labels: Vec<_> = rows
             .iter()
             .map(|r| (r.label.as_str(), r.thread.as_str()))
@@ -3411,7 +3418,8 @@ mod tests {
             )],
         );
         let mut app = App::default();
-        flatten(&tree, 0, &tree.path, "", &HashSet::new(), &mut app.rows);
+        let open = HashSet::from([(tree.path.clone(), PathBuf::from("/t"))]);
+        flatten(&tree, 0, &tree.path, "", &open, &mut app.rows);
         (app.side_inner, app.screen) = (Rect::new(1, 1, 98, 10), Rect::new(0, 0, 100, 20));
         let click = |b, x, y| MouseEvent {
             kind: MouseEventKind::Down(b),
