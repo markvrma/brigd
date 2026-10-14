@@ -5,6 +5,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs, thread};
 
@@ -63,6 +64,11 @@ impl LiveAgent {
         cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave); // so the reader sees EOF when the child exits
+
+        // Other brigd processes read this to avoid a second claude on the same session.
+        if let Some(pid) = child.process_id() {
+            let _ = fs::write(dir.join("pid"), pid.to_string());
+        }
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let w = writer.clone();
@@ -270,6 +276,25 @@ pub fn start_claude(
     Ok(register(LiveAgent::spawn(cmd, thread, agent, cwd, dir)?))
 }
 
+/// The pid in <dir>/pid if it is a live claude on <dir>/session, else None (stale files are ignored).
+/// A missing session file never matches, so an agent without one is never blocked.
+fn running_elsewhere(dir: &Path) -> Option<u32> {
+    let pid: u32 = fs::read_to_string(dir.join("pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let session = fs::read_to_string(dir.join("session")).ok()?;
+    let cmd = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    // ps prints nothing for a dead pid; matching the session id guards against pid reuse.
+    String::from_utf8_lossy(&cmd.stdout)
+        .contains(session.trim())
+        .then_some(pid)
+}
+
 /// Reopens an agent's saved session (`claude --resume <session>`) in its space,
 /// unless it is still live. Returns the live agent. A stray (`stray agents/<name>`,
 /// a claude typed in a brigd terminal) has no flow entry: it reopens in its saved cwd.
@@ -278,6 +303,9 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
         return Ok(a);
     }
     let dir = crate::thread_dir(thread).join(agent);
+    if let Some(pid) = running_elsewhere(&dir) {
+        return Err(format!("{thread}/{agent}: running in another brigd (pid {pid})").into());
+    }
     let mut cmd = CommandBuilder::new("claude");
     let cwd = if Path::new(agent).starts_with(crate::tree::STRAY) {
         cmd.args(["--permission-mode", "auto"]);
@@ -314,6 +342,27 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_pid_file_blocks_resume() {
+        let dir = std::env::temp_dir().join(format!("brigd-pid-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let sid = "sess-1234-test";
+        fs::write(dir.join("session"), sid).unwrap();
+        // A real process whose command line carries the session id.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30; :", sid])
+            .spawn()
+            .unwrap();
+        fs::write(dir.join("pid"), child.id().to_string()).unwrap();
+        assert_eq!(running_elsewhere(&dir), Some(child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(running_elsewhere(&dir), None); // dead pid
+        fs::write(dir.join("pid"), std::process::id().to_string()).unwrap();
+        assert_eq!(running_elsewhere(&dir), None); // live pid, other command (reuse)
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn pty_prints_hi() {
