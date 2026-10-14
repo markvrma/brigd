@@ -906,8 +906,12 @@ fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
     let sys = format!(
         "BRIGD WORKER {thread}/{}: do the task. You may use the Task/Agent tool for subagents, \
          but never run the `claude` CLI or start other claude sessions. \
-         When finished, write your final result to {}.",
+         When finished, first write {} holding only a ```mermaid code block: one small \
+         `flowchart TD` of the steps you took (at most 10 nodes like A[short label], \
+         edges only `-->` or `-->|label|`, no styling or subgraphs). \
+         Then write your final result to {}.",
         a.name,
+        dir.join(&a.name).join("flow.md").display(),
         dir.join(&a.name).join("output.md").display()
     );
     let s = |x: &str| x.to_string();
