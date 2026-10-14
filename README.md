@@ -3,8 +3,22 @@
 brigd plans a task as a staged flow of Claude Code agents and runs each agent in its own PTY,
 inside one TUI. Stages run in order; agents within a stage run in parallel.
 
+![The brigd TUI: the spaces sidebar on the left, a colored git diff in the middle, and the Claude session of the agent that did the work on the right](docs/images/brigd-overview.png)
+
+*One thread at a glance. Left: the sidebar tree of spaces, threads, agents and the files each one touched. Middle: the diff of the selected file. Right: the live Claude session of the agent that made the change.*
+
 > **Unofficial.** brigd is an independent project, not affiliated with, endorsed by, or sponsored by Anthropic.
 > "Claude" and "Claude Code" are trademarks of Anthropic.
+
+## How it looks
+
+**Flowmap.** The plan for a thread: stages run top to bottom, agents inside a stage run in parallel, each with its own model, effort and worktree.
+
+![A rendered flowmap with three stages of agents, each showing model, effort and worktree, followed by the run log](docs/images/brigd-flowmap.png)
+
+**Spaces.** The sidebar is one tree: space (repo) → thread → agent → subagent → output, with every file an agent touched and its `+added -removed` counts.
+
+<img src="docs/images/brigd-spaces.png" alt="The brigd sidebar tree showing a space, its threads, the agents in a thread and the files each touched" width="282">
 
 ## Requirements
 
