@@ -299,6 +299,8 @@ pub fn run(open: Option<&str>) -> Res<()> {
         let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         term.clear()?;
         let mut app = App::default();
+        // `brigd resume --bg` hands threads to the TUI whose pid is here.
+        _ = fs::write(crate::tui_pid_path(), std::process::id().to_string());
         app.refresh();
         if let Some(t) = open {
             app.open_flowplan(t);
@@ -322,8 +324,12 @@ pub fn run(open: Option<&str>) -> Res<()> {
             }
             if last.elapsed() >= REFRESH {
                 app.refresh();
+                app.claim_queued();
                 last = Instant::now();
             }
+        }
+        if crate::tui_pid() == Some(std::process::id()) {
+            _ = fs::remove_file(crate::tui_pid_path());
         }
         live_agents().iter().for_each(|a| a.kill());
         // A plan still running dies with brigd: free the names it reserved.
@@ -1951,6 +1957,36 @@ impl App {
             }
             Bg::Finished(name, Ok(())) => self.flash(format!("thread {name} done")),
             Bg::Finished(name, Err(e)) => self.flash(format!("thread {name}: {e}")),
+        }
+    }
+
+    /// Runs threads `brigd resume --bg` queued, if this TUI owns tui.pid. Takes over
+    /// tui.pid when its owner is gone, so one open TUI always answers.
+    fn claim_queued(&mut self) {
+        let me = std::process::id();
+        let owner = crate::tui_pid() == Some(me)
+            || (!crate::tui_alive() && fs::write(crate::tui_pid_path(), me.to_string()).is_ok());
+        let queued: Vec<String> = self
+            .thread_status
+            .iter()
+            .filter_map(|(p, st)| {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                crate::claimable(st, owner, crate::executing(&name)).then_some(name)
+            })
+            .collect();
+        for name in queued {
+            // Claim on disk before spawning so the next tick never sees it queued again.
+            let claimed = crate::load(&name).and_then(|(_, mut st)| {
+                st.status = "running".into();
+                crate::write_json(&crate::thread_dir(&name).join("state.json"), &st)
+            });
+            match claimed {
+                Ok(()) => {
+                    self.flash(format!("running queued thread {name}"));
+                    self.run_planned(name);
+                }
+                Err(e) => self.flash(format!("thread {name}: {e}")),
+            }
         }
     }
 

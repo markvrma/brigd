@@ -9,7 +9,7 @@ mod tui;
 
 use runner::Res;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,7 +45,8 @@ const USAGE: &str = "usage:
                                under Claude Code, so Claude can run `brigd <name> --flow <file>`
   brigd ls                     list threads
   brigd status <name>          per-agent detail
-  brigd resume <name>          continue a stopped thread in the TUI
+  brigd resume <name> [--bg]   continue a stopped thread in the TUI; with --bg (automatic
+                               like above) an open brigd TUI runs it, else a new tab/window
   brigd install-skill          install brigd-plan, plan-review-go, grill-me into ~/.claude/skills";
 
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","stages"],
@@ -134,7 +135,22 @@ fn real_main() -> Res<()> {
             if !plan.exists() {
                 fs::write(plan, flow_text(&flow))?;
             }
-            run_in_tui(name, flow, state)
+            match resume_how(bg, tui_alive()) {
+                How::Here => run_in_tui(name, flow, state),
+                How::Queue => {
+                    let mut state = state;
+                    state.status = "queued".into();
+                    state.updated = now();
+                    write_json(&thread_dir(name).join("state.json"), &state)?;
+                    println!("brigd: thread {name} queued; the open brigd TUI runs it");
+                    Ok(())
+                }
+                How::Launch => {
+                    let at = launch_bg(name, &state.repo)?;
+                    println!("brigd: thread {name} running in {at}");
+                    Ok(())
+                }
+            }
         }
         ["install-skill"] => install_skill(),
         [name, "--flow", file] => {
@@ -480,6 +496,63 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
 
 // ---------- background launch ----------
 
+#[derive(Debug, PartialEq)]
+enum How {
+    /// Take over this terminal with the TUI.
+    Here,
+    /// Mark the thread "queued" for the open TUI to claim.
+    Queue,
+    /// Open a new herdr tab / tmux window / Terminal window running `brigd resume`.
+    Launch,
+}
+
+fn resume_how(bg: bool, tui: bool) -> How {
+    match (bg, tui) {
+        (false, _) => How::Here,
+        (true, true) => How::Queue,
+        (true, false) => How::Launch,
+    }
+}
+
+/// The open TUI that claims "queued" threads writes its pid here.
+fn tui_pid_path() -> PathBuf {
+    root().join("tui.pid")
+}
+
+fn pid_alive(pid: u32) -> bool {
+    // ponytail: shells out to kill -0 (no libc dep); a recycled pid reads as alive.
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn tui_pid() -> Option<u32> {
+    fs::read_to_string(tui_pid_path()).ok()?.trim().parse().ok()
+}
+
+fn tui_alive() -> bool {
+    tui_pid().is_some_and(pid_alive)
+}
+
+/// The TUI claims a thread only if it is queued, this TUI owns tui.pid, and this
+/// process is not already executing it.
+fn claimable(status: &str, owner: bool, busy: bool) -> bool {
+    status == "queued" && owner && !busy
+}
+
+/// Threads `execute` is running in this process.
+static EXECUTING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn executing_set() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    EXECUTING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn executing(name: &str) -> bool {
+    executing_set().contains(name)
+}
+
 /// True when nobody can answer the y/N confirm or watch a fullscreen TUI here: `--bg`,
 /// no TTY on stdin/stdout, or Claude Code's Bash tool (it sets CLAUDECODE=1).
 fn background(bg_flag: bool, tty: bool, var: impl Fn(&str) -> Option<String>) -> bool {
@@ -779,6 +852,16 @@ fn run_in_tui(name: &str, flow: Flow, state: State) -> Res<()> {
 /// failed. Blocks, so the TUI calls it from a background thread. Never prints:
 /// progress goes to the thread log, state.json and the runner registry.
 fn execute(name: &str, flow: &Flow, state: State) -> Res<()> {
+    if !executing_set().insert(name.into()) {
+        return Err(format!("thread {name} is already running").into());
+    }
+    struct Running<'a>(&'a str);
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            executing_set().remove(self.0);
+        }
+    }
+    let _running = Running(name);
     let mut i = state.stage;
     let mut flow = flow.clone();
     let state = Mutex::new(state);
@@ -1526,6 +1609,13 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         assert!(background(false, false, env(&[])));
         assert!(background(false, true, env(&[("CLAUDECODE", "1")])));
         assert!(!background(false, true, env(&[("CLAUDECODE", "")])));
+        assert_eq!(resume_how(false, true), How::Here);
+        assert_eq!(resume_how(true, true), How::Queue);
+        assert_eq!(resume_how(true, false), How::Launch);
+        assert!(claimable("queued", true, false));
+        assert!(!claimable("queued", false, false)); // another TUI owns tui.pid
+        assert!(!claimable("queued", true, true)); // already executing here
+        assert!(!claimable("stopped", true, false));
         let mac = |mut v: Vec<Surface>| {
             if cfg!(target_os = "macos") {
                 v.push(Surface::Terminal);
