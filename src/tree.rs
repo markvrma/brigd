@@ -1,5 +1,5 @@
 //! The sidebar tree, read from disk: space (repo basename) → thread → agent →
-//! [output.md, subagent dirs → output.md …, changed files]. Also mirrors claude's
+//! [output.md, flow.md, subagent dirs → output.md …, changed files]. Also mirrors claude's
 //! subagent transcripts into <agent>/<subagent>/output.md.
 
 use crate::runner::Res;
@@ -178,19 +178,21 @@ pub fn build(root: &Path) -> Vec<Node> {
         .collect()
 }
 
-/// An agent or subagent dir: its output.md (if written), then its subagent dirs.
+/// An agent or subagent dir: its output.md and flow.md (if written), then its subagent dirs.
 fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
     let mut children = Vec::new();
-    let out = dir.join("output.md");
-    if out.exists() {
-        children.push(Node {
-            kind: Kind::Output,
-            label: "output.md".into(),
-            path: out,
-            children: vec![],
-            stage: None,
-            worktree: None,
-        });
+    for name in ["output.md", "flow.md"] {
+        let out = dir.join(name);
+        if out.exists() {
+            children.push(Node {
+                kind: Kind::Output,
+                label: name.into(),
+                path: out,
+                children: vec![],
+                stage: None,
+                worktree: None,
+            });
+        }
     }
     // dot dirs (.diff, the frozen diffs) are brigd's own, not subagents
     let mut subs: Vec<PathBuf> = fs::read_dir(dir)
@@ -877,6 +879,7 @@ mod tests {
         let t = root.join("threads/t1");
         fs::create_dir_all(t.join("a/sub-1234567/deep-7654321")).unwrap();
         fs::write(t.join("a/output.md"), "x").unwrap();
+        fs::write(t.join("a/flow.md"), "f").unwrap();
         fs::write(t.join("a/sub-1234567/output.md"), "y").unwrap();
         let flow = serde_json::json!({"goal":"g","stages":[[{"name":"a","worktree":null}],[{"name":"b","worktree":"fix"}]]});
         fs::write(t.join("flowmap.json"), flow.to_string()).unwrap();
@@ -919,14 +922,21 @@ mod tests {
             ),
             ("t1", 2, "a", Some(0), None)
         );
-        assert_eq!(a.children[0].kind, Kind::Output);
-        let sub = &a.children[1];
+        let outs: Vec<(Kind, &str)> = a.children[..2]
+            .iter()
+            .map(|c| (c.kind.clone(), c.label.as_str()))
+            .collect();
+        assert_eq!(
+            outs,
+            [(Kind::Output, "output.md"), (Kind::Output, "flow.md")]
+        );
+        let sub = &a.children[2];
         assert_eq!(
             (sub.kind.clone(), sub.label.as_str()),
             (Kind::Subagent, "sub-1234567")
         );
         assert_eq!(sub.children[0].kind, Kind::Output);
-        assert_eq!(sub.children[1].label, "deep-7654321");
+        assert_eq!(sub.children[1].label, "deep-7654321"); // no flow.md: no node
         let b = &t1n.children[1];
         assert_eq!(
             (

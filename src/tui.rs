@@ -612,6 +612,154 @@ pub fn plan_lines(
     out
 }
 
+/// A mermaid flowchart (flow.md): its nodes as (id, label) and edges as (from, to, label), in source order.
+/// None unless it opens with `flowchart`/`graph` and has a node. Handles `A[x] --> B{y}`, chains and `-->|label|`.
+fn parse_flow(src: &str) -> Option<(Vec<(String, String)>, Vec<(usize, usize, String)>)> {
+    let body = src
+        .split("```mermaid")
+        .nth(1)
+        .map_or(src, |s| s.split("```").next().unwrap_or(s));
+    let mut lines = body
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("%%"));
+    let head = lines.next()?;
+    if !(head.starts_with("flowchart") || head.starts_with("graph")) {
+        return None;
+    }
+    let (mut nodes, mut edges) = (Vec::<(String, String)>::new(), vec![]);
+    let mut node = |tok: &str| -> Option<usize> {
+        let tok = tok.trim();
+        let i = tok.find(['[', '(', '{', '>']).unwrap_or(tok.len());
+        let id = tok[..i].trim();
+        if id.is_empty() || id.contains(char::is_whitespace) {
+            return None;
+        }
+        let label = tok[i..].trim_matches(|c| "[](){}>\"/\\ ".contains(c));
+        let k = nodes.iter().position(|n| n.0 == id).unwrap_or_else(|| {
+            nodes.push((id.into(), id.into()));
+            nodes.len() - 1
+        });
+        if !label.is_empty() {
+            nodes[k].1 = label.into();
+        }
+        Some(k)
+    };
+    for l in lines {
+        if [
+            "style ",
+            "classDef ",
+            "class ",
+            "click ",
+            "linkStyle ",
+            "subgraph",
+            "end",
+            "direction ",
+        ]
+        .iter()
+        .any(|k| l.starts_with(k))
+        {
+            continue;
+        }
+        let mut parts = l.split("-->");
+        let mut from: Vec<usize> = parts
+            .next()?
+            .split('&')
+            .map(&mut node)
+            .collect::<Option<_>>()?;
+        for p in parts {
+            let (label, rest) = match p
+                .trim_start()
+                .strip_prefix('|')
+                .and_then(|r| r.split_once('|'))
+            {
+                Some((lab, rest)) => (lab.trim(), rest),
+                None => ("", p),
+            };
+            let to: Vec<usize> = rest.split('&').map(&mut node).collect::<Option<_>>()?;
+            for &f in &from {
+                edges.extend(to.iter().map(|&t| (f, t, label.to_string())));
+            }
+            from = to;
+        }
+    }
+    (!nodes.is_empty()).then_some((nodes, edges))
+}
+
+/// Nodes grouped into steps: a node sits one step below its deepest parent. A loop's
+/// back edge is dropped: when none is left without parents the first unplaced node starts.
+fn flow_steps(n: usize, edges: &[(usize, usize, String)]) -> Vec<Vec<usize>> {
+    let mut indeg = vec![0; n];
+    for e in edges.iter().filter(|e| e.0 != e.1) {
+        indeg[e.1] += 1;
+    }
+    let (mut depth, mut placed, mut queue) = (vec![0; n], vec![false; n], vec![]);
+    for _ in 0..n {
+        let next = queue
+            .pop()
+            .or_else(|| (0..n).find(|&v| !placed[v] && indeg[v] == 0));
+        let Some(u) = next.or_else(|| (0..n).find(|&v| !placed[v])) else {
+            break;
+        };
+        placed[u] = true;
+        for e in edges.iter().filter(|e| e.0 == u && !placed[e.1]) {
+            depth[e.1] = depth[e.1].max(depth[u] + 1);
+            indeg[e.1] -= 1;
+            if indeg[e.1] == 0 && !queue.contains(&e.1) {
+                queue.push(e.1);
+            }
+        }
+    }
+    let mut steps = vec![vec![]; n];
+    for v in 0..n {
+        steps[depth[v]].push(v);
+    }
+    steps.retain(|s| !s.is_empty());
+    steps
+}
+
+/// flow.md's mermaid flowchart as a FLOWPLAN-style step tree; None (→ raw markdown) if it won't parse.
+/// A node whose parents aren't exactly the step above names them (`← a, b`), so branches stay readable.
+/// ponytail: O(nodes × edges) per frame; fine for the ≤10-node flows agents are asked for.
+fn flow_lines(text: &str) -> Option<Vec<Line<'static>>> {
+    let (nodes, edges) = parse_flow(text)?;
+    let steps = flow_steps(nodes.len(), &edges);
+    let dim = Style::new().fg(pal().overlay0);
+    let mut out = vec![];
+    for (i, s) in steps.iter().enumerate() {
+        if i > 0 {
+            out.push(Line::styled("│", dim));
+        }
+        let mut prev = if i > 0 { steps[i - 1].clone() } else { vec![] };
+        prev.sort();
+        for (j, &v) in s.iter().enumerate() {
+            let lead = match (s.len(), j + 1 == s.len()) {
+                (1, _) => "",
+                (_, true) => "└─ ",
+                _ => "├─ ",
+            };
+            let ins: Vec<_> = edges.iter().filter(|e| e.1 == v && e.0 != v).collect();
+            let mut ps: Vec<usize> = ins.iter().map(|e| e.0).collect();
+            ps.sort();
+            ps.dedup();
+            let mut l = vec![Span::styled(lead, dim), step("done", 0), Span::raw("  ")];
+            l.push(Span::styled(
+                nodes[v].1.clone(),
+                Style::new().fg(stage_color(Some(i))),
+            ));
+            if !ps.is_empty() && ps != prev {
+                let names: Vec<&str> = ps.iter().map(|&p| nodes[p].1.as_str()).collect();
+                l.push(Span::styled(format!("  ← {}", names.join(", ")), dim));
+            }
+            if let Some(e) = ins.iter().find(|e| !e.2.is_empty()) {
+                l.push(Span::styled(format!("  · {}", e.2), dim));
+            }
+            out.push(Line::from(l));
+        }
+    }
+    Some(out)
+}
+
 /// Words a collapsed FLOWPLAN task shows before its "...".
 const TASK_WORDS: usize = 10;
 
@@ -1447,10 +1595,10 @@ impl App {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let title = if path.file_name().is_some_and(|f| f == "FLOWPLAN") {
-                format!("{title} FLOWPLAN")
-            } else {
-                title
+            let title = match path.file_name().and_then(|f| f.to_str()) {
+                Some("FLOWPLAN") => format!("{title} FLOWPLAN"),
+                Some("flow.md") => format!("{title} flow"),
+                _ => title,
             };
             let tab = match tree::diff_view(&path) {
                 Some((rel, text)) => {
@@ -2402,7 +2550,13 @@ impl App {
                 text,
                 rel: None,
                 ..
-            } => self.plan_view(path, text, pad.width as usize, &mut hits),
+            } => self
+                .plan_view(path, text, pad.width as usize, &mut hits)
+                .or_else(|| {
+                    path.ends_with("flow.md")
+                        .then(|| flow_lines(text))
+                        .flatten()
+                }),
             _ => None,
         });
         let plan_path = tabs.list.get(tabs.active).and_then(|t| match t {
@@ -3091,6 +3245,59 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.tabs[""].list[0].active, i);
+    }
+
+    #[test]
+    fn flow_md_draws_step_tree() {
+        let s = |t: &str| {
+            flow_lines(t).map(|ls| {
+                ls.iter()
+                    .map(|l| l.spans.iter().map(|s| &*s.content).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+        };
+        // a decision whose branches rejoin: no ← tags needed
+        let l = s("```mermaid\nflowchart TD\n  A[Read] --> B{ok?}\n  B -->|yes| C[Ship] \n  B -->|no| D[Fix]\n  C & D --> E[Done]\n```").unwrap();
+        assert_eq!(
+            l,
+            [
+                "✔  Read",
+                "│",
+                "✔  ok?",
+                "│",
+                "├─ ✔  Ship  · yes",
+                "└─ ✔  Fix  · no",
+                "│",
+                "✔  Done"
+            ]
+        );
+        // uneven branches: each node names its parents when they aren't the whole step above
+        let l = s("flowchart TD\n A[Start] --> B[Long 1] --> D[Long 2] --> E[Merge]\n A --> C[Short] --> E").unwrap();
+        assert_eq!(
+            l,
+            [
+                "✔  Start",
+                "│",
+                "├─ ✔  Long 1",
+                "└─ ✔  Short",
+                "│",
+                "✔  Long 2  ← Long 1",
+                "│",
+                "✔  Merge  ← Long 2, Short"
+            ]
+        );
+        assert_eq!(
+            s("flowchart LR\n A --> B --> A").unwrap(),
+            ["✔  A  ← B", "│", "✔  B"]
+        ); // a loop terminates
+        for bad in [
+            "",
+            "garbage ((( -->",
+            "# notes\nno diagram",
+            "flowchart TD\n A -.-> B",
+        ] {
+            assert!(s(bad).is_none(), "{bad}"); // → raw markdown
+        }
     }
 
     #[test]
