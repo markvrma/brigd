@@ -63,7 +63,7 @@ Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Skills
 
-`brigd install-skill` installs **brigd-plan**, **plan-review-go**, **grill-me** and **grilling** to `~/.claude/skills/`.
+`brigd install-skill` installs **brigd-plan**, **plan-review-go**, **grill-me**, **grilling**, **brigd-resume** and **find-skills** to `~/.claude/skills/`.
 In Claude Code, `/brigd-plan <task>` splits a task into stages of parallel agents and returns a
 flow JSON that `brigd <name> --flow flow.json` runs.
 

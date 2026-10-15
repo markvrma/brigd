@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
 
 const SKILL: &str = include_str!("../skills/brigd-plan/SKILL.md");
-// Installed by `brigd install-skill`; brigd-plan first, the rest back the opt-in plan-review-go path.
+// Installed by `brigd install-skill`; brigd-plan first, plan-review-go, grill-me, grilling and find-skills back the opt-in plan-review-go path; brigd-resume continues a thread.
 const SKILLS: &[(&str, &str)] = &[
     ("brigd-plan", SKILL),
     (
@@ -27,6 +27,14 @@ const SKILLS: &[(&str, &str)] = &[
     ),
     ("grill-me", include_str!("../skills/grill-me/SKILL.md")),
     ("grilling", include_str!("../skills/grilling/SKILL.md")),
+    (
+        "brigd-resume",
+        include_str!("../skills/brigd-resume/SKILL.md"),
+    ),
+    (
+        "find-skills",
+        include_str!("../skills/find-skills/SKILL.md"),
+    ),
 ];
 const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -47,7 +55,7 @@ const USAGE: &str = "usage:
   brigd status <name>          per-agent detail
   brigd resume <name> [--bg]   continue a stopped thread in the TUI; with --bg (automatic
                                like above) an open brigd TUI runs it, else a new tab/window
-  brigd install-skill          install brigd-plan, plan-review-go, grill-me into ~/.claude/skills";
+  brigd install-skill          install brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills into ~/.claude/skills";
 
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","stages"],
 "properties":{"goal":{"type":"string"},

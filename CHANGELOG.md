@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `brigd install-skill` now also installs `brigd-resume` and `find-skills` (which `plan-review-go` relies on).
+
 ## [0.1.0] - unreleased
 
 First public release.
