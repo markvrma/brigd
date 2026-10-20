@@ -179,14 +179,13 @@ enum Bg {
     Finished(String, Result<(), String>),
 }
 
-/// The '+' new-thread window: a name and a task field; once submitted, read-only while planning.
+/// The '+' new-thread window: dir, name and task fields; once submitted, read-only while planning.
 #[derive(Debug, Default, PartialEq)]
 struct Newt {
-    repo: PathBuf,
-    name: String,
-    task: String,
-    /// Which field has focus: false = name, true = task.
-    focus_task: bool,
+    /// dir, name, task.
+    fields: [String; 3],
+    /// Index into `fields` of the focused one.
+    focus: usize,
     err: Option<String>,
     /// Submitted: the planner thread runs and the fields are read-only.
     planning: bool,
@@ -253,6 +252,8 @@ struct App {
     pause_btns: Vec<(Rect, String)>,
     /// '+' rects from the last draw -> the space (repo) a new thread goes in.
     plus_btns: Vec<(Rect, PathBuf)>,
+    /// The sidebar header's '＋' (also in `plus_btns`): opens the window on the dir field.
+    header_plus: Rect,
     /// The new-thread window. Takes every key unless hidden.
     newt: Option<Newt>,
     /// A planned (thread, repo) waiting for y to run, n to be deleted.
@@ -1838,9 +1839,28 @@ impl App {
             n.hidden = false;
         } else {
             self.newt = Some(Newt {
-                repo,
+                fields: [repo.display().to_string(), String::new(), String::new()],
+                focus: 1,
                 ..Default::default()
             });
+        }
+    }
+
+    /// The window with the dir field focused, for a thread in any directory.
+    fn open_newt_anywhere(&mut self, repo: PathBuf) {
+        self.open_newt(repo);
+        if let Some(n) = self.newt.as_mut().filter(|n| !n.planning) {
+            n.focus = 0;
+        }
+    }
+
+    /// Where a new thread goes by default: the highlighted row's space, else the shown one, else the cwd.
+    fn new_dir(&self) -> PathBuf {
+        let space = self.rows.get(self.sel).map_or(&self.space, |r| &r.space);
+        if space.as_os_str().is_empty() {
+            env::current_dir().unwrap_or_default()
+        } else {
+            space.clone()
         }
     }
 
@@ -1873,35 +1893,44 @@ impl App {
         self.bg.get_or_insert_with(mpsc::channel).0.clone()
     }
 
-    /// Enter in the new-thread window: reserves the name, then plans off the UI thread.
-    fn submit_newt(&mut self, repo: PathBuf, name: String, task: String) {
-        let dir = crate::thread_dir(&name);
-        // create_dir reserves the name; tree::build hides the dir until flowmap.json exists.
-        let reserve = || -> Res<()> {
-            crate::check_new_thread(&name)?;
-            if task.is_empty() {
-                return Err("task is empty".into());
-            }
-            fs::create_dir_all(crate::root().join("threads"))?;
-            Ok(fs::create_dir(&dir)?)
+    /// Enter in the new-thread window: resolves the dir, reserves the name, then plans off the UI thread.
+    fn submit_newt(&mut self, fields: [String; 3]) {
+        let (typed, name, task) = (fields[0].trim(), fields[1].trim(), fields[2].trim());
+        let path = match (typed, typed.strip_prefix("~/"), env::var_os("HOME")) {
+            ("~", _, Some(h)) => PathBuf::from(h),
+            (_, Some(rest), Some(h)) => PathBuf::from(h).join(rest),
+            _ => PathBuf::from(typed),
         };
-        if let Err(e) = reserve() {
-            let focus_task = !task.is_empty() || name.is_empty();
+        let (name, task) = (name.to_string(), task.to_string());
+        let dir = crate::thread_dir(&name);
+        // Only the first failing check shows; create_dir reserves the name and tree::build hides
+        // the dir until flowmap.json exists.
+        let failed = match fs::canonicalize(&path).ok().filter(|p| p.is_dir()) {
+            None => Some((0, format!("no such directory: {typed}"))),
+            Some(_) => crate::check_new_thread(&name)
+                .err()
+                .map(|e| (1, e.to_string()))
+                .or_else(|| task.is_empty().then(|| (2, "task is empty".into())))
+                .or_else(|| {
+                    fs::create_dir_all(crate::root().join("threads"))
+                        .and_then(|_| fs::create_dir(&dir))
+                        .err()
+                        .map(|e| (1, e.to_string()))
+                }),
+        };
+        if let Some((focus, err)) = failed {
             self.newt = Some(Newt {
-                repo,
-                name,
-                task,
-                focus_task,
-                err: Some(e.to_string()),
+                fields,
+                focus,
+                err: Some(err),
                 ..Default::default()
             });
             return;
         }
+        let repo = fs::canonicalize(&path).unwrap_or(path);
         self.newt = Some(Newt {
-            repo: repo.clone(),
-            name: name.clone(),
-            task: task.clone(),
-            focus_task: true,
+            fields: [repo.display().to_string(), name.clone(), task.clone()],
+            focus: 2,
             planning: true,
             ..Default::default()
         });
@@ -1932,7 +1961,7 @@ impl App {
             Bg::Failed(name, e) => {
                 self.planning.remove(&name);
                 match &mut self.newt {
-                    Some(n) if n.planning && n.name == name => {
+                    Some(n) if n.planning && n.fields[1] == name => {
                         (n.planning, n.hidden, n.err) = (false, false, Some(e))
                     }
                     _ => self.flash(format!("plan {name}: {e}")),
@@ -1943,7 +1972,7 @@ impl App {
                 if self
                     .newt
                     .as_ref()
-                    .is_some_and(|n| n.planning && n.name == name)
+                    .is_some_and(|n| n.planning && n.fields[1] == name)
                 {
                     self.newt = None;
                 }
@@ -2029,31 +2058,23 @@ impl App {
             n.err = None;
             match k.code {
                 KeyCode::Esc => self.newt = None,
-                KeyCode::Tab | KeyCode::Up | KeyCode::Down => n.focus_task = !n.focus_task,
-                KeyCode::Enter if !n.focus_task => n.focus_task = true,
+                KeyCode::Tab | KeyCode::Down => n.focus = (n.focus + 1) % 3,
+                KeyCode::Up => n.focus = (n.focus + 2) % 3,
+                KeyCode::Enter if n.focus < 2 => n.focus += 1,
                 KeyCode::Enter => {
                     let n = self.newt.take().unwrap();
-                    self.submit_newt(n.repo, n.name.trim().into(), n.task.trim().into());
+                    self.submit_newt(n.fields);
                 }
-                KeyCode::Backspace => {
-                    _ = if n.focus_task {
-                        &mut n.task
-                    } else {
-                        &mut n.name
-                    }
-                    .pop()
+                KeyCode::Backspace => _ = n.fields[n.focus].pop(),
+                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    n.fields[n.focus].clear()
                 }
                 KeyCode::Char(c)
                     if !k
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
-                    if n.focus_task {
-                        &mut n.task
-                    } else {
-                        &mut n.name
-                    }
-                    .push(c)
+                    n.fields[n.focus].push(c)
                 }
                 _ => {}
             }
@@ -2123,7 +2144,7 @@ impl App {
             let row = self.rows.get(self.sel);
             let (thread, repo) = (
                 row.map(|r| r.thread.clone()).filter(|t| !t.is_empty()),
-                row.map_or(self.space.clone(), |r| r.space.clone()),
+                self.new_dir(),
             );
             match (k.code, thread) {
                 _ if ctrl_t => self.send(&[0x14]), // Ctrl-t twice sends one to claude
@@ -2131,6 +2152,7 @@ impl App {
                 (KeyCode::Char('a'), Some(t)) => self.archive(&t),
                 (KeyCode::Char('d' | 'a'), None) => self.flash("no thread highlighted"),
                 (KeyCode::Char('n'), _) => self.open_newt(repo),
+                (KeyCode::Char('m'), _) => self.open_newt_anywhere(repo),
                 _ => {}
             }
             return;
@@ -2271,7 +2293,11 @@ impl App {
                     .map(|(_, p)| p.clone())
                 {
                     (self.prefix, self.thread_prefix) = (false, false);
-                    self.open_newt(repo);
+                    if self.header_plus.contains(at) {
+                        self.open_newt_anywhere(repo);
+                    } else {
+                        self.open_newt(repo);
+                    }
                 } else if let Some(t) = self
                     .pause_btns
                     .iter()
@@ -2302,15 +2328,28 @@ impl App {
                         .position(|t| t.bar.contains(at) || t.body.contains(at))
                     {
                         let t = &mut p.list[j];
-                        if let Some(&(_, _, i)) = t
+                        // (previously active tab, clicked tab) when the click is on the "× ".
+                        let mut close = None;
+                        if let Some(&(_, x1, i)) = t
                             .spans
                             .iter()
                             .find(|&&(a, b, _)| t.bar.contains(at) && (a..b).contains(&m.column))
                         {
+                            if m.column + 2 >= x1 {
+                                close = Some((t.active, i));
+                            }
                             t.active = i;
                         }
                         if !t.list.is_empty() {
                             (p.focus, self.focus_main) = (j, true);
+                        }
+                        if let Some((prev, i)) = close {
+                            self.close_tab();
+                            // A neighbour closed: keep the tab that was showing (i == prev picks its own successor).
+                            let t = self.pane();
+                            if i != prev {
+                                t.active = prev - (i < prev) as usize;
+                            }
                         }
                     }
                 }
@@ -2374,12 +2413,7 @@ impl App {
     fn on_paste(&mut self, s: &str) {
         if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
             if !n.planning {
-                if n.focus_task {
-                    &mut n.task
-                } else {
-                    &mut n.name
-                }
-                .push_str(&s.replace(['\r', '\n'], " "));
+                n.fields[n.focus].push_str(&s.replace(['\r', '\n'], " "));
             }
             return;
         }
@@ -2537,8 +2571,8 @@ impl App {
         }
         let widths: Vec<u16> = titles
             .iter()
-            .map(|(t, _)| 1 + t.chars().count() as u16)
-            .collect(); // "│" + title
+            .map(|(t, _)| 3 + t.chars().count() as u16 + 2)
+            .collect(); // "░▒▓" + title + "× "
         let (first, end) = tab_window(
             &widths,
             0,
@@ -2551,25 +2585,24 @@ impl App {
             spans.push(marker("‹"));
         }
         let mut x = bar.x + pill + (first > 0) as u16;
-        // The focused pane's active tab is reversed, the other pane's underlined.
-        let on = if focused {
-            Modifier::REVERSED | Modifier::BOLD
-        } else {
-            Modifier::UNDERLINED
-        };
+        // ponytail: ░▒▓ and × are East Asian ambiguous width; a CJK-width terminal draws them 2 wide and the tab bar skews.
         for i in first..end {
             let (title, fg) = &titles[i];
-            tab_spans.push((x + 1, x + widths[i], i));
+            // Views, shells and strays have no stage color.
+            let color = fg.filter(|&c| c != Color::Reset).unwrap_or(pal().lavender);
+            let active = tabs.active == i;
+            // The focused pane's active tab is filled, the other pane's underlined.
+            let (text, bg, mods) = match (active, focused) {
+                (true, true) => (pal().crust, color, Modifier::BOLD),
+                (true, false) => (color, pal().surface0, Modifier::UNDERLINED | Modifier::BOLD),
+                _ => (color, pal().surface0, Modifier::empty()),
+            };
+            tab_spans.push((x, x + widths[i], i));
             x += widths[i];
-            spans.push(Span::raw("│"));
-            let style = fg.map_or(Style::new(), |c| Style::new().fg(c));
+            spans.push(Span::styled("░▒▓", Style::new().fg(bg)));
             spans.push(Span::styled(
-                title.clone(),
-                if tabs.active == i {
-                    style.add_modifier(on)
-                } else {
-                    style
-                },
+                format!("{title}× "),
+                Style::new().fg(text).bg(bg).add_modifier(mods),
             ));
         }
         if end < titles.len() {
@@ -2739,6 +2772,21 @@ impl App {
             }
         }
 
+        // The header '＋' (fullwidth: 2 columns) opens a thread in any directory.
+        let plus = Span::styled(
+            "＋",
+            Style::new().fg(pal().green).add_modifier(Modifier::BOLD),
+        );
+        let w = plus.width() as u16;
+        self.header_plus = Rect::new(
+            inner.right().saturating_sub(w).max(inner.x),
+            side.y,
+            w.min(inner.width),
+            1,
+        );
+        f.render_widget(plus, self.header_plus);
+        self.plus_btns.push((self.header_plus, self.new_dir()));
+
         // The thread's panes side by side, a dim "│" between them.
         let rects = pane_rects(
             main,
@@ -2768,7 +2816,7 @@ impl App {
                 Style::new().fg(pal().red).add_modifier(Modifier::BOLD),
             ),
             _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · c theme · q quit · C-o send C-o"),
-            _ if self.thread_prefix => Span::raw("C-t …  d delete · a archive · n new thread · C-t send C-t"),
+            _ if self.thread_prefix => Span::raw("C-t …  d delete · a archive · n new thread · m new thread anywhere · C-t send C-t"),
             _ if !self.focus_main => Span::raw("↑↓/jk move · Enter open/fold · ←→ fold · Tab back to tab · M-h/l tabs · M-t terminal · q quit · wheel scrolls"),
             _ if viewing => Span::raw("↑↓/jk PgUp/PgDn g/G scroll · Tab/Esc sidebar · M-h/l tabs · M-t terminal · C-o w close · C-o q quit"),
             _ => Span::raw("keys go to the tab · C-o s sidebar · M-h/l tabs · M-t terminal · C-o w close (keeps running) · C-o q quit · C-t thread · wheel scrollback"),
@@ -2808,11 +2856,16 @@ impl App {
             let inner = (w as usize).saturating_sub(2);
             let dim = Style::new().fg(pal().overlay0);
             let mut lines = vec![];
-            for (label, text, on) in [
-                ("name: ", &n.name, !n.focus_task),
-                ("task: ", &n.task, n.focus_task),
-            ] {
-                let cursor = if on && !n.planning { "█" } else { "" };
+            for (i, (label, text)) in ["dir: ", "name: ", "task: "]
+                .into_iter()
+                .zip(&n.fields)
+                .enumerate()
+            {
+                let cursor = if i == n.focus && !n.planning {
+                    "█"
+                } else {
+                    ""
+                };
                 let style = if n.planning { dim } else { Style::new() };
                 lines.extend(
                     chunk(&format!("{label}{text}{cursor}"), inner)
@@ -2825,7 +2878,7 @@ impl App {
                     format!(
                         "{} planning {}… · Esc hides",
                         SPIN[self.ticks as usize % SPIN.len()],
-                        n.name
+                        n.fields[1]
                     ),
                     Style::new().fg(pal().yellow),
                 )
@@ -2839,7 +2892,7 @@ impl App {
                     .into_iter()
                     .map(|l| Line::styled(l, style)),
             );
-            Some((format!(" new thread in {} ", n.repo.display()), lines, w))
+            Some((" new thread ".to_string(), lines, w))
         } else {
             self.confirm_run.as_ref().map(|(name, repo)| {
                 let l = Line::styled(
@@ -3276,8 +3329,8 @@ mod tests {
         let t = &app.tabs[""].list[0];
         let (first, (a, b, last)) = (t.spans[0].2, *t.spans.last().unwrap());
         assert!(first > 0 && last == 9); // the last tab is shown, fully
-        assert!(b <= t.bar.right() && b - a == "tab-number-9".len() as u16 + 2);
-        // A click on a tab maps through the scrolled window.
+        assert!(b <= t.bar.right() && b - a == "tab-number-9".len() as u16 + 2 + 5); // " title " + "░▒▓" + "× "
+                                                                                     // A click on a tab maps through the scrolled window.
         let (a, _, i) = t.spans[0];
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3286,6 +3339,48 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.tabs[""].list[0].active, i);
+    }
+
+    #[test]
+    fn tab_x_closes_that_tab() {
+        let view = |n: usize| Tab::View {
+            path: PathBuf::new(),
+            title: format!("t{n}"),
+            text: String::new(),
+            scroll: 0,
+            rel: None,
+        };
+        let mut app = App::default();
+        app.tabs
+            .insert(String::new(), one_pane((0..3).map(view).collect()));
+        app.pane().active = 1;
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let (_, x1, _) = app.tabs[""].list[0].spans[2];
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x1 - 2, // the ×
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        let t = &app.tabs[""].list[0];
+        assert_eq!((t.list.len(), t.active), (2, 1));
+    }
+
+    #[test]
+    fn header_plus_is_a_button() {
+        let mut app = App::default();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let r = app.header_plus;
+        assert!(r.width == 2 && r.y == 0 && app.plus_btns.iter().any(|(b, _)| *b == r));
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.newt.as_ref().unwrap().focus, 0);
     }
 
     #[test]
@@ -3803,10 +3898,23 @@ mod tests {
         assert_eq!(
             app.newt,
             Some(Newt {
-                repo: "/repo".into(),
+                fields: ["/repo".into(), String::new(), String::new()],
+                focus: 1,
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn ctrl_t_m_opens_dir_focused() {
+        let mut app = App {
+            space: "/repo".into(),
+            ..Default::default()
+        };
+        app.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.on_key(key(KeyCode::Char('m'), KeyModifiers::NONE));
+        let n = app.newt.as_ref().unwrap();
+        assert_eq!((n.fields[0].as_str(), n.focus), ("/repo", 0));
     }
 
     #[test]
@@ -3824,7 +3932,8 @@ mod tests {
         assert_eq!(
             app.newt,
             Some(Newt {
-                repo: "/repo".into(),
+                fields: ["/repo".into(), String::new(), String::new()],
+                focus: 1,
                 ..Default::default()
             })
         );
@@ -3837,27 +3946,47 @@ mod tests {
         app.on_key(key(KeyCode::Char('t'), KeyModifiers::ALT)); // no terminal opens behind the window
         assert_eq!(
             (
-                app.newt.as_ref().unwrap().name.as_str(),
+                app.newt.as_ref().unwrap().fields[1].as_str(),
                 app.tabs.is_empty()
             ),
             ("a", true)
         );
         app.on_key(key(KeyCode::Backspace, KeyModifiers::NONE));
         typ(&mut app, "Bad!");
+        app.newt.as_mut().unwrap().fields[0] = "/".into(); // a real dir, so the name is what fails
         app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // name -> task
-        assert!(app.newt.as_ref().unwrap().focus_task);
+        assert_eq!(app.newt.as_ref().unwrap().focus, 2);
         app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
-        assert!(!app.newt.as_ref().unwrap().focus_task);
+        assert_eq!(app.newt.as_ref().unwrap().focus, 1);
         app.on_key(key(KeyCode::Tab, KeyModifiers::NONE));
         typ(&mut app, "x y");
         app.on_paste("p\nq");
-        assert_eq!(app.newt.as_ref().unwrap().task, "x yp q");
+        assert_eq!(app.newt.as_ref().unwrap().fields[2], "x yp q");
         app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // a bad name keeps the window open with an error
         let n = app.newt.as_ref().unwrap();
         assert!(
             n.err.as_ref().unwrap().contains("bad thread name")
                 && !n.planning
-                && n.task == "x yp q"
+                && n.fields[2] == "x yp q"
+                && n.focus == 1
+        );
+        app.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)); // clears the focused (name) field
+        assert!(app.newt.as_ref().unwrap().fields[1].is_empty());
+        // A bad dir fails first and focuses the dir field.
+        app.on_key(key(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typ(&mut app, "/nonexistent-brigd-xyz");
+        app.on_key(key(KeyCode::Down, KeyModifiers::NONE));
+        typ(&mut app, "Bad!");
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)); // name -> task
+        app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let n = app.newt.as_ref().unwrap();
+        assert!(
+            n.err
+                .as_deref()
+                .unwrap()
+                .contains("no such directory: /nonexistent-brigd-xyz")
+                && n.focus == 0
         );
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.newt.is_none());
@@ -3881,9 +4010,7 @@ mod tests {
     fn newt_planning_state() {
         let mut app = App {
             newt: Some(Newt {
-                repo: "/r".into(),
-                name: "n".into(),
-                task: "t".into(),
+                fields: ["/r".into(), "n".into(), "t".into()],
                 planning: true,
                 ..Default::default()
             }),
@@ -3898,7 +4025,7 @@ mod tests {
             !n.hidden
                 && !n.planning
                 && n.err.as_deref() == Some("boom")
-                && (n.name.as_str(), n.task.as_str()) == ("n", "t")
+                && (n.fields[1].as_str(), n.fields[2].as_str()) == ("n", "t")
         );
     }
 
@@ -3906,9 +4033,7 @@ mod tests {
     fn newt_draws_on_tiny_terminal() {
         let mut app = App {
             newt: Some(Newt {
-                repo: "/r".into(),
-                name: "n".into(),
-                task: "日本語".repeat(40),
+                fields: ["/r".into(), "n".into(), "日本語".repeat(40)],
                 err: Some("a\nb".into()),
                 ..Default::default()
             }),
