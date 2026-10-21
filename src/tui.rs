@@ -2601,7 +2601,7 @@ impl App {
             x += widths[i];
             // Smooth left fade: three blank cells whose bg steps from the page bg to the tab bg.
             for k in 1..=3u16 {
-                let c = match (pal().base, bg) {
+                let c = match (pal().mantle, bg) {
                     (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
                         let m = |a: u8, b: u8| ((a as u16 * (4 - k) + b as u16 * k) / 4) as u8;
                         Color::Rgb(m(r0, r1), m(g0, g1), m(b0, b1))
