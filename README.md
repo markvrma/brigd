@@ -125,7 +125,8 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 |---|---|
 | `d` | delete the thread with its worktrees and `brigd/` branches (asks `y` to confirm) |
 | `a` | archive it: moved to `<root>/archive/threads`, worktrees kept |
-| `n` | new thread in the highlighted thread's repo (opens the new-thread dialog) |
+| `n` | new thread in the highlighted thread's repo (opens the new-thread dialog; the dir field is editable) |
+| `m` | new thread in any directory (same dialog, dir field focused); the green `＋` at the top of the sidebar does the same |
 | `Ctrl-t` | send Ctrl-t to the focused claude |
 
 ## Privacy and security

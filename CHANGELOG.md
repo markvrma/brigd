@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- New thread in any directory: the header `＋` or `C-t m`; the new-thread dialog has an editable dir field.
+- Tabs have a `×` close button and a left-side gradient.
+
 ### Fixed
 
 - `brigd install-skill` now also installs `brigd-resume` and `find-skills` (which `plan-review-go` relies on).
