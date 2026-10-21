@@ -95,6 +95,7 @@ not one of `ls`, `status`, `resume`, `install-skill`, `help`, `stray`.
 session. The next stage starts when every agent in the current one has written its result file. An agent with a
 `worktree` key works in its own git worktree (branch `brigd/<thread>/<key>`); `null` means the main repo.
 Two editing agents may not share a worktree.
+An agent writes its result only when the task is fully done; if it cannot finish it asks you a multiple-choice question and shows as blocked (`!`). A running thread with no live claude process is marked failed.
 
 ## TUI keys
 

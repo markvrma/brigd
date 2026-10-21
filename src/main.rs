@@ -567,6 +567,28 @@ fn thread_busy(name: &str, state: &State) -> Option<u32> {
         .find_map(|a| runner::running_elsewhere(&thread_dir(name).join(a)))
 }
 
+/// Marks a thread failed when it says running but no claude is alive: this process is not
+/// executing it, nothing touched it for 30s and no agent pid file has a live claude.
+/// Leaves `updated` alone (ls sorts by it). True when it changed the state.
+fn reconcile(name: &str, state: &mut State) -> Res<bool> {
+    if state.status != "running"
+        || executing(name)
+        || now().saturating_sub(state.updated) <= 30
+        || thread_busy(name, state).is_some()
+    {
+        return Ok(false);
+    }
+    for a in state.agents.values_mut() {
+        if matches!(a.status.as_str(), "running" | "blocked") {
+            a.status = "failed".into();
+        }
+    }
+    state.status = "failed".into();
+    write_json(&thread_dir(name).join("state.json"), state)?;
+    log(name, "stale: no live claude, marked failed");
+    Ok(true)
+}
+
 /// The TUI claims a thread only if it is queued, this TUI owns tui.pid, and this
 /// process is not already executing it.
 fn claimable(status: &str, owner: bool, busy: bool) -> bool {
@@ -1023,7 +1045,14 @@ fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
          When finished, first write {} holding only a ```mermaid code block: one small \
          `flowchart TD` of the steps you took (at most 10 nodes like A[short label], \
          edges only `-->` or `-->|label|`, no styling or subgraphs). \
-         Then write your final result to {}.",
+         Then write your final result to {}. \
+         COMPLETION: write flow.md and output.md only when the task is fully done. If you cannot \
+         complete it for any reason (missing file/skill/tool/access, failed precondition, an earlier \
+         stage's result missing or incomplete, ambiguity that materially changes the result), do NOT \
+         write either file; ask the user with AskUserQuestion offering 2-4 concrete ways forward (the \
+         user can pick Other to reply in free text and discuss). Never end your turn to wait for a \
+         reply; ask follow-ups with AskUserQuestion. If the user says stop or abort, end your turn \
+         without writing them.",
         a.name,
         dir.join(&a.name).join("flow.md").display(),
         dir.join(&a.name).join("output.md").display()
@@ -1119,10 +1148,11 @@ fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
 fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mutex<State>) -> bool {
     let out = live.dir.join("output.md");
     let nudge = format!(
-        "You stopped without writing your result file. If you have not done the task yet, read {} and do it. \
-         Then write your final result to {}.",
-        live.dir.join("prompt.md").display(),
-        out.display()
+        "You stopped without writing your result file. If the task is fully done, write your final result to {}. \
+         If it is not done and you cannot finish it, do not write it: ask the user with AskUserQuestion \
+         (a few options plus free text), unless the user already told you to stop. Task: {}",
+        out.display(),
+        live.dir.join("prompt.md").display()
     );
     let home = PathBuf::from(env::var("HOME").unwrap_or_default());
     let sync = || {
@@ -1342,7 +1372,8 @@ fn ls() -> Res<()> {
     let mut rows = Vec::new();
     for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Ok((flow, st)) = load(&name) {
+        if let Ok((flow, mut st)) = load(&name) {
+            let _ = reconcile(&name, &mut st);
             let total: usize = flow.stages.iter().map(Vec::len).sum();
             let done = st.agents.values().filter(|a| a.status == "done").count();
             let stage = format!(
@@ -1375,7 +1406,8 @@ fn ls() -> Res<()> {
 }
 
 fn status(name: &str) -> Res<()> {
-    let (flow, st) = load(name)?;
+    let (flow, mut st) = load(name)?;
+    let _ = reconcile(name, &mut st);
     println!(
         "{name}: {} (stage {}/{}), updated {}\nrepo: {}\ngoal: {}",
         st.status,
@@ -1596,6 +1628,26 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         assert!(fs::read_to_string(d.join("FLOWPLAN"))
             .unwrap()
             .contains("nudging"));
+
+        // reconcile: a fresh `updated` is left alone; a stale one with dead pids fails the thread.
+        let (_, mut st) = load("th").unwrap();
+        st.status = "running".into();
+        st.agents.get_mut("nudge").unwrap().status = "running".into();
+        st.updated = now();
+        let fresh = serde_json::to_string(&st).unwrap();
+        assert!(!reconcile("th", &mut st).unwrap());
+        assert_eq!(serde_json::to_string(&st).unwrap(), fresh);
+        let mut dead = Command::new("true").spawn().unwrap();
+        dead.wait().unwrap();
+        for a in ["first", "nudge"] {
+            fs::write(d.join(a).join("pid"), dead.id().to_string()).unwrap();
+        }
+        st.updated = 0;
+        assert!(reconcile("th", &mut st).unwrap());
+        let (_, st) = load("th").unwrap();
+        assert_eq!((st.status.as_str(), st.updated), ("failed", 0));
+        assert_eq!(st.agents["nudge"].status, "failed");
+        assert_eq!(st.agents["first"].status, "done");
         let _ = fs::remove_dir_all(&t);
     }
 
