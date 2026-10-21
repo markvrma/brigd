@@ -2590,7 +2590,7 @@ impl App {
         let widths: Vec<u16> = titles
             .iter()
             .map(|(t, _)| 3 + t.chars().count() as u16 + 2)
-            .collect(); // "░▒▓" + title + "× "
+            .collect(); // 3 fade cells + title + "× "
         let (first, end) = tab_window(
             &widths,
             0,
@@ -2603,7 +2603,7 @@ impl App {
             spans.push(marker("‹"));
         }
         let mut x = bar.x + pill + (first > 0) as u16;
-        // ponytail: ░▒▓ and × are East Asian ambiguous width; a CJK-width terminal draws them 2 wide and the tab bar skews.
+        // ponytail: × is East Asian ambiguous width; a CJK-width terminal draws it 2 wide and the tab bar skews.
         for i in first..end {
             let (title, fg) = &titles[i];
             // Views, shells and strays have no stage color.
@@ -2617,7 +2617,17 @@ impl App {
             };
             tab_spans.push((x, x + widths[i], i));
             x += widths[i];
-            spans.push(Span::styled("░▒▓", Style::new().fg(bg)));
+            // Smooth left fade: three blank cells whose bg steps from the page bg to the tab bg.
+            for k in 1..=3u16 {
+                let c = match (pal().mantle, bg) {
+                    (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
+                        let m = |a: u8, b: u8| ((a as u16 * (4 - k) + b as u16 * k) / 4) as u8;
+                        Color::Rgb(m(r0, r1), m(g0, g1), m(b0, b1))
+                    }
+                    _ => bg,
+                };
+                spans.push(Span::styled(" ", Style::new().bg(c)));
+            }
             spans.push(Span::styled(
                 format!("{title}× "),
                 Style::new().fg(text).bg(bg).add_modifier(mods),
@@ -3347,7 +3357,7 @@ mod tests {
         let t = &app.tabs[""].list[0];
         let (first, (a, b, last)) = (t.spans[0].2, *t.spans.last().unwrap());
         assert!(first > 0 && last == 9); // the last tab is shown, fully
-        assert!(b <= t.bar.right() && b - a == "tab-number-9".len() as u16 + 2 + 5); // " title " + "░▒▓" + "× "
+        assert!(b <= t.bar.right() && b - a == "tab-number-9".len() as u16 + 2 + 5); // " title " + fade + "× "
                                                                                      // A click on a tab maps through the scrolled window.
         let (a, _, i) = t.spans[0];
         app.on_mouse(MouseEvent {
