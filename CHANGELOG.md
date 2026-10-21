@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An agent that cannot finish its task asks you a multiple-choice question (shown as blocked) instead of writing its result; a background check marks a "running" thread failed when no claude process is alive.
+
 ### Fixed
 
 - `brigd install-skill` now also installs `brigd-resume` and `find-skills` (which `plan-review-go` relies on).

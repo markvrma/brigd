@@ -325,6 +325,9 @@ pub fn run(open: Option<&str>) -> Res<()> {
             if last.elapsed() >= REFRESH {
                 app.refresh();
                 app.claim_queued();
+                if app.ticks.is_multiple_of(7) {
+                    app.reconcile_running();
+                }
                 last = Instant::now();
             }
         }
@@ -1982,6 +1985,7 @@ impl App {
                     return Ok(false);
                 }
                 st.status = "running".into();
+                st.updated = crate::now(); // reconcile treats a stale `updated` as a dead run
                 crate::write_json(&crate::thread_dir(&name).join("state.json"), &st).map(|_| true)
             });
             match claimed {
@@ -1991,6 +1995,20 @@ impl App {
                     self.run_planned(name);
                 }
                 Err(e) => self.flash(format!("thread {name}: {e}")),
+            }
+        }
+    }
+
+    /// Fails running threads whose claude is gone (see `crate::reconcile`).
+    fn reconcile_running(&self) {
+        for name in self
+            .thread_status
+            .iter()
+            .filter(|(_, st)| *st == "running")
+            .filter_map(|(p, _)| Some(p.file_name()?.to_string_lossy().into_owned()))
+        {
+            if let Ok((_, mut st)) = crate::load(&name) {
+                let _ = crate::reconcile(&name, &mut st);
             }
         }
     }

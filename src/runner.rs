@@ -220,13 +220,19 @@ fn sh_quote(s: &str) -> String {
 /// Inline --settings JSON whose hooks write idle/working/blocked to <dir>/status.
 pub fn hooks_json(dir: &Path) -> String {
     let file = sh_quote(&dir.join("status").to_string_lossy());
-    let set = |s: &str| serde_json::json!([{"hooks": [{"type": "command", "command": format!("printf {s} > {file}")}]}]);
+    let cmd = |c: String| serde_json::json!([{"hooks": [{"type": "command", "command": c}]}]);
+    let set = |s: &str| cmd(format!("printf {s} > {file}"));
     let mut blocked = set("blocked");
     // idle_prompt notifications fire after a quiet minute; only permission prompts mean blocked.
     blocked[0]["matcher"] = "permission_prompt".into();
+    // The hook JSON arrives on stdin: a pending AskUserQuestion means the agent waits for the user.
+    // One entry only; a second matcher entry would race this one.
+    let pre = cmd(format!(
+        r#"grep -Eq '"tool_name": ?"AskUserQuestion"' && printf blocked > {file} || printf working > {file}"#
+    ));
     serde_json::json!({"hooks": {
         "UserPromptSubmit": set("working"),
-        "PreToolUse": set("working"),
+        "PreToolUse": pre,
         "PostToolUse": set("working"),
         "Notification": blocked,
         "Stop": set("idle"),
