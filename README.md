@@ -69,7 +69,7 @@ flow JSON that `brigd <name> --flow flow.json` runs.
 
 `brigd <name> "... use plan-review-go"` opts into a review path: stage 1 is the only planned stage, an agent that runs
 plan-review-go with you; once you approve, it appends all later stages to flowmap.json. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
-**ponytail** plugin (`ponytail-review`, installed by `setup.sh`); never used unless you ask.
+**ponytail** plugin (`ponytail-review`, installed by `setup.sh`). brigd asks "Use plan-review-go? (y/N)" after you enter the task (in a terminal, and in the TUI's new-thread window); naming plan-review-go in the task still works and skips the question.
 
 ## Starting a thread
 
