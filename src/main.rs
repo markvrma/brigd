@@ -179,11 +179,33 @@ fn real_main() -> Res<()> {
         }
         [name, task] if !task.starts_with('-') => {
             check_new_thread(name)?;
+            let task = if io::stdin().is_terminal() && !mentions_prg(task) && ask_prg() {
+                with_prg(task)
+            } else {
+                task.to_string()
+            };
             eprintln!("planning with opus (brigd-plan)…");
-            new_thread(name, plan(task, &env::current_dir()?)?, bg)
+            new_thread(name, plan(&task, &env::current_dir()?)?, bg)
         }
         _ => Err(USAGE.into()),
     }
+}
+
+/// Whether the task already opts into plan-review-go (brigd-plan looks for this name).
+fn mentions_prg(task: &str) -> bool {
+    task.contains("plan-review-go")
+}
+
+fn with_prg(task: &str) -> String {
+    format!("{task}\n\nUse plan-review-go.")
+}
+
+/// One line from stdin: does the user want plan-review-go?
+fn ask_prg() -> bool {
+    eprint!("Use plan-review-go? (y/N) ");
+    let mut line = String::new();
+    io::stdin().read_line(&mut line).is_ok()
+        && matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 // ---------- threads on disk ----------

@@ -187,6 +187,8 @@ struct Newt {
     /// Index into `fields` of the focused one.
     focus: usize,
     err: Option<String>,
+    /// Enter on the task field passed validation: asking "Use plan-review-go?".
+    ask: bool,
     /// Submitted: the planner thread runs and the fields are read-only.
     planning: bool,
     /// Esc while planning: the box is gone but planning goes on.
@@ -1896,31 +1898,52 @@ impl App {
         self.bg.get_or_insert_with(mpsc::channel).0.clone()
     }
 
-    /// Enter in the new-thread window: resolves the dir, reserves the name, then plans off the UI thread.
-    fn submit_newt(&mut self, fields: [String; 3]) {
-        let (typed, name, task) = (fields[0].trim(), fields[1].trim(), fields[2].trim());
-        let path = match (typed, typed.strip_prefix("~/"), env::var_os("HOME")) {
+    /// The dir field as a path: `~` expands to $HOME.
+    fn newt_path(typed: &str) -> PathBuf {
+        match (typed, typed.strip_prefix("~/"), env::var_os("HOME")) {
             ("~", _, Some(h)) => PathBuf::from(h),
             (_, Some(rest), Some(h)) => PathBuf::from(h).join(rest),
             _ => PathBuf::from(typed),
-        };
-        let (name, task) = (name.to_string(), task.to_string());
+        }
+    }
+
+    /// The first failing check of the new-thread fields (focus index, message); reserves nothing.
+    fn newt_check(fields: &[String; 3]) -> Option<(usize, String)> {
+        let typed = fields[0].trim();
+        match fs::canonicalize(Self::newt_path(typed))
+            .ok()
+            .filter(|p| p.is_dir())
+        {
+            None => Some((0, format!("no such directory: {typed}"))),
+            Some(_) => crate::check_new_thread(fields[1].trim())
+                .err()
+                .map(|e| (1, e.to_string()))
+                .or_else(|| {
+                    fields[2]
+                        .trim()
+                        .is_empty()
+                        .then(|| (2, "task is empty".into()))
+                }),
+        }
+    }
+
+    /// Enter in the new-thread window: resolves the dir, reserves the name, then plans off the UI thread.
+    /// `prg`: the user answered yes to "Use plan-review-go?".
+    fn submit_newt(&mut self, fields: [String; 3], prg: bool) {
+        let path = Self::newt_path(fields[0].trim());
+        let (name, mut task) = (fields[1].trim().to_string(), fields[2].trim().to_string());
+        if prg {
+            task = crate::with_prg(&task);
+        }
         let dir = crate::thread_dir(&name);
         // Only the first failing check shows; create_dir reserves the name and tree::build hides
         // the dir until flowmap.json exists.
-        let failed = match fs::canonicalize(&path).ok().filter(|p| p.is_dir()) {
-            None => Some((0, format!("no such directory: {typed}"))),
-            Some(_) => crate::check_new_thread(&name)
+        let failed = Self::newt_check(&fields).or_else(|| {
+            fs::create_dir_all(crate::root().join("threads"))
+                .and_then(|_| fs::create_dir(&dir))
                 .err()
                 .map(|e| (1, e.to_string()))
-                .or_else(|| task.is_empty().then(|| (2, "task is empty".into())))
-                .or_else(|| {
-                    fs::create_dir_all(crate::root().join("threads"))
-                        .and_then(|_| fs::create_dir(&dir))
-                        .err()
-                        .map(|e| (1, e.to_string()))
-                }),
-        };
+        });
         if let Some((focus, err)) = failed {
             self.newt = Some(Newt {
                 fields,
@@ -2074,14 +2097,30 @@ impl App {
                 return;
             }
             n.err = None;
+            if n.ask {
+                match k.code {
+                    KeyCode::Esc => n.ask = false,
+                    KeyCode::Char('y' | 'Y') | KeyCode::Char('n' | 'N') | KeyCode::Enter => {
+                        let yes = matches!(k.code, KeyCode::Char('y' | 'Y'));
+                        let n = self.newt.take().unwrap();
+                        self.submit_newt(n.fields, yes);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             match k.code {
                 KeyCode::Esc => self.newt = None,
                 KeyCode::Tab | KeyCode::Down => n.focus = (n.focus + 1) % 3,
                 KeyCode::Up => n.focus = (n.focus + 2) % 3,
                 KeyCode::Enter if n.focus < 2 => n.focus += 1,
                 KeyCode::Enter => {
-                    let n = self.newt.take().unwrap();
-                    self.submit_newt(n.fields);
+                    if !crate::mentions_prg(&n.fields[2]) && Self::newt_check(&n.fields).is_none() {
+                        n.ask = true;
+                    } else {
+                        let n = self.newt.take().unwrap();
+                        self.submit_newt(n.fields, false);
+                    }
                 }
                 KeyCode::Backspace => _ = n.fields[n.focus].pop(),
                 KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2430,7 +2469,7 @@ impl App {
 
     fn on_paste(&mut self, s: &str) {
         if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
-            if !n.planning {
+            if !n.planning && !n.ask {
                 n.fields[n.focus].push_str(&s.replace(['\r', '\n'], " "));
             }
             return;
@@ -2889,7 +2928,7 @@ impl App {
                 .zip(&n.fields)
                 .enumerate()
             {
-                let cursor = if i == n.focus && !n.planning {
+                let cursor = if i == n.focus && !n.planning && !n.ask {
                     "█"
                 } else {
                     ""
@@ -2908,6 +2947,11 @@ impl App {
                         SPIN[self.ticks as usize % SPIN.len()],
                         n.fields[1]
                     ),
+                    Style::new().fg(pal().yellow),
+                )
+            } else if n.ask {
+                (
+                    "Use plan-review-go? (y/N) · Esc edits".into(),
                     Style::new().fg(pal().yellow),
                 )
             } else if let Some(e) = &n.err {
@@ -4024,6 +4068,36 @@ mod tests {
         assert!(app.confirm_run.is_some());
         app.on_key(key(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(app.confirm_run.is_none());
+    }
+
+    #[test]
+    fn newt_asks_plan_review_go() {
+        let name = format!("ask-t{}", std::process::id());
+        let mk = |task: &str| App {
+            newt: Some(Newt {
+                fields: ["/".into(), name.clone(), task.into()],
+                focus: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let enter = |app: &mut App| app.on_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        // Enter on the task asks; nothing is reserved; Esc goes back to editing.
+        let mut app = mk("do it");
+        enter(&mut app);
+        assert!(app.newt.as_ref().unwrap().ask);
+        assert!(!crate::thread_dir(&name).exists());
+        app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        let n = app.newt.as_ref().unwrap();
+        assert!(!n.ask && !n.planning && n.focus == 2);
+        assert!(!crate::thread_dir(&name).exists());
+        // A bad field fails before asking.
+        let mut bad = mk("");
+        enter(&mut bad);
+        assert!(!bad.newt.as_ref().unwrap().ask && bad.newt.as_ref().unwrap().err.is_some());
+        // Naming plan-review-go skips the question; 'y' adds the marker.
+        assert_eq!(crate::with_prg("do it"), "do it\n\nUse plan-review-go.");
+        assert!(crate::mentions_prg(&crate::with_prg("x")) && !crate::mentions_prg("do it"));
     }
 
     #[test]
