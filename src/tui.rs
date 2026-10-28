@@ -2616,7 +2616,10 @@ impl App {
         let pill = if j == 0 {
             spans.push(Span::styled(
                 format!(" {} ", self.thread),
-                Style::new().fg(pal().crust).bg(pal().mauve),
+                Style::new()
+                    .fg(pal().crust)
+                    .bg(pal().subtext0)
+                    .add_modifier(Modifier::BOLD),
             ));
             self.thread.chars().count() as u16 + 2
         } else {
