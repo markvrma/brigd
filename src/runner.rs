@@ -254,6 +254,8 @@ pub fn register(a: LiveAgent) -> Arc<LiveAgent> {
 pub fn session_args(dir: &Path) -> Res<[String; 4]> {
     let _ = fs::remove_file(dir.join("status"));
     let _ = fs::remove_file(dir.join(TERMINATED));
+    // a resumed agent's new edits must show again
+    let _ = fs::remove_file(dir.join(".diff/.sealed"));
     let session = new_uuid()?;
     fs::write(dir.join("session"), &session)?;
     Ok([
@@ -340,6 +342,8 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
         .map_err(|e| format!("{thread}/{agent}: no session: {e}"))?;
     let _ = fs::remove_file(dir.join("status"));
     let _ = fs::remove_file(dir.join(TERMINATED));
+    // a resumed agent's new edits must show again
+    let _ = fs::remove_file(dir.join(".diff/.sealed"));
     // ponytail: assumes --resume keeps the session id (subagent scan reads <session>/subagents); re-read it if not.
     cmd.args(["--resume", session.trim(), "--settings", &hooks_json(&dir)]);
     Ok(register(LiveAgent::spawn(cmd, thread, agent, &cwd, &dir)?))

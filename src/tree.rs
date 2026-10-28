@@ -6,6 +6,7 @@ use crate::runner::Res;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -238,7 +239,12 @@ static NAMES: Mutex<BTreeMap<PathBuf, Names>> = Mutex::new(BTreeMap::new());
 type View = (PathBuf, String, String, (String, String));
 static VIEWS: Mutex<BTreeMap<PathBuf, View>> = Mutex::new(BTreeMap::new());
 
+#[cfg(test)]
+thread_local!(static GIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
+
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    #[cfg(test)]
+    GIT_CALLS.with(|c| c.set(c.get() + 1));
     let o = Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -356,24 +362,46 @@ fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
     if files.is_empty() {
         return vec![];
     }
-    let mut names = NAMES.lock().unwrap();
-    let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
-    if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
-        let b = base(cwd, repo, dir);
-        let listed = b.as_ref().and_then(|b| {
-            git(
-                cwd,
-                &["diff", "--numstat", "--no-renames", "--relative", "-z", b],
-            )
-        });
-        *entry = (
-            Instant::now(),
-            b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))),
-        );
-    }
-    // no base/listing (git failed): only the already frozen diffs can show
-    let (base, listed) = entry.1.clone().unwrap_or_default();
-    drop(names);
+    // Sealed: the agent finished and its diffs are frozen, so git has nothing new to say.
+    let sealed = dir.join(".diff/.sealed");
+    let (base, listed) = if sealed.exists() {
+        Default::default()
+    } else {
+        let mut names = NAMES.lock().unwrap();
+        let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
+        if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
+            // first check: backdate by a stable per-dir 0–3s phase so agents' rechecks spread out
+            let mut h = DefaultHasher::new();
+            dir.hash(&mut h);
+            let phase = Duration::from_millis(if entry.1.is_none() {
+                h.finish() % 3000
+            } else {
+                0
+            });
+            let b = base(cwd, repo, dir);
+            let listed = b.as_ref().and_then(|b| {
+                git(
+                    cwd,
+                    &["diff", "--numstat", "--no-renames", "--relative", "-z", b],
+                )
+            });
+            *entry = (
+                Instant::now()
+                    .checked_sub(phase)
+                    .unwrap_or_else(Instant::now),
+                b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))),
+            );
+            // done ≥10s ago (transcript settled) after a good git pass, or cwd gone: seal
+            let old = fs::metadata(dir.join("output.md"))
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= Duration::from_secs(10)));
+            if (entry.1.is_some() && old) || !cwd.exists() {
+                let _ = fs::create_dir_all(dir.join(".diff")).and_then(|_| fs::write(&sealed, ""));
+            }
+        }
+        // no base/listing (git failed): only the already frozen diffs can show
+        entry.1.clone().unwrap_or_default()
+    };
     // Once the agent is done (output.md written) its diffs are saved and never recomputed.
     let done = dir.join("output.md").exists();
     let mut views = VIEWS.lock().unwrap();
@@ -736,6 +764,70 @@ mod tests {
             .children
             .iter()
             .all(|c| c.kind != Kind::Subagent)); // .diff is not a subagent
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sealed_agent_skips_git() {
+        let d = tmp("sealed");
+        let (home, cwd, dir) = (d.join("home"), d.join("repo"), d.join("agent"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let g = |a: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(a)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
+        g(&["init", "-q"]);
+        fs::write(cwd.join("a.rs"), "one\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "init"]);
+        fs::write(dir.join("base"), git(&cwd, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        fs::write(cwd.join("a.rs"), "one\ntwo\n").unwrap();
+        fs::write(dir.join("session"), "s1\n").unwrap();
+        let log = home
+            .join(".claude/projects")
+            .join(slug(&cwd))
+            .join("s1.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let a = cwd.join("a.rs");
+        fs::write(
+            &log,
+            serde_json::json!({"toolUseResult": {"filePath": a}}).to_string() + "\n",
+        )
+        .unwrap();
+        fs::write(dir.join("output.md"), "done\n").unwrap();
+        let calls = || GIT_CALLS.with(|c| c.get());
+        let sealed = dir.join(".diff/.sealed");
+        // done just now: git runs, the diff freezes, but no seal yet (transcript may still settle)
+        let before = calls();
+        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        assert!(calls() > before);
+        assert_eq!((n.len(), n[0].label.as_str()), (1, "a.rs"));
+        assert!(!sealed.exists());
+        // done ≥10s ago: the next git pass seals it
+        fs::File::options()
+            .write(true)
+            .open(dir.join("output.md"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(20))
+            .unwrap();
+        NAMES.lock().unwrap().remove(&dir);
+        diff_nodes(&home, &cwd, &cwd, &dir);
+        assert!(sealed.exists());
+        // sealed: no git at all (even with no cached check), the frozen diff still shows
+        NAMES.lock().unwrap().remove(&dir);
+        let before = calls();
+        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        assert_eq!(calls(), before);
+        assert_eq!((n.len(), n[0].label.as_str()), (1, "a.rs"));
+        assert_eq!(diff_stat(&n[0].path), Some(("1".into(), "0".into())));
         let _ = fs::remove_dir_all(&d);
     }
 

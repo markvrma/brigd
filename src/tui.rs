@@ -308,7 +308,14 @@ pub fn run(open: Option<&str>) -> Res<()> {
         if let Some(t) = open {
             app.open_flowplan(t);
         }
-        let mut last = Instant::now();
+        // The tree is rebuilt off the UI thread (git and disk reads take 40ms+): keys never wait on it.
+        let (tx, trees) = mpsc::channel();
+        std::thread::spawn(move || {
+            let root = crate::root();
+            while tx.send(tree::build(&root)).is_ok() {
+                std::thread::sleep(REFRESH);
+            }
+        });
         while !app.quit {
             term.draw(|f| app.draw(f))?;
             if event::poll(Duration::from_millis(40))? {
@@ -325,13 +332,12 @@ pub fn run(open: Option<&str>) -> Res<()> {
             while let Some(m) = app.bg.as_ref().and_then(|(_, rx)| rx.try_recv().ok()) {
                 app.on_bg(m);
             }
-            if last.elapsed() >= REFRESH {
-                app.refresh();
+            if let Some(t) = trees.try_iter().last() {
+                app.refresh_with(t);
                 app.claim_queued();
                 if app.ticks.is_multiple_of(7) {
                     app.reconcile_running();
                 }
-                last = Instant::now();
             }
         }
         if crate::tui_pid() == Some(std::process::id()) {
@@ -1181,8 +1187,13 @@ impl App {
 
     /// Re-reads the tree and statuses from disk and the registry.
     fn refresh(&mut self) {
+        self.refresh_with(tree::build(&crate::root()));
+    }
+
+    /// `refresh` with a tree already built (by the worker in `run`).
+    fn refresh_with(&mut self, tree: Vec<Node>) {
         self.ticks += 1;
-        self.tree = tree::build(&crate::root());
+        self.tree = tree;
         let terms: Vec<_> = self
             .live_shells()
             .into_iter()
