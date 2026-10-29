@@ -1824,9 +1824,9 @@ impl App {
             .collect()
     }
 
-    /// Kills the agent, reverts its changes, keeps its output (crate::terminate), and says how it went.
+    /// Kills the agent, reverts its changes, keeps its output (crate::engine::terminate), and says how it went.
     fn terminate(&mut self, thread: &str, agent: &str) {
-        match crate::terminate(thread, agent) {
+        match crate::engine::terminate(thread, agent) {
             Ok(n) => self.flash(format!(
                 "terminated {agent}: reverted {n} file(s), output kept"
             )),
@@ -1845,7 +1845,7 @@ impl App {
 
     /// Stops the thread's agents, strays and terminals and closes its tabs (Delete / Archive come next).
     fn stop_thread(&mut self, thread: &str) {
-        crate::stop_thread(thread);
+        crate::engine::stop_thread(thread);
         self.live_shells()
             .into_iter()
             .filter(|(_, t)| t == thread)
@@ -2056,7 +2056,7 @@ impl App {
             .iter()
             .filter_map(|(p, st)| {
                 let name = p.file_name()?.to_string_lossy().into_owned();
-                crate::claimable(st, owner, crate::executing(&name)).then_some(name)
+                crate::engine::claimable(st, owner, crate::engine::executing(&name)).then_some(name)
             })
             .collect();
         for name in queued {
@@ -2082,7 +2082,7 @@ impl App {
         }
     }
 
-    /// Fails running threads whose claude is gone (see `crate::reconcile`).
+    /// Fails running threads whose claude is gone (see `crate::engine::reconcile`).
     fn reconcile_running(&self) {
         for name in self
             .thread_status
@@ -2091,7 +2091,7 @@ impl App {
             .filter_map(|(p, _)| Some(p.file_name()?.to_string_lossy().into_owned()))
         {
             if let Ok((_, mut st)) = crate::store::load(&name) {
-                let _ = crate::reconcile(&name, &mut st);
+                let _ = crate::engine::reconcile(&name, &mut st);
             }
         }
     }
@@ -2102,7 +2102,7 @@ impl App {
             Ok((flow, state)) => {
                 let tx = self.tx();
                 std::thread::spawn(move || {
-                    let r = crate::execute(&name, &flow, state).map_err(|e| e.to_string());
+                    let r = crate::engine::execute(&name, &flow, state).map_err(|e| e.to_string());
                     let _ = tx.send(Bg::Finished(name, r));
                 });
             }
