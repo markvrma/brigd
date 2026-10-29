@@ -293,7 +293,7 @@ struct App {
     task_btns: Vec<(Rect, (PathBuf, String))>,
 }
 
-/// Opens the TUI over every thread in ~/.brigd/threads until Mark quits.
+/// Opens the TUI over every thread in ~/.brigd/threads until the user quits.
 /// Quitting kills every live agent.
 pub fn run(open: Option<&str>) -> Res<()> {
     init_theme();
@@ -497,7 +497,7 @@ fn tab_window(widths: &[u16], first: usize, follow: Option<usize>, avail: u16) -
     (first, end_from(first))
 }
 
-/// While the process lives its hook status wins (a done agent Mark types into is live
+/// While the process lives its hook status wins (a done agent the user types into is live
 /// again): running / blocked / idle. Once it exits: done / failed from state.json, else off.
 fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
     match live {
@@ -630,9 +630,12 @@ pub fn plan_lines(
     out
 }
 
+type Nodes = Vec<(String, String)>;
+type Edges = Vec<(usize, usize, String)>;
+
 /// A mermaid flowchart (flow.md): its nodes as (id, label) and edges as (from, to, label), in source order.
 /// None unless it opens with `flowchart`/`graph` and has a node. Handles `A[x] --> B{y}`, chains and `-->|label|`.
-fn parse_flow(src: &str) -> Option<(Vec<(String, String)>, Vec<(usize, usize, String)>)> {
+fn parse_flow(src: &str) -> Option<(Nodes, Edges)> {
     let body = src
         .split("```mermaid")
         .nth(1)
@@ -1774,7 +1777,6 @@ impl App {
         }
     }
 
-    /// Kills the agent, reverts its changes, keeps its output (crate::terminate), and says how it went.
     /// PAUSE: ESC to every live agent of the thread (flow agents, and the shell tabs strays
     /// run in). RESUME: "continue" + Enter to the same set.
     fn toggle_pause(&mut self, thread: &str) {
@@ -1815,6 +1817,7 @@ impl App {
             .collect()
     }
 
+    /// Kills the agent, reverts its changes, keeps its output (crate::terminate), and says how it went.
     fn terminate(&mut self, thread: &str, agent: &str) {
         match crate::terminate(thread, agent) {
             Ok(n) => self.flash(format!(
@@ -3079,7 +3082,7 @@ fn tail(agent: &str) -> &str {
 /// A stray running in a terminal tab is no LiveAgent: it is alive while the pid it saved
 /// (exec kept brigd's) runs; the pid file goes once it is gone. Status from its hooks.
 fn stray_status(dir: &Path) -> &'static str {
-    // Gone: terminated by Mark (failed) or just exited (off).
+    // Gone: terminated by the user (failed) or just exited (off).
     let gone = || {
         if dir.join(runner::TERMINATED).exists() {
             "failed"

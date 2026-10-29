@@ -231,12 +231,12 @@ fn load(name: &str) -> Res<(Flow, State)> {
     let read =
         |f: &str| fs::read_to_string(dir.join(f)).map_err(|e| format!("thread {name}: {f}: {e}"));
     Ok((
-        serde_json::from_str(&read("flowmap.json").or_else(|_| read("flow.json"))?)?,
+        serde_json::from_str(&read("flowmap.json")?)?,
         serde_json::from_str(&read("state.json")?)?,
     ))
 }
 
-/// Writes via temp file + rename so a crash never leaves half a journal.
+/// Writes via temp file + rename so a crash never leaves a half-written file.
 fn write_json(path: &Path, v: &impl Serialize) -> Res<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_string_pretty(v)?)?;
@@ -1015,7 +1015,7 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
         );
         log(thread, &format!("start {} in {}", a.name, cwd.display()));
         record_base(&cwd, &adir);
-        // A trust dialog for a new worktree shows in the agent's own terminal; Mark answers it there.
+        // A trust dialog for a new worktree shows in the agent's own terminal; the user answers it there.
         let live = runner::start_claude(
             thread,
             &a.name,
@@ -1166,7 +1166,7 @@ fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
 }
 
 /// Drives one agent to completion: done = output.md exists once it is idle (or exited).
-/// One nudge when it goes idle without output. Blocked prompts are left for Mark.
+/// One nudge when it goes idle without output. Blocked prompts are left for the user.
 fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mutex<State>) -> bool {
     let out = live.dir.join("output.md");
     let nudge = format!(

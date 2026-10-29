@@ -97,10 +97,7 @@ pub fn build(root: &Path) -> Vec<Node> {
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         };
-        let (Some(flow), Some(state)) = (
-            read("flowmap.json").or_else(|| read("flow.json")),
-            read("state.json"),
-        ) else {
+        let (Some(flow), Some(state)) = (read("flowmap.json"), read("state.json")) else {
             continue;
         };
         let thread = tdir

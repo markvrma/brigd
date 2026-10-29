@@ -193,11 +193,11 @@ pub fn pid_alive(pid: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// <agent dir>/terminated: written when Mark terminates the agent, cleared when it is started again.
+/// <agent dir>/terminated: written when the user terminates the agent, cleared when it is started again.
 pub const TERMINATED: &str = "terminated";
 
 /// A random v4 UUID from /dev/urandom.
-pub fn new_uuid() -> Res<String> {
+fn new_uuid() -> Res<String> {
     let mut b = [0u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -218,7 +218,7 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// Inline --settings JSON whose hooks write idle/working/blocked to <dir>/status.
-pub fn hooks_json(dir: &Path) -> String {
+fn hooks_json(dir: &Path) -> String {
     let file = sh_quote(&dir.join("status").to_string_lossy());
     let cmd = |c: String| serde_json::json!([{"hooks": [{"type": "command", "command": c}]}]);
     let set = |s: &str| cmd(format!("printf {s} > {file}"));
