@@ -142,6 +142,8 @@ struct App {
     expanded: HashSet<(PathBuf, String)>,
     /// Task "..." (or expanded task line) rects from the last draw -> the (FLOWPLAN path, agent) it toggles.
     task_btns: Vec<(Rect, (PathBuf, String))>,
+    /// The master row was opened: its session is respawned whenever it exits.
+    master: bool,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until the user quits.
@@ -191,6 +193,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
                 app.claim_queued();
                 if app.ticks.is_multiple_of(SYNC_EVERY) {
                     app.reconcile_running();
+                    app.keep_master_alive();
                 }
             }
         }
@@ -383,8 +386,21 @@ impl App {
         Some(lines)
     }
 
+    /// Restarts the master session (resumed, see runner::master_args) once it has been opened
+    /// and has exited. Errors (claude missing, `brigd master` holding it) wait for the next try.
+    fn keep_master_alive(&self) {
+        let m = crate::runner::MASTER;
+        if self.master && !crate::runner::live(m, m).is_some_and(|a| a.alive()) {
+            let _ = crate::runner::resume_agent(m, m);
+        }
+    }
+
     fn ask_quit(&mut self) {
-        if live_agents().is_empty() {
+        // The always-alive master session alone never asks: its context survives (resumed).
+        if live_agents()
+            .iter()
+            .all(|a| a.thread == crate::runner::MASTER)
+        {
             self.quit = true;
         } else {
             self.confirm_quit = true;

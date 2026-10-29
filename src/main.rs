@@ -41,7 +41,7 @@ use std::{env, fs, thread};
 /// The app-wide result: errors are shown as text.
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-// Installed by `brigd install-skill`; brigd-plan first, plan-review-go, grill-me, grilling and find-skills back the opt-in plan-review-go path; brigd-resume continues a thread.
+// Installed by `brigd install-skill`; brigd-plan first, plan-review-go, grill-me, grilling and find-skills back the opt-in plan-review-go path; brigd-resume continues a thread; brigd-master runs the master session.
 const SKILLS: &[(&str, &str)] = &[
     ("brigd-plan", SKILL),
     (
@@ -58,20 +58,27 @@ const SKILLS: &[(&str, &str)] = &[
         "find-skills",
         include_str!("../skills/find-skills/SKILL.md"),
     ),
+    (
+        "brigd-master",
+        include_str!("../skills/brigd-master/SKILL.md"),
+    ),
 ];
 
 const USAGE: &str = "usage:
   brigd                        open the TUI over all threads
   brigd <name> \"task\"          plan with the brigd-plan skill, confirm, run in the TUI
   brigd <name> --flow <file>   run a hand-written flow
-    ... --bg                   skip the confirm, open the TUI in a new herdr tab, tmux window
-                               or Terminal window and return; automatic without a TTY or
-                               under Claude Code, so Claude can run `brigd <name> --flow <file>`
+    ... --bg                   skip the confirm and return: an open brigd TUI runs it, else a
+                               new herdr tab, tmux window or Terminal window; automatic without
+                               a TTY or under Claude Code, so Claude can run `brigd <name> --flow <file>`
   brigd ls                     list threads
   brigd status <name>          per-agent detail
   brigd resume <name> [--bg]   continue a stopped thread in the TUI; with --bg (automatic
                                like above) an open brigd TUI runs it, else a new tab/window
-  brigd install-skill          install brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills into ~/.claude/skills";
+  brigd master                 the master session: tell it what you want, it starts threads
+                               (also the TUI's pinned master row; one at a time)
+  brigd install-skill          install brigd-plan, plan-review-go, grill-me, grilling, brigd-resume,
+                               find-skills, brigd-master into ~/.claude/skills";
 
 fn main() {
     if let Err(e) = real_main() {
@@ -98,6 +105,7 @@ fn real_main() -> Res<()> {
         ["status", name] => cmd_status(name),
         ["resume", name] => cmd_resume(name, bg),
         ["install-skill"] => install_skill(),
+        ["master"] => cmd_master(),
         [name, "--flow", file] => new_thread(name, read_flow(Path::new(file))?, bg),
         [name, task] if !task.starts_with('-') => cmd_new(name, task, bg),
         _ => Err(USAGE.into()),
@@ -125,24 +133,27 @@ fn cmd_resume(name: &str, bg: bool) -> Res<()> {
     }
     match resume_how(bg, tui_alive()) {
         ResumeMode::Here => run_in_tui(name, flow, state),
-        ResumeMode::Queue => {
-            // Re-read so a stale snapshot never overwrites a thread that moved on.
-            let mut state = load(name)?.1;
-            if let Some(pid) = thread_busy(name, &state) {
-                return Err(format!("thread {name} is already running (pid {pid})").into());
-            }
-            state.status = Status::Queued;
-            state.updated = now();
-            write_json(&thread_dir(name).join("state.json"), &state)?;
-            println!("brigd: thread {name} queued; the open brigd TUI runs it");
-            Ok(())
-        }
+        ResumeMode::Queue => queue(name),
         ResumeMode::Launch => {
             let at = launch_bg(name, &state.repo)?;
             println!("brigd: thread {name} running in {at}");
             Ok(())
         }
     }
+}
+
+/// Marks thread `name` queued: the open TUI (tui.pid) claims and runs it.
+fn queue(name: &str) -> Res<()> {
+    // Re-read so a stale snapshot never overwrites a thread that moved on.
+    let mut state = load(name)?.1;
+    if let Some(pid) = thread_busy(name, &state) {
+        return Err(format!("thread {name} is already running (pid {pid})").into());
+    }
+    state.status = Status::Queued;
+    state.updated = now();
+    write_json(&thread_dir(name).join("state.json"), &state)?;
+    println!("brigd: thread {name} queued; the open brigd TUI runs it");
+    Ok(())
 }
 
 /// `brigd <name> "task"`: plan the task (asking about plan-review-go on a TTY), then new_thread.
@@ -183,9 +194,14 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     let state = create_thread(&root(), name, &repo, &flow)?;
     let dir = thread_dir(name);
     let flow_path = dir.join("flowmap.json");
-    if bg {
+    // Like resume: with --bg the open TUI runs it, else a new terminal; without, the confirm below.
+    let how = resume_how(bg, tui_alive());
+    if how != ResumeMode::Here {
         let plan = dir.join("FLOWPLAN");
         fs::write(&plan, flow_text(&flow))?;
+        if how == ResumeMode::Queue {
+            return queue(name);
+        }
         let at = launch_bg(name, &state.repo)?;
         println!(
             "brigd: thread {name} running in {at}; FLOWPLAN at {}",
@@ -315,6 +331,26 @@ fn cmd_status(name: &str) -> Res<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `brigd master`: the master session in this terminal. The TUI's pinned master row runs
+/// the same session, so only one of them can hold it at a time.
+fn cmd_master() -> Res<()> {
+    let dir = runner::master_dir();
+    if let Some(pid) = runner::running_elsewhere(&dir) {
+        return Err(format!(
+            "the master session is already running (pid {pid}), e.g. in the brigd TUI"
+        )
+        .into());
+    }
+    let mut child = Command::new("claude")
+        .args(runner::master_args(&dir)?)
+        .current_dir(&dir)
+        .spawn()?;
+    // So the TUI's master row does not start a second claude on this session.
+    fs::write(dir.join("pid"), child.id().to_string())?;
+    child.wait()?;
     Ok(())
 }
 

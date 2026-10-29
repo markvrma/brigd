@@ -99,7 +99,14 @@ impl App {
         let mut lines: Vec<Line> = vec![];
         for &(y, i) in &shown {
             lines.resize(y, Line::default());
-            lines.push(self.row_line(&self.rows[i], i == self.sel, inner.width as usize));
+            let line = self.row_line(&self.rows[i], i == self.sel, inner.width as usize);
+            if self.rows[i].kind == Kind::Master {
+                // Banner: the row padded above and below in its own background.
+                let pad = Line::default().style(line.style);
+                lines.extend([pad.clone(), line, pad]);
+            } else {
+                lines.push(line);
+            }
         }
         if lines.is_empty() {
             f.render_widget(

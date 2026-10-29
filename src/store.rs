@@ -209,8 +209,16 @@ pub(crate) fn log(thread: &str, msg: &str) {
     }
 }
 
-/// Subcommand names, so never thread names.
-pub(crate) const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
+/// Subcommand names (and the TUI's master row key), so never thread names.
+pub(crate) const RESERVED: &[&str] = &[
+    "ls",
+    "status",
+    "resume",
+    "install-skill",
+    "help",
+    "stray",
+    "master",
+];
 // Keeps "<thread>/<agent>" labels short enough for a sidebar (with flow's AGENT_MAX).
 pub(crate) const THREAD_MAX: usize = 12;
 
@@ -446,6 +454,7 @@ mod tests {
     fn thread_names() {
         assert!(!valid_name("a-very-long-thread", THREAD_MAX));
         assert!(RESERVED.contains(&"ls"));
+        assert!(check_new_thread("master").is_err());
     }
 
     #[test]

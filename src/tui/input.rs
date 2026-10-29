@@ -237,7 +237,8 @@ impl App {
             self.thread_prefix = false;
             let row = self.rows.get(self.sel);
             let (thread, repo) = (
-                row.map(|r| r.thread.clone()).filter(|t| !t.is_empty()),
+                row.map(|r| r.thread.clone())
+                    .filter(|t| !t.is_empty() && t != crate::runner::MASTER),
                 self.new_dir(),
             );
             match (k.code, thread) {

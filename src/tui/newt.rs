@@ -1,6 +1,6 @@
 //! The '+' new-thread window: its form state, validation, submit, and the background planner/execute threads it starts.
 
-use super::App;
+use super::{App, Kind};
 use ratatui::text::Span;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -81,7 +81,11 @@ impl App {
 
     /// Where a new thread goes by default: the highlighted row's space, else the shown one, else the cwd.
     pub(super) fn new_dir(&self) -> PathBuf {
-        let space = self.rows.get(self.sel).map_or(&self.space, |r| &r.space);
+        let space = self
+            .rows
+            .get(self.sel)
+            .filter(|r| r.kind != Kind::Master)
+            .map_or(&self.space, |r| &r.space);
         if space.as_os_str().is_empty() {
             env::current_dir().unwrap_or_default()
         } else {
