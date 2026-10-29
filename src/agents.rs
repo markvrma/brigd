@@ -177,7 +177,11 @@ pub(crate) fn config() -> Config {
 pub(crate) fn init(ask: bool) -> Res<()> {
     let path = root().join("config.json");
     let cfg = match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?,
+        Ok(s) => {
+            let cfg: Config = serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+            check(&cfg).map_err(|e| format!("{}: {e}", path.display()))?;
+            cfg
+        }
         Err(_) => {
             let found: Vec<&str> = AGENTS.iter().copied().filter(|a| on_path(a)).collect();
             if ask {
@@ -216,9 +220,6 @@ fn setup(found: &[&str], read: &dyn Fn(String) -> String) -> Res<Config> {
             .filter(|s| !s.is_empty())
             .collect()
     };
-    if let Some(bad) = agents.iter().find(|a| !AGENTS.contains(&a.as_str())) {
-        return Err(format!("unknown agent {bad:?}; supported: {AGENTS:?}").into());
-    }
     let first = agents.first().ok_or("no agents given")?;
     let default = if agents.iter().any(|a| a == "claude") {
         "claude"
@@ -229,10 +230,20 @@ fn setup(found: &[&str], read: &dyn Fn(String) -> String) -> Res<Config> {
         "" => default.to_string(),
         b => b.to_string(),
     };
-    if !agents.contains(&base) {
-        return Err(format!("base agent {base:?} is not one of {agents:?}").into());
+    let cfg = Config { agents, base };
+    check(&cfg)?;
+    Ok(cfg)
+}
+
+/// Rejects agent names brigd does not know and a base agent that is not enabled.
+fn check(cfg: &Config) -> Res<()> {
+    if let Some(bad) = cfg.agents.iter().find(|a| !AGENTS.contains(&a.as_str())) {
+        return Err(format!("unknown agent {bad:?}; supported: {AGENTS:?}").into());
     }
-    Ok(Config { agents, base })
+    if !cfg.agents.contains(&cfg.base) {
+        return Err(format!("base agent {:?} is not one of {:?}", cfg.base, cfg.agents).into());
+    }
+    Ok(())
 }
 
 /// One trimmed line from stdin after printing `q` (to stderr, like ask_prg).
@@ -320,6 +331,13 @@ mod tests {
             (vec!["pi".into(), "kimi".into()], "kimi".into())
         );
         assert!(setup(&[], &keep).is_err());
+        let loaded = |agents: &[&str], base: &str| Config {
+            agents: agents.iter().map(|s| s.to_string()).collect(),
+            base: base.into(),
+        };
+        assert!(check(&loaded(&["claude"], "pi")).is_err());
+        assert!(check(&loaded(&["claude", "gemini"], "claude")).is_err());
+        assert!(check(&loaded(&["claude", "pi"], "pi")).is_ok());
         assert!(setup(&["claude"], &|_| "gemini".into()).is_err());
         assert!(
             setup(&["claude", "pi"], &|q: String| if q.starts_with("base") {
