@@ -1,8 +1,9 @@
 //! The flow definition: its JSON schema and limits, validation, the planner call that writes
 //! one, and the text derived from it (FLOWPLAN, each agent's prompt.md and claude flags).
 
+use crate::launch::PARENT_SESSION_VARS;
 use crate::store::{output_path, thread_dir, Agent, Flow};
-use crate::{tui, Res, PARENT_SESSION_VARS};
+use crate::{tui, Res};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;

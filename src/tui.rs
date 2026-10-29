@@ -304,7 +304,10 @@ pub fn run(open: Option<&str>) -> Res<()> {
         term.clear()?;
         let mut app = App::default();
         // `brigd resume --bg` hands threads to the TUI whose pid is here.
-        _ = fs::write(crate::tui_pid_path(), std::process::id().to_string());
+        _ = fs::write(
+            crate::launch::tui_pid_path(),
+            std::process::id().to_string(),
+        );
         app.refresh();
         if let Some(t) = open {
             app.open_flowplan(t);
@@ -341,8 +344,8 @@ pub fn run(open: Option<&str>) -> Res<()> {
                 }
             }
         }
-        if crate::tui_pid() == Some(std::process::id()) {
-            _ = fs::remove_file(crate::tui_pid_path());
+        if crate::launch::tui_pid() == Some(std::process::id()) {
+            _ = fs::remove_file(crate::launch::tui_pid_path());
         }
         live_agents().iter().for_each(|a| a.kill());
         // A plan still running dies with brigd: free the names it reserved.
@@ -2045,8 +2048,9 @@ impl App {
     /// tui.pid when its owner is gone, so one open TUI always answers.
     fn claim_queued(&mut self) {
         let me = std::process::id();
-        let owner = crate::tui_pid() == Some(me)
-            || (!crate::tui_alive() && fs::write(crate::tui_pid_path(), me.to_string()).is_ok());
+        let owner = crate::launch::tui_pid() == Some(me)
+            || (!crate::launch::tui_alive()
+                && fs::write(crate::launch::tui_pid_path(), me.to_string()).is_ok());
         let queued: Vec<String> = self
             .thread_status
             .iter()
