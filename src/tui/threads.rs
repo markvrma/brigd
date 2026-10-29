@@ -35,8 +35,11 @@ impl Act {
     }
 }
 
+/// A copy of the live-agent registry: (thread, agent) -> LiveAgent.
+pub(super) type Snapshot = BTreeMap<runner::Key, Arc<LiveAgent>>;
+
 /// A copy of the live-agent registry, so the lock is never held across PTY calls.
-pub(super) fn registry_snapshot() -> BTreeMap<runner::Key, Arc<LiveAgent>> {
+pub(super) fn registry_snapshot() -> Snapshot {
     runner::registry().lock().unwrap().clone()
 }
 

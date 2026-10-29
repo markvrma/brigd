@@ -36,7 +36,7 @@ use tabs::{Tab, ThreadPanes};
 use term::{copy_to_clipboard, setup, teardown};
 use theme::{init_theme, pal};
 use threads::{
-    add_terminals, agent_glyph_status, live_agents, registry_snapshot, stray_status, Menu,
+    add_terminals, agent_glyph_status, live_agents, registry_snapshot, stray_status, Menu, Snapshot,
 };
 
 const SIDE_W: u16 = 40;
@@ -65,7 +65,7 @@ struct App {
     thread: String,
     tabs: BTreeMap<String, ThreadPanes>,
     /// (thread, agent) -> running / blocked / done / failed / off
-    agent_status: HashMap<(String, String), &'static str>,
+    agent_status: AgentStatuses,
     /// thread dir -> state.json status
     thread_status: HashMap<PathBuf, String>,
     blocked: HashSet<(String, String)>,
@@ -200,7 +200,8 @@ impl App {
         self.refresh_with(tree::build(&crate::store::root()));
     }
 
-    /// `refresh` with a tree already built (by the worker in `run`).
+    /// `refresh` with a tree already built (by the worker in `run`). Order matters: terminals join
+    /// the tree before statuses are read, plans load before `resize_all`, and rows reflow last.
     fn refresh_with(&mut self, tree: Vec<Node>) {
         self.ticks += 1;
         self.tree = tree;
@@ -211,33 +212,20 @@ impl App {
             .collect();
         add_terminals(&mut self.tree, &terms);
         let reg = registry_snapshot();
-        let (mut agents, mut threads) = (HashMap::new(), HashMap::new());
-        for t in self.tree.iter().flat_map(|s| &s.children) {
-            let state: serde_json::Value = fs::read_to_string(t.path.join("state.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            threads.insert(
-                t.path.clone(),
-                state["status"].as_str().unwrap_or("").to_string(),
-            );
-            for a in t.children.iter().filter(|a| a.kind == Kind::Agent) {
-                let key = (t.label.clone(), a.label.clone());
-                let saved = state["agents"][&a.label]["status"].as_str().unwrap_or("");
-                let live = reg.get(&key).filter(|l| l.alive()).map(|l| l.status());
-                agents.insert(key, agent_glyph_status(live.as_deref(), saved));
-            }
-            // A terminal running claude (a stray whose pid lives) gets that claude's status; else it stays "$".
-            for d in tree::stray_dirs(&t.path) {
-                let (st, term) = (
-                    stray_status(&d),
-                    fs::read_to_string(d.join("term")).unwrap_or_default(),
-                );
-                if !matches!(st, "off" | "failed") && !term.is_empty() {
-                    agents.insert((t.label.clone(), term.trim().to_string()), st);
-                }
-            }
+        let (agents, threads) = read_statuses(&self.tree, &reg);
+        let blocked = self.bell_on_new_blocked(&agents);
+        (self.agent_status, self.thread_status, self.blocked) = (agents, threads, blocked);
+        self.sync_tabs(&reg);
+        self.load_plans();
+        self.resize_all();
+        if self.ticks.is_multiple_of(SYNC_EVERY) {
+            self.sync_subagents();
         }
+        self.reflow();
+    }
+
+    /// The agents now blocked; rings the bell when one of them wasn't before.
+    fn bell_on_new_blocked(&self, agents: &AgentStatuses) -> HashSet<(String, String)> {
         let blocked: HashSet<_> = agents
             .iter()
             .filter(|(_, s)| **s == "blocked")
@@ -248,9 +236,12 @@ impl App {
                 .write_all(b"\x07")
                 .and_then(|_| io::stdout().flush());
         }
-        (self.agent_status, self.thread_status, self.blocked) = (agents, threads, blocked);
+        blocked
+    }
 
-        // Tabs follow a restart of their agent (execute or resume registers a new LiveAgent).
+    /// Tabs follow a restart of their agent (execute or resume registers a new LiveAgent);
+    /// viewers re-read their file, diff tabs re-diff every DIFF_EVERY refreshes.
+    fn sync_tabs(&mut self, reg: &Snapshot) {
         let diff_tick = self.ticks.is_multiple_of(DIFF_EVERY); // git diff open diff tabs every few seconds, not every refresh
         for tab in self.all_tabs_mut() {
             match tab {
@@ -283,33 +274,32 @@ impl App {
                 }
             }
         }
-        self.load_plans();
-        self.resize_all();
-        // supervise mirrors subagents only for agents execute runs; this covers ones resumed from the sidebar.
-        if self.ticks.is_multiple_of(SYNC_EVERY) {
-            let home = crate::store::home();
-            let mut runs: Vec<(PathBuf, PathBuf)> = live_agents()
-                .into_iter()
-                .filter(|a| !a.dir.as_os_str().is_empty())
-                .map(|a| (a.dir.clone(), a.cwd.clone()))
-                .collect();
-            // Strays running in a terminal tab (they keep a pid file while alive).
-            for d in self
-                .tree
-                .iter()
-                .flat_map(|s| &s.children)
-                .flat_map(|t| tree::stray_dirs(&t.path))
-                .filter(|d| d.join("pid").exists())
-            {
-                runs.extend(
-                    fs::read_to_string(d.join("cwd")).map(|c| (d.clone(), PathBuf::from(c.trim()))),
-                );
-            }
-            for (dir, cwd) in runs {
-                crate::transcript::sync_agent(&home, &cwd, &dir);
-            }
+    }
+
+    /// supervise mirrors subagents only for agents execute runs; this covers ones resumed from
+    /// the sidebar, and strays running in a terminal tab.
+    fn sync_subagents(&self) {
+        let home = crate::store::home();
+        let mut runs: Vec<(PathBuf, PathBuf)> = live_agents()
+            .into_iter()
+            .filter(|a| !a.dir.as_os_str().is_empty())
+            .map(|a| (a.dir.clone(), a.cwd.clone()))
+            .collect();
+        // Strays running in a terminal tab (they keep a pid file while alive).
+        for d in self
+            .tree
+            .iter()
+            .flat_map(|s| &s.children)
+            .flat_map(|t| tree::stray_dirs(&t.path))
+            .filter(|d| d.join("pid").exists())
+        {
+            runs.extend(
+                fs::read_to_string(d.join("cwd")).map(|c| (d.clone(), PathBuf::from(c.trim()))),
+            );
         }
-        self.reflow();
+        for (dir, cwd) in runs {
+            crate::transcript::sync_agent(&home, &cwd, &dir);
+        }
     }
 
     /// Reloads flowmap.json + state.json for every open FLOWPLAN tab.
@@ -383,6 +373,41 @@ impl App {
             self.confirm_quit = true;
         }
     }
+}
+
+/// (thread, agent) -> its sidebar status (agent_glyph_status), terminals running claude included.
+type AgentStatuses = HashMap<(String, String), &'static str>;
+
+/// Every agent's status (live hook status, else state.json) and every thread's state.json status.
+fn read_statuses(tree: &[Node], reg: &Snapshot) -> (AgentStatuses, HashMap<PathBuf, String>) {
+    let (mut agents, mut threads) = (HashMap::new(), HashMap::new());
+    for t in tree.iter().flat_map(|s| &s.children) {
+        let state: serde_json::Value = fs::read_to_string(t.path.join("state.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        threads.insert(
+            t.path.clone(),
+            state["status"].as_str().unwrap_or("").to_string(),
+        );
+        for a in t.children.iter().filter(|a| a.kind == Kind::Agent) {
+            let key = (t.label.clone(), a.label.clone());
+            let saved = state["agents"][&a.label]["status"].as_str().unwrap_or("");
+            let live = reg.get(&key).filter(|l| l.alive()).map(|l| l.status());
+            agents.insert(key, agent_glyph_status(live.as_deref(), saved));
+        }
+        // A terminal running claude (a stray whose pid lives) gets that claude's status; else it stays "$".
+        for d in tree::stray_dirs(&t.path) {
+            let (st, term) = (
+                stray_status(&d),
+                fs::read_to_string(d.join("term")).unwrap_or_default(),
+            );
+            if !matches!(st, "off" | "failed") && !term.is_empty() {
+                agents.insert((t.label.clone(), term.trim().to_string()), st);
+            }
+        }
+    }
+    (agents, threads)
 }
 
 #[cfg(test)]
