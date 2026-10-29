@@ -1,6 +1,6 @@
 //! Panes and tabs: what a tab shows, each thread's 1-2 panes, the tab window, and opening/closing/cycling/splitting tabs and sending keys to them.
 
-use super::threads::{fresh_name, live_agents};
+use super::threads::{fresh_name, live_agents, registry_snapshot};
 use super::App;
 use crate::runner::{self, LiveAgent};
 use crate::tree::Kind;
@@ -195,18 +195,13 @@ impl App {
         };
         // Registry key (space, name): names are unique per space, and a closed-but-running tab keeps its name.
         let thread = space.to_string_lossy().into_owned();
-        let reg = runner::registry().lock().unwrap().clone();
-        let taken = self
-            .tabs
-            .values()
-            .flat_map(|p| &p.list)
-            .flat_map(|t| &t.list)
-            .filter_map(|t| match t {
-                Tab::Term {
-                    thread: t, agent, ..
-                } if *t == thread => Some(agent.as_str()),
-                _ => None,
-            });
+        let reg = registry_snapshot();
+        let taken = self.all_tabs().filter_map(|t| match t {
+            Tab::Term {
+                thread: t, agent, ..
+            } if *t == thread => Some(agent.as_str()),
+            _ => None,
+        });
         // ponytail: names of every live shell are taken too, so the terminal folder can find a shell by thread + name
         let is_shell = |k: &(String, String)| k.0 == thread || self.shell_thread.contains_key(k);
         let name = fresh_name(
@@ -414,6 +409,21 @@ impl App {
                 let _ = a.resize(body.height, body.width);
             }
         }
+    }
+
+    /// Every open tab of every thread.
+    pub(super) fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs
+            .values()
+            .flat_map(|p| &p.list)
+            .flat_map(|t| &t.list)
+    }
+
+    pub(super) fn all_tabs_mut(&mut self) -> impl Iterator<Item = &mut Tab> {
+        self.tabs
+            .values_mut()
+            .flat_map(|p| &mut p.list)
+            .flat_map(|t| &mut t.list)
     }
 
     pub(super) fn send(&mut self, bytes: &[u8]) {

@@ -3,7 +3,7 @@
 //! (runner.rs PTYs drawn with tui-term) and read-only output.md viewers.
 
 use crate::tree::{self, Kind, Node};
-use crate::{runner, Res};
+use crate::Res;
 use crossterm::event::{self, Event, KeyEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -35,7 +35,9 @@ use sidebar::{NodeKey, Row};
 use tabs::{Tab, ThreadPanes};
 use term::{copy_to_clipboard, setup, teardown};
 use theme::{init_theme, pal};
-use threads::{add_terminals, agent_glyph_status, live_agents, stray_status, Menu};
+use threads::{
+    add_terminals, agent_glyph_status, live_agents, registry_snapshot, stray_status, Menu,
+};
 
 const SIDE_W: u16 = 40;
 const MIN_SIDE_W: u16 = 12;
@@ -202,7 +204,7 @@ impl App {
             .map(|(a, t)| (t, a.agent.clone()))
             .collect();
         add_terminals(&mut self.tree, &terms);
-        let reg = runner::registry().lock().unwrap().clone();
+        let reg = registry_snapshot();
         let (mut agents, mut threads) = (HashMap::new(), HashMap::new());
         for t in self.tree.iter().flat_map(|s| &s.children) {
             let state: serde_json::Value = fs::read_to_string(t.path.join("state.json"))
@@ -244,12 +246,7 @@ impl App {
 
         // Tabs follow a restart of their agent (execute or resume registers a new LiveAgent).
         let diff_tick = self.ticks.is_multiple_of(4); // git diff open diff tabs each ~3s, not every refresh
-        for tab in self
-            .tabs
-            .values_mut()
-            .flat_map(|p| &mut p.list)
-            .flat_map(|t| &mut t.list)
-        {
+        for tab in self.all_tabs_mut() {
             match tab {
                 Tab::Term {
                     thread,
@@ -311,17 +308,12 @@ impl App {
 
     /// Reloads flowmap.json + state.json for every open FLOWPLAN tab.
     fn load_plans(&mut self) {
-        let paths = self
-            .tabs
-            .values()
-            .flat_map(|p| &p.list)
-            .flat_map(|t| &t.list)
-            .filter_map(|t| match t {
-                Tab::View {
-                    path, rel: None, ..
-                } if path.ends_with("FLOWPLAN") => Some(path.clone()),
-                _ => None,
-            });
+        let paths = self.all_tabs().filter_map(|t| match t {
+            Tab::View {
+                path, rel: None, ..
+            } if path.ends_with("FLOWPLAN") => Some(path.clone()),
+            _ => None,
+        });
         self.plans = paths
             .filter_map(|p| {
                 Some((

@@ -5,7 +5,7 @@ use super::App;
 use crate::runner::{self, LiveAgent};
 use crate::tree::{self, Kind, Node};
 use ratatui::layout::Rect;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -35,14 +35,16 @@ impl Act {
     }
 }
 
+/// A copy of the live-agent registry, so the lock is never held across PTY calls.
+pub(super) fn registry_snapshot() -> BTreeMap<runner::Key, Arc<LiveAgent>> {
+    runner::registry().lock().unwrap().clone()
+}
+
 pub(super) fn live_agents() -> Vec<Arc<LiveAgent>> {
-    let all: Vec<Arc<LiveAgent>> = runner::registry()
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
-    all.into_iter().filter(|a| a.alive()).collect()
+    registry_snapshot()
+        .into_values()
+        .filter(|a| a.alive())
+        .collect()
 }
 
 /// While the process lives its hook status wins (a done agent the user types into is live
@@ -159,7 +161,7 @@ impl App {
 
     /// Live shell tabs, each with the thread its $BRIGD_THREAD names.
     pub(super) fn live_shells(&self) -> Vec<(Arc<LiveAgent>, String)> {
-        let reg = runner::registry().lock().unwrap().clone();
+        let reg = registry_snapshot();
         reg.iter()
             .filter(|(_, a)| a.alive())
             .filter_map(|(k, a)| Some((a.clone(), self.shell_thread.get(k)?.clone())))

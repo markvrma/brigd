@@ -9,7 +9,6 @@ use super::{App, MIN_SIDE_W, SIDE_W};
 use crate::tree::{self, Kind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
-use std::time::Instant;
 
 /// A key as the bytes a terminal would send. `app_cursor` = DECCKM (arrows as ESC O x).
 pub(super) fn key_bytes(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
@@ -69,7 +68,7 @@ impl App {
             || self.confirm_delete.is_some()
             || self.confirm_quit
         {
-            (self.prefix, self.thread_prefix) = (false, false);
+            self.disarm_prefixes();
         }
         // The new-thread window and its run confirm come first: no key may reach anything behind them.
         if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
@@ -165,9 +164,7 @@ impl App {
                 KeyCode::Char('t') => self.new_term(),
                 KeyCode::Char('v') => self.split(),
                 KeyCode::Char('o') => self.other_pane(),
-                KeyCode::Char('c') => {
-                    self.msg = Some((format!("theme: {}", next_theme()), Instant::now()))
-                }
+                KeyCode::Char('c') => self.flash(format!("theme: {}", next_theme())),
                 KeyCode::Char('q') => self.ask_quit(),
                 _ => {}
             }
@@ -242,7 +239,7 @@ impl App {
             y: m.row,
         };
         if matches!(m.kind, MouseEventKind::Down(_)) {
-            (self.prefix, self.thread_prefix) = (false, false);
+            self.disarm_prefixes();
             if let Some(menu) = self.menu.take() {
                 // A left click on an item picks it; any other click closes the menu (a right
                 // click on another row then opens that row's menu below).
@@ -311,7 +308,7 @@ impl App {
                     .find(|(r, _)| r.contains(at))
                     .map(|(_, p)| p.clone())
                 {
-                    (self.prefix, self.thread_prefix) = (false, false);
+                    self.disarm_prefixes();
                     if self.header_plus.contains(at) {
                         self.open_newt_anywhere(repo);
                     } else {
@@ -427,6 +424,11 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Drops a pending Ctrl-o / Ctrl-t prefix.
+    fn disarm_prefixes(&mut self) {
+        (self.prefix, self.thread_prefix) = (false, false);
     }
 
     pub(super) fn on_paste(&mut self, s: &str) {
