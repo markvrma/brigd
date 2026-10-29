@@ -2,12 +2,12 @@
 //! output.md; plus reconciling dead runs and stopping or terminating agents.
 
 use crate::diffs::record_base;
-use crate::flow::{claude_flags, read_flow, task_prompt};
+use crate::flow::{read_flow, task_prompt};
 use crate::store::{
     home, load, log, now, root, set_agent, thread_dir, update, write_json, Agent, Flow, State,
     Status,
 };
-use crate::{runner, transcript, tree, Res};
+use crate::{agents, runner, transcript, tree, Res};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -84,6 +84,21 @@ pub(crate) fn executing(name: &str) -> bool {
 fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<bool> {
     let dir = thread_dir(thread);
     let repo = PathBuf::from(state.lock().unwrap().repo.clone());
+    // Before starting any, so a missing bin never leaves half a stage running unsupervised.
+    let finished = |n: &str| {
+        state
+            .lock()
+            .unwrap()
+            .agents
+            .get(n)
+            .is_some_and(|x| x.status == Status::Done)
+    };
+    if let Some(a) = flow.stages[i]
+        .iter()
+        .find(|a| !finished(&a.name) && !agents::on_path(&a.agent))
+    {
+        return Err(format!("{}: `{}` is not on PATH", a.name, a.agent).into());
+    }
     let mut jobs = Vec::new();
     for a in &flow.stages[i] {
         let done = state
@@ -115,14 +130,7 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
         log(thread, &format!("start {} in {}", a.name, cwd.display()));
         record_base(&cwd, &adir);
         // A trust dialog for a new worktree shows in the agent's own terminal; the user answers it there.
-        let live = runner::start_claude(
-            thread,
-            &a.name,
-            &cwd,
-            &adir,
-            &claude_flags(thread, a),
-            &prompt,
-        )?;
+        let live = runner::start_agent(thread, a, &cwd, &adir, &prompt)?;
         set_agent(state, &a.name, Status::Running)?;
         jobs.push((a, live));
     }
@@ -179,12 +187,18 @@ const IDLE_DEBOUNCE: u32 = 3;
 const PASTE_GAP: Duration = Duration::from_millis(300);
 
 /// Drives one agent to completion: done = output.md exists once it is idle (or exited).
-/// One nudge when it goes idle without output. Blocked prompts are left for the user.
+/// One nudge when it goes idle without output. Blocked prompts are left for the user. A
+/// non-claude agent (no hooks) that goes quiet again after the nudge counts as blocked.
 fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mutex<State>) -> bool {
     let out = live.dir.join("output.md");
+    let how = if live.pty_status {
+        ""
+    } else {
+        " with AskUserQuestion"
+    };
     let nudge = format!(
         "You stopped without writing your result file. If the task is fully done, write your final result to {}. \
-         If it is not done and you cannot finish it, do not write it: ask the user with AskUserQuestion \
+         If it is not done and you cannot finish it, do not write it: ask the user{how} \
          (a few options plus free text), unless the user already told you to stop. Task: {}",
         out.display(),
         live.dir.join("prompt.md").display()
@@ -214,7 +228,11 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             );
             break false;
         }
-        if status == Status::Blocked {
+        // A quiet non-claude agent after its nudge: blocked until it prints again.
+        let quiet_after_nudge = live.pty_status
+            && status == Status::Idle
+            && nudged_at.is_some_and(|t| tick - t >= NUDGE_COOLDOWN);
+        if status == Status::Blocked || quiet_after_nudge {
             if !blocked {
                 blocked = true;
                 let _ = set_agent(state, &a.name, Status::Blocked);
@@ -330,6 +348,12 @@ pub(crate) fn terminate(thread: &str, agent: &str) -> Res<usize> {
         )
     };
     stop_agent(thread, agent)?;
+    if runner::agent_of(&dir) != "claude" {
+        log(
+            thread,
+            &format!("{agent}: revert covers reported files only"),
+        );
+    }
     let n = crate::diffs::revert(&home(), &cwd, &repo, &dir)?;
     if let Some(state) = state {
         set_agent(&Mutex::new(state), agent, Status::Failed)?;

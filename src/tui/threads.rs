@@ -56,6 +56,8 @@ pub(super) fn live_agents() -> Vec<Arc<LiveAgent>> {
 pub(super) fn agent_glyph_status(live: Option<Status>, saved: Status) -> Status {
     match live {
         Some(Status::Blocked) => Status::Blocked,
+        // Non-claude agents have no hook status; supervise saves Blocked after a silent stall.
+        Some(Status::Idle) if saved == Status::Blocked => Status::Blocked,
         Some(Status::Idle) => Status::Idle,
         Some(_) => Status::Running,
         None if saved == Status::Done => Status::Done,

@@ -1,7 +1,7 @@
 //! Starting `brigd resume` (or a new thread) somewhere else: a new herdr tab, tmux window or
 //! Terminal window, or the already open TUI (tui.pid) when `--bg` is asked for.
 
-use crate::flow::PARENT_SESSION_VARS;
+use crate::agents::parent_session_vars;
 use crate::runner::{self, sh_quote};
 use crate::store::root;
 use crate::Res;
@@ -46,7 +46,9 @@ pub(crate) fn tui_alive() -> bool {
 /// True when nobody can answer the y/N confirm or watch a fullscreen TUI here: `--bg`,
 /// no TTY on stdin/stdout, or Claude Code's Bash tool (it sets CLAUDECODE=1).
 pub(crate) fn background(bg_flag: bool, tty: bool, var: impl Fn(&str) -> Option<String>) -> bool {
-    bg_flag || !tty || var("CLAUDECODE").is_some_and(|v| !v.is_empty())
+    bg_flag
+        || !tty
+        || crate::agents::parent_session_vars().any(|k| var(k).is_some_and(|v| !v.is_empty()))
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,11 +78,8 @@ fn surfaces(var: impl Fn(&str) -> Option<String>) -> Vec<Surface> {
 /// server, tmux server or Terminal.app owns that process, so it is detached from this
 /// one and from the caller's terminal; brigd only runs short helper commands.
 pub(crate) fn launch_bg(name: &str, repo: &str) -> Res<String> {
-    // A tmux window inherits this process's env: drop the calling Claude session's vars so agents start clean.
-    let unset: String = PARENT_SESSION_VARS
-        .iter()
-        .map(|v| format!("-u {v} "))
-        .collect();
+    // A tmux window inherits this process's env: drop the calling agent session's vars so agents start clean.
+    let unset: String = parent_session_vars().map(|v| format!("-u {v} ")).collect();
     let cmd = format!(
         "env {unset}{} resume {name}",
         sh_quote(&env::current_exe()?.to_string_lossy())

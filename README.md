@@ -22,7 +22,7 @@ inside one TUI. Stages run in order; agents within a stage run in parallel.
 
 ## Requirements
 
-- [Claude Code](https://docs.claude.com/en/docs/claude-code) CLI (`claude`), installed and logged in. Claude is the default agent.
+- At least one coding agent CLI, installed and logged in: [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`), `codex`, `pi` or `kimi`.
 - Rust 1.89 or newer (`cargo`), and `git`.
 - macOS or Linux. Windows is not supported (needs a Unix PTY and `$HOME`). Agent terminals assume `zsh` (falls back to `/bin/sh`).
 - Optional: `tmux` or `herdr`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS. On Linux, `--bg` needs tmux or herdr; plain `brigd` and `resume` work anywhere.
@@ -63,13 +63,32 @@ Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Skills
 
-`brigd install-skill` installs **brigd-plan**, **plan-review-go**, **grill-me**, **grilling**, **brigd-resume** and **find-skills** to `~/.claude/skills/`.
+`brigd install-skill` installs **brigd-plan**, **plan-review-go**, **grill-me**, **grilling**, **brigd-resume** and **find-skills** into each enabled agent's skills dir (`~/.claude/skills/` for claude, `~/.agents/skills/` for codex, pi and kimi).
 In Claude Code, `/brigd-plan <task>` splits a task into stages of parallel agents and returns a
 flow JSON that `brigd <name> --flow flow.json` runs.
 
 `brigd <name> "... use plan-review-go"` opts into a review path: stage 1 is the only planned stage, an agent that runs
 plan-review-go with you; once you approve, it appends all later stages to flowmap.json. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
 **ponytail** plugin (`ponytail-review`, installed by `setup.sh`). brigd asks "Use plan-review-go? (y/N)" after you enter the task (in a terminal, and in the TUI's new-thread window); naming plan-review-go in the task still works and skips the question.
+
+## Agents and config
+
+brigd runs claude, codex, pi or kimi agents. On first run (no `~/.brigd/config.json`) it detects the
+four bins on `PATH` and asks which are enabled and which is the **base** agent that plans flows
+(claude if present). Without a TTY or with `--bg` it writes the detected agents silently.
+
+```json
+{"agents": ["claude", "pi"], "base": "claude"}
+```
+
+Delete `~/.brigd/config.json` to redo setup. Each flow agent has an `"agent"` field (old flows
+without it run as claude). The brigd-plan skill's **Agents** section lists each agent's models with a
+cheap/mid/top tier; the planner picks the cheapest that fits each stage. Non-claude agents run in their
+closest no-prompt mode (codex: workspace-write sandbox; pi and kimi have no sandbox).
+
+**Known gaps:** no resume or stray shim for non-claude agents; their diffs and reverts cover only the files
+listed in output.md's `## Files changed`; no exact blocked detection for them (a quiet agent is marked blocked
+after a nudge); non-claude flags come from docs and are unverified; kimi runs one-shot and cannot ask questions.
 
 ## Starting a thread
 
@@ -144,7 +163,7 @@ See [SECURITY.md](SECURITY.md).
 ```sh
 cargo uninstall brigd
 rm -rf ~/.claude/skills/brigd-plan   # the installed skill
-rm -rf ~/.brigd                      # thread state; optional
+rm -rf ~/.brigd                      # thread state and config.json; optional
 ```
 
 Thread worktrees live under `~/.brigd/worktrees` and add `brigd/<thread>/<key>` branches to your repos;
