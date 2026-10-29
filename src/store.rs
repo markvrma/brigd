@@ -72,6 +72,7 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A thread's flowmap.json and state.json.
 pub(crate) fn load(name: &str) -> Res<(Flow, State)> {
     let dir = thread_dir(name);
     let read =

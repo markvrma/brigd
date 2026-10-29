@@ -19,6 +19,8 @@ pub(crate) enum ResumeMode {
     Launch,
 }
 
+/// How `brigd resume` runs a thread: here without `--bg`; with it, by the open TUI if one
+/// is alive, else in a new terminal.
 pub(crate) fn resume_how(bg: bool, tui: bool) -> ResumeMode {
     match (bg, tui) {
         (false, _) => ResumeMode::Here,

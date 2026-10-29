@@ -1,7 +1,17 @@
 //! brigd: plan a flow of Claude agents with the brigd-plan skill, then run it
 //! stage by stage, one PTY per agent. Progress lives in ~/.brigd/threads/<name>/
-//! ({flowmap.json,state.json,log} and <agent>/{prompt.md,output.md,status,session}),
-//! so a thread can be listed, inspected and resumed.
+//! ({flowmap.json,state.json,FLOWPLAN} and <agent>/{prompt.md,output.md,status,session}),
+//! so a thread can be listed, inspected and resumed. This file is the CLI.
+//!
+//! Modules: store (thread data on disk), flow (the flow definition and planner), engine
+//! (running a flow), launch (`--bg` and terminal surfaces), stray (the `claude` shim),
+//! runner (agent PTYs), tree (the sidebar model), diffs (agent diffs), transcript
+//! (claude's transcript files), tui (the screen).
+//!
+//! "Flow" names five things: `store::Flow`, the stages of agents, saved as a thread's
+//! flowmap.json (agents may edit later stages while it runs); FLOWPLAN, that flow rendered
+//! as a tree plus the run log; an agent's flow.md, a mermaid chart of the steps it took;
+//! `--flow <file>`, a hand-written flowmap.json to run; and the `flow` module.
 
 mod diffs;
 mod engine;

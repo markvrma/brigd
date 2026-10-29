@@ -358,6 +358,7 @@ const KILL_ESCALATE: u32 = 20;
 
 /// Kills `agent`'s claude (its LiveAgent, or a stray's pid) and waits for it to be gone.
 /// Marks it `terminated` first, so a supervise thread that sees it die does not report it done.
+/// Does NOT revert its files (terminate does).
 fn stop_agent(thread: &str, agent: &str) -> Res<()> {
     let dir = thread_dir(thread).join(agent);
     fs::write(dir.join(runner::TERMINATED), "")?;
@@ -389,7 +390,7 @@ fn stop_agent(thread: &str, agent: &str) -> Res<()> {
 }
 
 /// Stops every running agent of `thread`: its live flow agents and its strays with a live pid.
-/// Unlike terminate it reverts nothing (an archived thread keeps its work).
+/// Does NOT revert anything, unlike terminate (an archived thread keeps its work).
 pub(crate) fn stop_thread(thread: &str) {
     let mut agents: Vec<String> = runner::registry()
         .lock()

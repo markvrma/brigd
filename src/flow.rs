@@ -41,6 +41,9 @@ pub(crate) fn valid_name(s: &str, max: usize) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
+/// Checks what the schema cannot: at least one stage, no empty stage, unique valid agent
+/// names (not "log"), known effort and mode, valid worktree keys, and at most one editing
+/// agent (WRITE_MODES) per space per stage.
 fn validate(flow: &Flow) -> Result<(), String> {
     if flow.stages.is_empty() {
         return Err("flow has no stages".into());
@@ -185,6 +188,8 @@ pub(crate) fn flow_text(flow: &Flow) -> String {
         .collect()
 }
 
+/// The prompt.md for agent `a` in stage `i`: the thread goal, its task and files, the
+/// output.md paths of every earlier agent, the live flowmap.json, and where to write its result.
 pub(crate) fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
     let mut p = format!(
         "# brigd task: {} (thread {thread}, stage {}/{})\n\nGoal of the whole thread: {}\n\n## Task\n{}\n",

@@ -1,5 +1,6 @@
 //! One agent = one PTY child. A reader thread feeds a vt100 parser the UI can
-//! render; status comes from a file the agent's own claude hooks write.
+//! render; status comes from a file the agent's own claude hooks write. Also the live
+//! registry, the hook/session args, resuming a saved session and pid checks.
 
 use crate::store::home;
 use crate::{transcript, Res};
