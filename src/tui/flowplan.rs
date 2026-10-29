@@ -1,7 +1,7 @@
 //! FLOWPLAN and flow.md rendering: the step tree of a thread's flow, and mermaid flowcharts drawn the same way.
 
 use super::theme::{pal, stage_color};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
 
@@ -24,23 +24,7 @@ pub fn plan_lines(
     frame: usize,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let dim = Style::new().fg(pal().overlay0);
-    let guide = |s: &str| Span::styled(s.to_string(), dim);
-    let mut out = vec![];
-    for (i, l) in wrap(&flow.goal, width.saturating_sub(3).max(20))
-        .into_iter()
-        .enumerate()
-    {
-        let lead = if i == 0 {
-            Span::styled("◆  ", Style::new().fg(pal().mauve))
-        } else {
-            guide("│  ")
-        };
-        out.push(Line::from(vec![
-            lead,
-            Span::styled(l, Style::new().fg(pal().text).add_modifier(Modifier::BOLD)),
-        ]));
-    }
+    let mut out = goal_lines(&flow.goal, width);
     let w = flow
         .stages
         .iter()
@@ -89,41 +73,7 @@ pub fn plan_lines(
                 Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)),
                 guide(&meta),
             ]));
-            let tw = width.saturating_sub(8).max(20);
-            let lead = if last { "│       " } else { "│  │    " };
-            let words: Vec<&str> = a.task.split_whitespace().collect();
-            if words.len() > TASK_WORDS && !expanded(&a.name) {
-                let ws = wrap(&words[..TASK_WORDS].join(" "), tw);
-                let n = ws.len();
-                for (k, w) in ws.into_iter().enumerate() {
-                    let mut l = vec![guide(lead)];
-                    if k + 1 == n {
-                        let x = (lead.chars().count() + w.chars().count() + 1) as u16;
-                        hits.push((out.len(), x..x + 3, a.name.clone()));
-                        l.push(Span::styled(w + " ", dim.add_modifier(Modifier::ITALIC)));
-                        l.push(Span::styled(
-                            "...",
-                            Style::new().fg(c).add_modifier(Modifier::BOLD),
-                        ));
-                    } else {
-                        l.push(Span::styled(w, dim.add_modifier(Modifier::ITALIC)));
-                    }
-                    out.push(Line::from(l));
-                }
-                continue;
-            }
-            // Blank task lines are dropped, like wrap() drops them in the goal.
-            for l in a.task.lines().filter(|l| !l.trim().is_empty()) {
-                for w in wrap(l, tw) {
-                    if words.len() > TASK_WORDS {
-                        hits.push((out.len(), 0..u16::MAX, a.name.clone()));
-                    }
-                    out.push(Line::from(vec![
-                        guide(lead),
-                        Span::styled(w, dim.add_modifier(Modifier::ITALIC)),
-                    ]));
-                }
-            }
+            task_lines(&mut out, hits, a, last, c, &expanded, width);
         }
     }
     out.push(Line::from(guide("│")));
@@ -131,8 +81,81 @@ pub fn plan_lines(
     out
 }
 
-type Nodes = Vec<(String, String)>;
+/// Tree guide characters, dimmed.
+fn guide(s: &str) -> Span<'static> {
+    Span::styled(s.to_string(), Style::new().fg(pal().overlay0))
+}
 
+/// The flow's goal, word-wrapped after a ◆.
+fn goal_lines(goal: &str, width: usize) -> Vec<Line<'static>> {
+    let mut out = vec![];
+    for (i, l) in wrap(goal, width.saturating_sub(3).max(20))
+        .into_iter()
+        .enumerate()
+    {
+        let lead = if i == 0 {
+            Span::styled("◆  ", Style::new().fg(pal().mauve))
+        } else {
+            guide("│  ")
+        };
+        out.push(Line::from(vec![
+            lead,
+            Span::styled(l, Style::new().fg(pal().text).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    out
+}
+
+/// Agent `a`'s task under its row (`last`: the stage's last agent), pushed to `out` with its
+/// clickable spans in `hits` (see plan_lines).
+fn task_lines(
+    out: &mut Vec<Line<'static>>,
+    hits: &mut Vec<(usize, Range<u16>, String)>,
+    a: &crate::store::Agent,
+    last: bool,
+    c: Color,
+    expanded: &impl Fn(&str) -> bool,
+    width: usize,
+) {
+    let dim = Style::new().fg(pal().overlay0);
+    let tw = width.saturating_sub(8).max(20);
+    let lead = if last { "│       " } else { "│  │    " };
+    let words: Vec<&str> = a.task.split_whitespace().collect();
+    if words.len() > TASK_WORDS && !expanded(&a.name) {
+        let rows = wrap(&words[..TASK_WORDS].join(" "), tw);
+        let n = rows.len();
+        for (k, row) in rows.into_iter().enumerate() {
+            let mut l = vec![guide(lead)];
+            if k + 1 == n {
+                let x = (lead.chars().count() + row.chars().count() + 1) as u16;
+                hits.push((out.len(), x..x + 3, a.name.clone()));
+                l.push(Span::styled(row + " ", dim.add_modifier(Modifier::ITALIC)));
+                l.push(Span::styled(
+                    "...",
+                    Style::new().fg(c).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                l.push(Span::styled(row, dim.add_modifier(Modifier::ITALIC)));
+            }
+            out.push(Line::from(l));
+        }
+        return;
+    }
+    // Blank task lines are dropped, like wrap() drops them in the goal.
+    for l in a.task.lines().filter(|l| !l.trim().is_empty()) {
+        for row in wrap(l, tw) {
+            if words.len() > TASK_WORDS {
+                hits.push((out.len(), 0..u16::MAX, a.name.clone()));
+            }
+            out.push(Line::from(vec![
+                guide(lead),
+                Span::styled(row, dim.add_modifier(Modifier::ITALIC)),
+            ]));
+        }
+    }
+}
+
+type Nodes = Vec<(String, String)>;
 type Edges = Vec<(usize, usize, String)>;
 
 /// A mermaid flowchart (flow.md): its nodes as (id, label) and edges as (from, to, label), in source order.
