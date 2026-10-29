@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - New threads ask "Use plan-review-go? (y/N)" right after the task is entered (TUI window and terminal CLI); naming plan-review-go in the task skips the question.
-- An agent that cannot finish its task asks you a multiple-choice question (shown as blocked) instead of writing its result; a background check marks a "running" thread failed when no claude process is alive.
+- An agent that cannot finish its task asks you a multiple-choice question (shown as blocked) instead of writing its result; a background check marks a "running" thread failed when no agent process is alive.
+- Multiple coding agents: claude, codex, pi and kimi. A first run writes `~/.brigd/config.json` (`agents` and the `base` agent that plans flows); each flow stage picks its `agent`, `model` and `effort`. Non-claude agents have no hooks: a quiet agent is nudged once, then shown as blocked.
 - New thread in any directory: the header `＋` or `C-t m`; the new-thread dialog has an editable dir field.
 - Tabs have a `×` close button and a left-side fade.
 

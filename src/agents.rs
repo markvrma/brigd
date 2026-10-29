@@ -178,7 +178,8 @@ pub(crate) fn init(ask: bool) -> Res<()> {
     let path = root().join("config.json");
     let cfg = match fs::read_to_string(&path) {
         Ok(s) => {
-            let cfg: Config = serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
+            let cfg: Config =
+                serde_json::from_str(&s).map_err(|e| format!("{}: {e}", path.display()))?;
             check(&cfg).map_err(|e| format!("{}: {e}", path.display()))?;
             cfg
         }

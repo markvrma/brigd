@@ -1,6 +1,6 @@
 # brigd
 
-brigd plans a task as a staged flow of Claude Code agents and runs each agent in its own PTY,
+brigd plans a task as a staged flow of coding agents (Claude Code, codex, pi, kimi) and runs each agent in its own PTY,
 inside one TUI. Stages run in order; agents within a stage run in parallel.
 
 ![The brigd TUI: the spaces sidebar on the left, a colored git diff in the middle, and the Claude session of the agent that did the work on the right](docs/images/brigd-overview.png)
@@ -12,7 +12,7 @@ inside one TUI. Stages run in order; agents within a stage run in parallel.
 
 ## How it looks
 
-**Flowmap.** The plan for a thread: stages run top to bottom, agents inside a stage run in parallel, each with its own model, effort and worktree.
+**Flowmap.** The plan for a thread: stages run top to bottom, agents inside a stage run in parallel, each with its own agent, model, effort and worktree.
 
 ![A rendered flowmap with three stages of agents, each showing model, effort and worktree, followed by the run log](docs/images/brigd-flowmap.png)
 
@@ -96,7 +96,7 @@ after a nudge); non-claude flags come from docs and are unverified; kimi runs on
 |---|---|
 | `brigd <name> "task"` | plan with brigd-plan, confirm, run in the TUI |
 | `brigd <name> --flow flow.json` | run a hand-written flow |
-| `... --bg` | skip the confirm; open the TUI in a new tmux window / Terminal window and return (automatic without a TTY or under Claude Code) |
+| `... --bg` | skip the confirm; open the TUI in a new tmux window / Terminal window and return (automatic without a TTY or inside an agent session) |
 | `brigd` | open the TUI over all threads |
 | `brigd ls` | list threads |
 | `brigd status <name>` | per-agent detail |
@@ -110,11 +110,11 @@ not one of `ls`, `status`, `resume`, `install-skill`, `help`, `stray`.
 **In the TUI**, the `+` button on a repo row (sidebar) opens the new-thread dialog: fill in a name and a task
 (Tab switches field, Enter submits, Esc cancels), brigd plans it and asks you to confirm the run.
 
-**Flow basics:** stages run one after another; every agent in a stage runs in parallel, each an interactive Claude
+**Flow basics:** stages run one after another; every agent in a stage runs in parallel, each an interactive agent
 session. The next stage starts when every agent in the current one has written its result file. An agent with a
 `worktree` key works in its own git worktree (branch `brigd/<thread>/<key>`); `null` means the main repo.
 Two editing agents may not share a worktree.
-An agent writes its result only when the task is fully done; if it cannot finish it asks you a multiple-choice question and shows as blocked (`!`). A running thread with no live claude process is marked failed.
+An agent writes its result only when the task is fully done; if it cannot finish it asks you a multiple-choice question and shows as blocked (`!`). A running thread with no live agent process is marked failed.
 
 ## TUI keys
 
@@ -137,7 +137,7 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 | `o` | other pane |
 | `c` | cycle theme |
 | `q` | quit (asks to confirm if agents are running) |
-| `Ctrl-o` | send Ctrl-o to the focused claude |
+| `Ctrl-o` | send Ctrl-o to the focused agent |
 
 **Ctrl-t thread prefix** (press Ctrl-t, then), acting on the highlighted thread:
 
@@ -147,22 +147,22 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 | `a` | archive it: moved to `<root>/archive/threads`, worktrees kept |
 | `n` | new thread in the highlighted thread's repo (opens the new-thread dialog; the dir field is editable) |
 | `m` | new thread in any directory (same dialog, dir field focused); the green `＋` at the top of the sidebar does the same |
-| `Ctrl-t` | send Ctrl-t to the focused claude |
+| `Ctrl-t` | send Ctrl-t to the focused agent |
 
 ## Privacy and security
 
-brigd launches **every** agent with `claude --permission-mode auto`: Claude runs tools (shell commands, file
-edits) without asking first. Agents can read and write anything your user can, and anything they read
-(files, web pages, dependencies) can try to steer them. Only run flows you trust, in repos you trust; use a
-disposable checkout for untrusted code. brigd itself sends nothing anywhere: flow state, prompts and results
-live under `~/.brigd/threads/`, and all network traffic comes from the `claude` CLI under its own terms.
-See [SECURITY.md](SECURITY.md).
+brigd runs every agent unattended: claude in `auto` permission mode, codex in its workspace-write sandbox,
+pi and kimi with every tool call approved (no sandbox). Agents can read and write anything your user can,
+and anything they read (files, web pages, dependencies) can try to steer them. Only run flows you trust, in
+repos you trust; use a disposable checkout for untrusted code. brigd itself sends nothing anywhere: flow
+state, prompts and results live under `~/.brigd/threads/`, and network traffic comes from the agent CLIs
+under their own terms. See [SECURITY.md](SECURITY.md).
 
 ## Uninstall
 
 ```sh
 cargo uninstall brigd
-rm -rf ~/.claude/skills/brigd-plan   # the installed skill
+rm -rf ~/.claude/skills/brigd-plan   # the installed skill (also ~/.agents/skills/ for codex, pi, kimi)
 rm -rf ~/.brigd                      # thread state and config.json; optional
 ```
 
