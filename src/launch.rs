@@ -1,5 +1,5 @@
-//! Starting `brigd resume` somewhere else: a new herdr tab, tmux window or Terminal window,
-//! or the already open TUI (tui.pid) when `--bg` is asked for.
+//! Starting `brigd resume` (or a new thread) somewhere else: a new herdr tab, tmux window or
+//! Terminal window, or the already open TUI (tui.pid) when `--bg` is asked for.
 
 use crate::flow::PARENT_SESSION_VARS;
 use crate::runner::{self, sh_quote};
@@ -20,8 +20,8 @@ pub(crate) enum ResumeMode {
     Launch,
 }
 
-/// How `brigd resume` runs a thread: here without `--bg`; with it, by the open TUI if one
-/// is alive, else in a new terminal.
+/// How `brigd resume` and `brigd <name> ...` run a thread: here without `--bg`; with it, by
+/// the open TUI if one is alive (queued), else in a new terminal.
 pub(crate) fn resume_how(bg: bool, tui: bool) -> ResumeMode {
     match (bg, tui) {
         (false, _) => ResumeMode::Here,
@@ -182,6 +182,11 @@ mod tests {
         assert_eq!(resume_how(false, true), ResumeMode::Here);
         assert_eq!(resume_how(true, true), ResumeMode::Queue);
         assert_eq!(resume_how(true, false), ResumeMode::Launch);
+        // A new thread from the master session (--bg, a TUI open) is queued, never a new tab.
+        assert_eq!(
+            resume_how(background(false, false, env(&[])), true),
+            ResumeMode::Queue
+        );
         let mac = |mut v: Vec<Surface>| {
             if cfg!(target_os = "macos") {
                 v.push(Surface::Terminal);

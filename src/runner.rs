@@ -283,16 +283,66 @@ pub fn running_elsewhere(dir: &Path) -> Option<u32> {
         .then_some(pid)
 }
 
+/// The master session's registry key (thread and agent) and dir name: one claude above all
+/// spaces that turns requests into brigd threads (the brigd-master skill).
+pub const MASTER: &str = "master";
+
+/// ~/.brigd/master: the master session's cwd and its session/status/pid files.
+pub fn master_dir() -> PathBuf {
+    crate::store::root().join(MASTER)
+}
+
+/// claude args for the master session in `dir`: `--resume` the saved session once claude
+/// has written its transcript (so context survives restarts), else a fresh session that
+/// starts the brigd-master skill.
+pub fn master_args(dir: &Path) -> Res<Vec<String>> {
+    if !home().join(".claude/skills/brigd-master/SKILL.md").exists() {
+        return Err("brigd-master skill missing: run `brigd install-skill`".into());
+    }
+    fs::create_dir_all(dir)?;
+    let mut args: Vec<String> = vec![
+        "--model".into(),
+        "sonnet".into(), // ponytail: fixed alias, make configurable if needed
+        "--permission-mode".into(),
+        "auto".into(),
+    ];
+    let saved = fs::read_to_string(dir.join("session"))
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| transcript::transcript_path(&home(), dir, s).exists());
+    match saved {
+        Some(s) => {
+            reset_run_files(dir);
+            args.extend(["--resume".into(), s, "--settings".into(), hooks_json(dir)]);
+        }
+        None => {
+            args.extend(session_args(dir)?);
+            args.push("/brigd-master".into());
+        }
+    }
+    Ok(args)
+}
+
 /// Reopens an agent's saved session (`claude --resume <session>`) in its space,
 /// unless it is still live. Returns the live agent. A stray (`stray agents/<name>`,
 /// a claude typed in a brigd terminal) has no flow entry: it reopens in its saved cwd.
+/// MASTER/MASTER is the master session (master_args).
 pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     if let Some(a) = live(thread, agent).filter(|a| a.alive()) {
         return Ok(a);
     }
-    let dir = crate::store::thread_dir(thread).join(agent);
+    let dir = if thread == MASTER {
+        master_dir()
+    } else {
+        crate::store::thread_dir(thread).join(agent)
+    };
     if let Some(pid) = running_elsewhere(&dir) {
         return Err(format!("{thread}/{agent}: running in another brigd (pid {pid})").into());
+    }
+    if thread == MASTER {
+        let mut cmd = CommandBuilder::new("claude");
+        cmd.args(master_args(&dir)?);
+        return Ok(register(LiveAgent::spawn(cmd, thread, agent, &dir, &dir)?));
     }
     let mut cmd = CommandBuilder::new("claude");
     let cwd = if Path::new(agent).starts_with(crate::tree::STRAY) {

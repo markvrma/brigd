@@ -19,6 +19,8 @@ pub enum Kind {
     Folder,
     /// A live brigd terminal (shell tab) whose $BRIGD_THREAD is the thread; listed by the TUI, not on disk.
     Terminal,
+    /// The TUI's pinned top row: the master session (runner::MASTER), not on disk.
+    Master,
 }
 
 /// <thread>/stray agents/<name>/{cwd,session,base,pid,term,status}: claude sessions typed in a brigd terminal.

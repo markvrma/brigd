@@ -192,7 +192,9 @@ impl App {
     /// ~/.brigd/bin shim first on PATH.
     pub(super) fn new_term(&mut self) {
         let space = self.space.clone();
-        let brigd_thread = Some(self.thread.clone()).filter(|t| !t.is_empty());
+        // The master row is no thread: a claude typed there is no stray of anything.
+        let brigd_thread =
+            Some(self.thread.clone()).filter(|t| !t.is_empty() && t != runner::MASTER);
         let cwd = if space.as_os_str().is_empty() {
             env::current_dir().unwrap_or_default()
         } else {

@@ -2,6 +2,7 @@
 
 use super::theme::{pal, stage_color};
 use super::App;
+use crate::runner;
 use crate::store::Status;
 use crate::tree::{self, Kind, Node};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -82,9 +83,18 @@ pub(super) fn layout(rows: &[Row], offset: usize, h: usize) -> Vec<(usize, usize
             break;
         }
         out.push((y, i));
-        y += 1;
+        y += row_height(r);
     }
     out
+}
+
+/// Lines a row takes: the master row is a three-line banner, the rest one.
+pub(super) fn row_height(r: &Row) -> usize {
+    if r.kind == Kind::Master {
+        3
+    } else {
+        1
+    }
 }
 
 /// The smallest offset that still shows the last row in `h` lines.
@@ -112,7 +122,7 @@ pub(super) fn hit(
     let dy = (row - inner.y) as usize;
     let i = layout(rows, offset, inner.height as usize)
         .into_iter()
-        .find(|&(y, _)| y == dy)?
+        .find(|&(y, i)| (y..y + row_height(&rows[i])).contains(&dy))?
         .1;
     let r = &rows[i];
     let arrow_x = (r.depth * INDENT) as u16;
@@ -141,13 +151,26 @@ impl Status {
 }
 
 impl App {
-    /// Re-flattens the tree (after a refresh or a fold), keeping the selected node.
+    /// Re-flattens the tree (after a refresh or a fold), keeping the selected node. The
+    /// master row is pinned first, above every space.
     pub(super) fn reflow(&mut self) {
         let keep = self
             .rows
             .get(self.sel)
             .map(|r| (r.space.clone(), r.path.clone()));
-        let mut rows = Vec::new();
+        let dir = runner::master_dir();
+        let mut rows = vec![Row {
+            depth: 0,
+            kind: Kind::Master,
+            label: runner::MASTER.into(),
+            path: dir.clone(),
+            space: dir,
+            thread: runner::MASTER.into(),
+            folder: false,
+            open: false,
+            stage: None,
+            worktree: None,
+        }];
         for s in &self.tree {
             flatten(s, 0, &s.path, "", &self.toggled, &mut rows);
         }
@@ -161,7 +184,7 @@ impl App {
         }
         self.sel = self.sel.min(self.rows.len().saturating_sub(1));
         if self.space.as_os_str().is_empty() {
-            if let Some(r) = self.rows.first() {
+            if let Some(r) = self.rows.iter().find(|r| r.kind == Kind::Space) {
                 self.space = r.space.clone();
             }
         }
@@ -192,6 +215,10 @@ impl App {
     /// Row `i`'s space and (unless it is a space row) thread become the shown ones.
     fn follow(&mut self, i: usize) {
         let r = &self.rows[i];
+        if r.kind == Kind::Master {
+            self.thread = r.thread.clone(); // its tab pane is keyed "master"; keep the shown space
+            return;
+        }
         self.space = r.space.clone();
         if !r.thread.is_empty() {
             self.thread = r.thread.clone();
@@ -225,6 +252,10 @@ impl App {
                     self.toggle(i);
                 }
                 self.open_agent(thread.clone(), &thread, &agent, stage);
+            }
+            Kind::Master => {
+                self.master = true; // the run loop respawns it from now on
+                self.open_agent(runner::MASTER.into(), runner::MASTER, runner::MASTER, None);
             }
             Kind::Terminal => {
                 let (key, name) = (r.thread.clone(), r.label.clone());
@@ -300,18 +331,34 @@ impl App {
                     ));
                 }
             }
+            Kind::Master => {
+                let live = runner::live(runner::MASTER, runner::MASTER)
+                    .filter(|a| a.alive())
+                    .map(|a| a.status());
+                let (g, style) = super::agent_glyph_status(live, Status::Pending).glyph();
+                spans.push(Span::styled(g, style));
+                label = label.fg(pal().mauve).add_modifier(Modifier::BOLD);
+            }
             Kind::Output => label = label.fg(pal().sky),
             Kind::Diff => label = label.fg(pal().yellow),
             Kind::Space => label = label.fg(pal().mauve).add_modifier(Modifier::BOLD),
             Kind::Thread => label = label.fg(pal().text).add_modifier(Modifier::BOLD),
             _ => label = label.fg(pal().subtext0),
         }
-        let slash = if matches!(r.kind, Kind::Output | Kind::Diff | Kind::Terminal) {
+        let slash = if matches!(
+            r.kind,
+            Kind::Output | Kind::Diff | Kind::Terminal | Kind::Master
+        ) {
             ""
         } else {
             "/"
         };
-        spans.push(Span::styled(format!("{}{slash}", r.label), label));
+        let text = if r.kind == Kind::Master {
+            r.label.to_uppercase()
+        } else {
+            format!("{}{slash}", r.label)
+        };
+        spans.push(Span::styled(text, label));
         // Worktree name (agents) and +add -del (diffs) sit flush right, one column of padding.
         let mut right = vec![];
         if let Some(wt) = &r.worktree {
@@ -349,6 +396,7 @@ impl App {
             (true, false) => line.style(Style::new().add_modifier(Modifier::REVERSED)),
             (true, true) => line.style(Style::new().bg(pal().surface1)),
             // The space (repo) whose tabs show.
+            _ if r.kind == Kind::Master => line.style(Style::new().bg(pal().surface0)),
             _ if r.kind == Kind::Space && r.space == self.space => {
                 line.style(Style::new().bg(pal().surface0))
             }

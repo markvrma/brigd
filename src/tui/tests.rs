@@ -816,6 +816,56 @@ fn ctrl_t_acts_on_highlighted_thread() {
 }
 
 #[test]
+fn master_row_pinned_above_spaces() {
+    let node = |kind, label: &str, children| Node {
+        kind,
+        label: label.into(),
+        path: PathBuf::from(format!("/{label}")),
+        children,
+        stage: None,
+        worktree: None,
+    };
+    let mut app = App {
+        tree: vec![
+            node(Kind::Space, "a", vec![node(Kind::Thread, "t", vec![])]),
+            node(Kind::Space, "b", vec![]),
+        ],
+        ..Default::default()
+    };
+    app.reflow();
+    let rows: Vec<_> = app
+        .rows
+        .iter()
+        .map(|r| (r.kind.clone(), r.label.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (Kind::Master, "master"),
+            (Kind::Space, "a"),
+            (Kind::Thread, "t"),
+            (Kind::Space, "b")
+        ]
+    );
+    // The master banner is three lines, then a blank line before the first space; the
+    // shown space and thread are still the first real ones.
+    let ys: Vec<_> = layout(&app.rows, 0, 20)
+        .into_iter()
+        .map(|(y, _)| y)
+        .collect();
+    assert_eq!(ys, [0, 4, 5, 7]);
+    assert_eq!(
+        (app.space.as_path(), app.thread.as_str()),
+        (Path::new("/a"), "t")
+    );
+    // Ctrl-t never deletes or archives the master session.
+    app.sel = 0;
+    app.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    app.on_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
+    assert_eq!(app.confirm_delete, None);
+}
+
+#[test]
 fn ctrl_t_m_opens_dir_focused() {
     let mut app = App {
         space: "/repo".into(),
