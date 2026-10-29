@@ -312,7 +312,7 @@ pub(crate) fn reconcile(name: &str, state: &mut State) -> Res<bool> {
     }
     state.status = Status::Failed;
     write_json(&thread_dir(name).join("state.json"), state)?;
-    log(name, "stale: no live claude, marked failed");
+    log(name, "stale: no live agent, marked failed");
     Ok(true)
 }
 
