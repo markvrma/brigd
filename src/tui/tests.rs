@@ -1,6 +1,8 @@
 use super::sidebar::flatten;
+use super::tabs::Tabs;
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
+use super::threads::fresh_name;
 use super::*;
 
 fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
