@@ -1,13 +1,17 @@
 use super::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use super::flowplan::{flow_lines, SPIN};
 use super::input::key_bytes;
-use super::sidebar::flatten;
-use super::sidebar::hit;
+use super::markdown::{diff_lines, md_text};
+use super::newt::chunk;
+use super::sidebar::{flatten, hit};
+use super::sidebar::{layout, max_offset};
+use super::tabs::pane_rects;
 use super::tabs::Tabs;
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
-use super::threads::fresh_name;
-use super::threads::Act;
+use super::threads::{fresh_name, Act};
 use super::*;
+use ratatui::style::Modifier;
 
 fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, m)
