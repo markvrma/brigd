@@ -16,7 +16,7 @@ mod tui;
 
 use crate::engine::{reconcile, run_in_tui, thread_busy};
 use crate::flow::{flow_from_json, flow_text, plan, print_flow, read_flow, SKILL};
-use crate::launch::{background, launch_bg, resume_how, tui_alive, How};
+use crate::launch::{background, launch_bg, resume_how, tui_alive, ResumeMode};
 use crate::store::{
     ago, check_new_thread, create_thread, load, now, output_path, root, thread_dir, write_json,
     Flow,
@@ -75,68 +75,75 @@ fn real_main() -> Res<()> {
     args.retain(|a| a != "--bg");
     let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     let bg = background(bg_flag, tty, |k| env::var(k).ok());
-    let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    match a.as_slice() {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match argv.as_slice() {
         [] => tui::run(None),
         ["stray", ..] => stray(&args[1..]),
         ["help" | "-h" | "--help"] => {
             println!("{USAGE}");
             Ok(())
         }
-        ["ls"] => ls(),
-        ["status", name] => status(name),
-        ["resume", name] => {
-            let (flow, state) = load(name)?;
-            if state.status == "done" {
-                return Err(format!("thread {name} is already done").into());
-            }
-            // A thread saved with N at the confirm has no FLOWPLAN yet.
-            let plan = thread_dir(name).join("FLOWPLAN");
-            if !plan.exists() {
-                fs::write(plan, flow_text(&flow))?;
-            }
+        ["ls"] => cmd_ls(),
+        ["status", name] => cmd_status(name),
+        ["resume", name] => cmd_resume(name, bg),
+        ["install-skill"] => install_skill(),
+        [name, "--flow", file] => new_thread(name, read_flow(Path::new(file))?, bg),
+        [name, task] if !task.starts_with('-') => cmd_new(name, task, bg),
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// `brigd resume <name>`: run a stopped thread here, queue it for the open TUI, or launch it
+/// in a new terminal (see launch::resume_how).
+fn cmd_resume(name: &str, bg: bool) -> Res<()> {
+    let (flow, state) = load(name)?;
+    if state.status == "done" {
+        return Err(format!("thread {name} is already done").into());
+    }
+    // A thread saved with N at the confirm has no FLOWPLAN yet.
+    let plan = thread_dir(name).join("FLOWPLAN");
+    if !plan.exists() {
+        fs::write(plan, flow_text(&flow))?;
+    }
+    if let Some(pid) = thread_busy(name, &state) {
+        return Err(format!("thread {name} is already running (pid {pid})").into());
+    }
+    if bg && state.status == "queued" {
+        println!("brigd: thread {name} is already queued");
+        return Ok(());
+    }
+    match resume_how(bg, tui_alive()) {
+        ResumeMode::Here => run_in_tui(name, flow, state),
+        ResumeMode::Queue => {
+            // Re-read so a stale snapshot never overwrites a thread that moved on.
+            let mut state = load(name)?.1;
             if let Some(pid) = thread_busy(name, &state) {
                 return Err(format!("thread {name} is already running (pid {pid})").into());
             }
-            if bg && state.status == "queued" {
-                println!("brigd: thread {name} is already queued");
-                return Ok(());
-            }
-            match resume_how(bg, tui_alive()) {
-                How::Here => run_in_tui(name, flow, state),
-                How::Queue => {
-                    // Re-read so a stale snapshot never overwrites a thread that moved on.
-                    let mut state = load(name)?.1;
-                    if let Some(pid) = thread_busy(name, &state) {
-                        return Err(format!("thread {name} is already running (pid {pid})").into());
-                    }
-                    state.status = "queued".into();
-                    state.updated = now();
-                    write_json(&thread_dir(name).join("state.json"), &state)?;
-                    println!("brigd: thread {name} queued; the open brigd TUI runs it");
-                    Ok(())
-                }
-                How::Launch => {
-                    let at = launch_bg(name, &state.repo)?;
-                    println!("brigd: thread {name} running in {at}");
-                    Ok(())
-                }
-            }
+            state.status = "queued".into();
+            state.updated = now();
+            write_json(&thread_dir(name).join("state.json"), &state)?;
+            println!("brigd: thread {name} queued; the open brigd TUI runs it");
+            Ok(())
         }
-        ["install-skill"] => install_skill(),
-        [name, "--flow", file] => new_thread(name, read_flow(Path::new(file))?, bg),
-        [name, task] if !task.starts_with('-') => {
-            check_new_thread(name)?;
-            let task = if io::stdin().is_terminal() && !mentions_prg(task) && ask_prg() {
-                with_prg(task)
-            } else {
-                task.to_string()
-            };
-            eprintln!("planning with opus (brigd-plan)…");
-            new_thread(name, plan(&task, &env::current_dir()?)?, bg)
+        ResumeMode::Launch => {
+            let at = launch_bg(name, &state.repo)?;
+            println!("brigd: thread {name} running in {at}");
+            Ok(())
         }
-        _ => Err(USAGE.into()),
     }
+}
+
+/// `brigd <name> "task"`: plan the task (asking about plan-review-go on a TTY), then new_thread.
+fn cmd_new(name: &str, task: &str, bg: bool) -> Res<()> {
+    check_new_thread(name)?;
+    let task = if io::stdin().is_terminal() && !mentions_prg(task) && ask_prg() {
+        with_prg(task)
+    } else {
+        task.to_string()
+    };
+    eprintln!("planning with opus (brigd-plan)…");
+    new_thread(name, plan(&task, &env::current_dir()?)?, bg)
 }
 
 /// Whether the task already opts into plan-review-go (brigd-plan looks for this name).
@@ -203,7 +210,7 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     }
 }
 
-fn ls() -> Res<()> {
+fn cmd_ls() -> Res<()> {
     let root = thread_dir("");
     let mut rows = Vec::new();
     for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
@@ -241,7 +248,7 @@ fn ls() -> Res<()> {
     Ok(())
 }
 
-fn status(name: &str) -> Res<()> {
+fn cmd_status(name: &str) -> Res<()> {
     let (flow, mut st) = load(name)?;
     let _ = reconcile(name, &mut st);
     println!(

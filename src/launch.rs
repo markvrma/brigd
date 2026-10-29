@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::{env, fs, thread};
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum How {
+pub(crate) enum ResumeMode {
     /// Take over this terminal with the TUI.
     Here,
     /// Mark the thread "queued" for the open TUI to claim.
@@ -19,11 +19,11 @@ pub(crate) enum How {
     Launch,
 }
 
-pub(crate) fn resume_how(bg: bool, tui: bool) -> How {
+pub(crate) fn resume_how(bg: bool, tui: bool) -> ResumeMode {
     match (bg, tui) {
-        (false, _) => How::Here,
-        (true, true) => How::Queue,
-        (true, false) => How::Launch,
+        (false, _) => ResumeMode::Here,
+        (true, true) => ResumeMode::Queue,
+        (true, false) => ResumeMode::Launch,
     }
 }
 
@@ -190,9 +190,9 @@ mod tests {
         assert!(background(false, false, env(&[])));
         assert!(background(false, true, env(&[("CLAUDECODE", "1")])));
         assert!(!background(false, true, env(&[("CLAUDECODE", "")])));
-        assert_eq!(resume_how(false, true), How::Here);
-        assert_eq!(resume_how(true, true), How::Queue);
-        assert_eq!(resume_how(true, false), How::Launch);
+        assert_eq!(resume_how(false, true), ResumeMode::Here);
+        assert_eq!(resume_how(true, true), ResumeMode::Queue);
+        assert_eq!(resume_how(true, false), ResumeMode::Launch);
         let mac = |mut v: Vec<Surface>| {
             if cfg!(target_os = "macos") {
                 v.push(Surface::Terminal);
