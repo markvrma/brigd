@@ -1,9 +1,10 @@
 //! Stray agents: `claude` typed in a brigd terminal tab goes through the ~/.brigd/bin shim
 //! to `brigd stray`, which records the session under <thread>/stray agents/ and then execs claude.
 
+use crate::diffs::record_base;
 use crate::flow::{valid_name, THREAD_MAX};
 use crate::store::{root, thread_dir};
-use crate::{record_base, runner, tree, Res};
+use crate::{runner, tree, Res};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs, io};

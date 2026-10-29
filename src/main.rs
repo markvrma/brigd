@@ -3,6 +3,7 @@
 //! ({flowmap.json,state.json,log} and <agent>/{prompt.md,output.md,status,session}),
 //! so a thread can be listed, inspected and resumed.
 
+mod diffs;
 mod engine;
 mod flow;
 mod launch;
@@ -198,22 +199,6 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
                 println!("saved, not run. `brigd resume {name}` runs it.");
                 return Ok(());
             }
-        }
-    }
-}
-
-/// The commit an agent started from, for its diffs; a relaunch keeps the first one.
-fn record_base(cwd: &Path, dir: &Path) {
-    if !dir.join("base").exists() {
-        if let Some(o) = Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-        {
-            let _ = fs::write(dir.join("base"), &o.stdout);
         }
     }
 }

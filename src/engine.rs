@@ -1,11 +1,12 @@
 //! Running a flow: stage by stage, each agent in its PTY, supervised until it writes its
 //! output.md; plus reconciling dead runs and stopping or terminating agents.
 
+use crate::diffs::record_base;
 use crate::flow::{claude_flags, read_flow, task_prompt};
 use crate::store::{
     home, load, log, now, root, set_agent, thread_dir, update, write_json, Agent, Flow, State,
 };
-use crate::{record_base, runner, tree, tui, Res};
+use crate::{runner, tree, tui, Res};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -314,7 +315,7 @@ pub(crate) fn claimable(status: &str, owner: bool, busy: bool) -> bool {
 }
 
 /// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
-/// files it changed to its base commit (tree::revert), keeps its dir and output.md, and
+/// files it changed to its base commit (diffs::revert), keeps its dir and output.md, and
 /// marks it failed (state.json for a flow agent, the dir's `terminated` file for both).
 /// Returns how many files were reverted.
 pub(crate) fn terminate(thread: &str, agent: &str) -> Res<usize> {
@@ -339,7 +340,7 @@ pub(crate) fn terminate(thread: &str, agent: &str) -> Res<usize> {
         )
     };
     stop_agent(thread, agent)?;
-    let n = tree::revert(&home(), &cwd, &repo, &dir)?;
+    let n = crate::diffs::revert(&home(), &cwd, &repo, &dir)?;
     if let Some(state) = state {
         set_agent(&Mutex::new(state), agent, "failed")?;
     }

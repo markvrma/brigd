@@ -1278,7 +1278,8 @@ impl App {
                     rel: Some(_),
                     ..
                 } => {
-                    if let Some((_, t)) = diff_tick.then(|| tree::diff_view(path)).flatten() {
+                    if let Some((_, t)) = diff_tick.then(|| crate::diffs::diff_view(path)).flatten()
+                    {
                         *text = t;
                     }
                 }
@@ -1636,7 +1637,7 @@ impl App {
                 Some("flow.md") => format!("{title} flow"),
                 _ => title,
             };
-            let tab = match tree::diff_view(&path) {
+            let tab = match crate::diffs::diff_view(&path) {
                 Some((rel, text)) => {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     let agent = path
@@ -2589,7 +2590,7 @@ impl App {
             right.push(Span::styled(wt.clone(), Style::new().fg(pal().overlay0)));
         }
         if let Some((add, del)) = (r.kind == Kind::Diff)
-            .then(|| tree::diff_stat(&r.path))
+            .then(|| crate::diffs::diff_stat(&r.path))
             .flatten()
         {
             right.push(Span::styled(
