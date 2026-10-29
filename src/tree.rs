@@ -297,10 +297,28 @@ fn numstat(out: &str, cwd: &Path) -> HashMap<PathBuf, (String, String)> {
 }
 
 /// The commit an agent started from: <dir>/base (written at launch), else where its
-/// cwd's HEAD forked from the repo's HEAD.
+/// cwd's HEAD forked from the repo's HEAD. If HEAD moved on with commits made before launch
+/// (a `git pull`), the newest of those becomes the base, so pulled changes aren't the agent's.
 fn base(cwd: &Path, repo: &Path, dir: &Path) -> Option<String> {
-    if let Ok(b) = fs::read_to_string(dir.join("base")) {
-        return Some(b.trim().to_string());
+    let file = dir.join("base");
+    if let Ok(b) = fs::read_to_string(&file) {
+        let b = b.trim().to_string();
+        let launch = fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+        let moved = git(cwd, &["rev-parse", "HEAD"]).is_some_and(|h| h.trim() != b);
+        if let (true, Some(launch)) = (moved, launch) {
+            // strictly before the launch second: a commit in that second counts as the agent's
+            let before = format!("--before={}", launch.as_secs().saturating_sub(1));
+            if let Some(c) = git(cwd, &["rev-list", "-1", &before, "HEAD"]) {
+                let c = c.trim();
+                if !c.is_empty() && git(cwd, &["merge-base", "--is-ancestor", &b, c]).is_some() {
+                    return Some(c.to_string());
+                }
+            }
+        }
+        return Some(b);
     }
     let head = git(repo, &["rev-parse", "HEAD"])?;
     Some(
@@ -1089,5 +1107,56 @@ mod tests {
             format!("{STRAY}/stray-1")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn base_skips_commits_pulled_after_launch() {
+        let d = tmp("pulled");
+        let (cwd, dir) = (d.join("repo"), d.join("agent"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        let g = |date: u64, a: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(&cwd)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(a)
+                .env("GIT_COMMITTER_DATE", format!("@{date} +0000"))
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
+        let a = cwd.join("a.rs");
+        g(0, &["init", "-q"]);
+        fs::write(&a, "one\n").unwrap();
+        g(0, &["add", "."]);
+        g(1_000_000_000, &["commit", "-qm", "init"]);
+        fs::write(dir.join("base"), git(&cwd, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+        let launch = fs::metadata(dir.join("base"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let diff = || {
+            git(
+                &cwd,
+                &["diff", &base(&cwd, &cwd, &dir).unwrap(), "--", "a.rs"],
+            )
+            .unwrap()
+        };
+        // the agent pulls a commit made upstream before it launched, then edits a.rs
+        fs::write(&a, "one\npulled\n").unwrap();
+        g(launch - 100, &["commit", "-qam", "upstream"]);
+        fs::write(&a, "one\npulled\nmine\n").unwrap();
+        let d1 = diff();
+        assert!(d1.contains("+mine") && !d1.contains("+pulled"), "{d1}");
+        // a commit the agent makes itself (after launch) still shows
+        g(launch + 100, &["commit", "-qam", "agent"]);
+        let d2 = diff();
+        assert!(d2.contains("+mine") && !d2.contains("+pulled"), "{d2}");
+        let _ = fs::remove_dir_all(&d);
     }
 }
