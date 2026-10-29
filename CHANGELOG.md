@@ -13,9 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New thread in any directory: the header `＋` or `C-t m`; the new-thread dialog has an editable dir field.
 - Tabs have a `×` close button and a left-side fade.
 
+### Changed
+
+- The source is split into modules (`store`, `flow`, `engine`, `launch`, `stray`, `diffs`, `transcript`, and `tui/` as a directory); see CONTRIBUTING.md. No user-visible change.
+- Statuses are typed: `state.json` accepts `"stopped"` (written by the brigd-resume skill) and keeps any other hand-written status as is, instead of failing to load. An empty status reads, and is written back, as `"pending"`.
+
+### Removed
+
+- The legacy `flow.json` fallback: a thread directory needs `flowmap.json`. (`--flow <file>` is unchanged.)
+
 ### Fixed
 
 - `brigd install-skill` now also installs `brigd-resume` and `find-skills` (which `plan-review-go` relies on).
+- Agent diffs no longer count commits the agent pulled in (e.g. `git pull`) after it launched as its own changes.
 
 ## [0.1.0] - unreleased
 

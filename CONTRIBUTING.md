@@ -21,12 +21,21 @@ Agents run with `--permission-mode auto`, so try flows in a throwaway repo. Neve
 
 ## Code layout
 
+Each module only imports the ones listed below it, so a file can be read without its callers.
+
 | File | What lives there |
 |---|---|
-| `src/main.rs` | CLI, flow/thread state on disk (`~/.brigd/threads/<name>/`), planning, stage scheduling, `--bg` launchers |
+| `src/main.rs` | CLI: argument dispatch, `ls`/`status`/`resume`, new threads, `install-skill`; the "flow" glossary |
+| `src/tui/` | ratatui UI. `mod.rs` holds `App`, the run loop and the contracts (draw order, key precedence, locks); `draw`, `input`, `sidebar`, `tabs`, `newt` (new-thread window), `threads` (thread/agent actions), `flowplan` (FLOWPLAN and flow.md rendering), `markdown`, `term`, `theme`, `tests` |
+| `src/engine.rs` | Running a flow: stages, supervising each agent until its output.md, reconcile, terminate/stop |
+| `src/stray.rs` | The `claude` shim and stray sessions started inside brigd terminals |
+| `src/launch.rs` | `--bg`: starting `brigd resume` in herdr, tmux or Terminal, or handing it to the open TUI (`tui.pid`) |
 | `src/runner.rs` | One agent = one PTY child; reader thread feeds a vt100 parser; status via claude hooks |
 | `src/tree.rs` | Sidebar tree read from disk: repo, thread, agent, outputs, changed files |
-| `src/tui.rs` | ratatui UI: sidebar, panes, tab bars, modals, key prefixes, themes |
+| `src/diffs.rs` | Agent diffs: the base commit, `git diff` listings and views, sealing, revert |
+| `src/transcript.rs` | Claude transcript files: status, changed files, final text, subagent mirroring |
+| `src/flow.rs` | The flow definition: schema, validation, the planner call, prompt.md, claude flags |
+| `src/store.rs` | Thread data on disk (`~/.brigd/threads/<name>/`): `Flow`, `State`, `Status`, thread names, create/archive/delete |
 | `skills/brigd-plan/` | The `brigd-plan` Claude Code skill, embedded into the binary and installed by `brigd install-skill` |
 
 ## Commit style
