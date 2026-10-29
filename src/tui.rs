@@ -1568,7 +1568,7 @@ impl App {
             cmd.env("BRIGD_THREAD", t);
             cmd.env("BRIGD_TERM", &name); // stray() records it, so the terminal row can show this shell's claude
         }
-        if let (Ok(bin), Ok(shim)) = (env::current_exe(), crate::ensure_shim()) {
+        if let (Ok(bin), Ok(shim)) = (env::current_exe(), crate::stray::ensure_shim()) {
             let path = env::var_os("PATH").unwrap_or_default();
             if let Ok(p) =
                 env::join_paths([shim.clone()].into_iter().chain(env::split_paths(&path)))
