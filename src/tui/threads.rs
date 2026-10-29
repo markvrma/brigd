@@ -197,7 +197,7 @@ impl App {
             self.thread.clear(); // not a thread any more: reflow re-picks the first one
             self.reflow();
         }
-        self.focus_main &= self.cur().is_some();
+        self.focus_main &= self.active_tab().is_some();
         self.paused.remove(thread);
     }
 

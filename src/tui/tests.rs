@@ -6,7 +6,7 @@ use super::newt::chunk;
 use super::sidebar::{flatten, hit};
 use super::sidebar::{layout, max_offset};
 use super::tabs::pane_rects;
-use super::tabs::Tabs;
+use super::tabs::Pane;
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
 use super::threads::{fresh_name, Act};
@@ -17,9 +17,9 @@ fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, m)
 }
 
-fn one_pane(list: Vec<Tab>) -> Panes {
-    Panes {
-        list: vec![Tabs {
+fn one_pane(list: Vec<Tab>) -> ThreadPanes {
+    ThreadPanes {
+        list: vec![Pane {
             list,
             ..Default::default()
         }],
@@ -259,7 +259,7 @@ fn tab_x_closes_that_tab() {
     let mut app = App::default();
     app.tabs
         .insert(String::new(), one_pane((0..3).map(view).collect()));
-    app.pane().active = 1;
+    app.focused_pane().active = 1;
     let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
     term.draw(|f| app.draw(f)).unwrap();
     let (_, x1, _) = app.tabs[""].list[0].spans[2];
@@ -532,7 +532,7 @@ fn split_gives_new_pane_own_tab_bar() {
     app.open_view("t".into(), PathBuf::from("/nope/1"));
     app.open_view("t".into(), PathBuf::from("/nope/2"));
     let p = app.tabs.get_mut("t").unwrap();
-    p.list.push(Tabs::default()); // what split does, then new_term; a viewer stands in for the shell
+    p.list.push(Pane::default()); // what split does, then new_term; a viewer stands in for the shell
     p.focus = 1;
     app.open_view("t".into(), PathBuf::from("/nope/3"));
     let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 20)).unwrap();
@@ -995,7 +995,7 @@ fn drag_copies_selection() {
         side: Rect::new(0, 0, 5, 3),
         ..App::default()
     };
-    app.pane().body = Rect::new(5, 0, 13, 3);
+    app.focused_pane().body = Rect::new(5, 0, 13, 3);
     let ev = |kind, x, y| MouseEvent {
         kind,
         column: x,
@@ -1028,7 +1028,7 @@ fn drag_copies_selection() {
 fn divider_drag_resizes() {
     let mut app = App::default();
     (app.side, app.divider) = (Rect::new(0, 0, 40, 5), Rect::new(40, 0, 1, 5));
-    app.pane().body = Rect::new(41, 0, 40, 5);
+    app.focused_pane().body = Rect::new(41, 0, 40, 5);
     let ev = |kind, x| MouseEvent {
         kind,
         column: x,
@@ -1060,7 +1060,7 @@ fn sidebar_drag_selects_nothing() {
         side: Rect::new(0, 0, 5, 2),
         ..App::default()
     };
-    app.pane().body = Rect::new(5, 0, 13, 2);
+    app.focused_pane().body = Rect::new(5, 0, 13, 2);
     let ev = |kind, x, y| MouseEvent {
         kind,
         column: x,

@@ -234,7 +234,7 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') if sel == Some((true, true)) => {
                 self.toggle(self.sel)
             }
-            KeyCode::Tab => self.focus_main = self.cur().is_some(),
+            KeyCode::Tab => self.focus_main = self.active_tab().is_some(),
             KeyCode::Char('q') => self.ask_quit(),
             _ => {}
         }

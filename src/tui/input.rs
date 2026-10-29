@@ -210,7 +210,7 @@ impl App {
         if !self.focus_main {
             return self.side_key(k);
         }
-        match self.cur() {
+        match self.active_tab() {
             Some(Tab::Term { live, .. }) => {
                 let app_cursor = live.parser.lock().unwrap().screen().application_cursor();
                 self.send(&key_bytes(k, app_cursor));
@@ -365,7 +365,7 @@ impl App {
                         if let Some((prev, i)) = close {
                             self.close_tab();
                             // A neighbour closed: keep the tab that was showing (i == prev picks its own successor).
-                            let t = self.pane();
+                            let t = self.focused_pane();
                             if i != prev {
                                 t.active = prev - (i < prev) as usize;
                             }
@@ -439,7 +439,7 @@ impl App {
         if self.confirm_run.is_some() || !self.focus_main {
             return;
         }
-        let Some(Tab::Term { live, .. }) = self.cur() else {
+        let Some(Tab::Term { live, .. }) = self.active_tab() else {
             return;
         };
         let bracketed = live.parser.lock().unwrap().screen().bracketed_paste();

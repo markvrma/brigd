@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
 
+/// What a tab shows: an agent's (or shell's) live terminal, or a read-only file/diff viewer.
 pub(super) enum Tab {
     Term {
         thread: String,
@@ -26,8 +27,9 @@ pub(super) enum Tab {
     },
 }
 
+/// One pane: a tab bar and its tabs, `active` the one shown.
 #[derive(Default)]
-pub(super) struct Tabs {
+pub(super) struct Pane {
     pub(super) list: Vec<Tab>,
     pub(super) active: usize,
     // From the last draw: the pane's tab bar, its body, and each shown tab's (x0, x1, index).
@@ -37,21 +39,21 @@ pub(super) struct Tabs {
 }
 
 /// A thread's panes, left to right (1 or 2, never 0), and the focused one.
-pub(super) struct Panes {
-    pub(super) list: Vec<Tabs>,
+pub(super) struct ThreadPanes {
+    pub(super) list: Vec<Pane>,
     pub(super) focus: usize,
 }
 
-impl Default for Panes {
+impl Default for ThreadPanes {
     fn default() -> Self {
-        Panes {
-            list: vec![Tabs::default()],
+        ThreadPanes {
+            list: vec![Pane::default()],
             focus: 0,
         }
     }
 }
 
-impl Panes {
+impl ThreadPanes {
     /// (pane, tab) of the first tab matching `f`: an open tab is focused, never shown twice.
     fn find(&self, f: impl Fn(&Tab) -> bool) -> Option<(usize, usize)> {
         self.list
@@ -86,7 +88,7 @@ pub(super) fn pane_rects(main: Rect, n: usize) -> Vec<(Rect, Rect)> {
 /// Tabs per tab bar; opening one more closes the oldest opened (its agent keeps running).
 const MAX_TABS: usize = 5;
 
-fn push_tab(tabs: &mut Tabs, tab: Tab) {
+fn push_tab(tabs: &mut Pane, tab: Tab) {
     tabs.list.push(tab);
     while tabs.list.len() > MAX_TABS {
         tabs.list.remove(0);
@@ -244,7 +246,7 @@ impl App {
                     self.shell_thread.insert((thread.clone(), name.clone()), t);
                 }
                 push_tab(
-                    self.pane(),
+                    self.focused_pane(),
                     Tab::Term {
                         thread,
                         agent: name,
@@ -321,7 +323,7 @@ impl App {
     }
 
     /// The shown thread's focused pane.
-    pub(super) fn pane(&mut self) -> &mut Tabs {
+    pub(super) fn focused_pane(&mut self) -> &mut Pane {
         let p = self.tabs.entry(self.thread.clone()).or_default();
         &mut p.list[p.focus]
     }
@@ -335,14 +337,15 @@ impl App {
         pane_rects(self.main, n)[focus].1
     }
 
-    pub(super) fn cur(&mut self) -> Option<&mut Tab> {
+    /// The focused pane's shown tab.
+    pub(super) fn active_tab(&mut self) -> Option<&mut Tab> {
         let p = self.tabs.get_mut(&self.thread)?;
         let t = &mut p.list[p.focus];
         t.list.get_mut(t.active)
     }
 
     pub(super) fn cycle(&mut self, d: isize) {
-        let t = self.pane();
+        let t = self.focused_pane();
         if !t.list.is_empty() {
             t.active = (t.active as isize + d).rem_euclid(t.list.len() as isize) as usize;
             self.focus_main = true;
@@ -372,10 +375,10 @@ impl App {
         if p.list.len() >= 2 {
             return self.flash("max 2 panes");
         }
-        p.list.push(Tabs::default());
+        p.list.push(Pane::default());
         p.focus = 1;
         self.new_term();
-        if self.cur().is_none() {
+        if self.active_tab().is_none() {
             self.close_tab(); // the shell failed to start: drop the empty pane
         }
     }
@@ -414,7 +417,7 @@ impl App {
     }
 
     pub(super) fn send(&mut self, bytes: &[u8]) {
-        let Some(Tab::Term { live, .. }) = self.cur() else {
+        let Some(Tab::Term { live, .. }) = self.active_tab() else {
             return;
         };
         let live = live.clone();

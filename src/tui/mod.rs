@@ -32,7 +32,7 @@ mod threads;
 pub use flowplan::plan_lines;
 use newt::{Bg, Newt};
 use sidebar::{NodeKey, Row};
-use tabs::{Panes, Tab};
+use tabs::{Tab, ThreadPanes};
 use term::{copy_to_clipboard, setup, teardown};
 use theme::{init_theme, pal};
 use threads::{add_terminals, agent_glyph_status, live_agents, stray_status, Menu};
@@ -55,7 +55,7 @@ struct App {
     space: PathBuf,
     /// The thread whose tabs show.
     thread: String,
-    tabs: BTreeMap<String, Panes>,
+    tabs: BTreeMap<String, ThreadPanes>,
     /// (thread, agent) -> running / blocked / done / failed / off
     agent_status: HashMap<(String, String), &'static str>,
     /// thread dir -> state.json status

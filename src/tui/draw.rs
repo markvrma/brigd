@@ -296,7 +296,7 @@ impl App {
             self.draw_pane(f, j, bar, body);
         }
 
-        let viewing = matches!(self.cur(), Some(Tab::View { .. }));
+        let viewing = matches!(self.active_tab(), Some(Tab::View { .. }));
         let text = match &self.msg {
             Some((m, t)) if t.elapsed() < Duration::from_secs(5) => Span::styled(m.clone(), Style::new().fg(pal().yellow)),
             _ if self.confirm_delete.is_some() => Span::styled(
