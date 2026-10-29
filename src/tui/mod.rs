@@ -27,39 +27,21 @@ use tui_term::widget::PseudoTerminal;
 
 mod flowplan;
 mod markdown;
+mod sidebar;
 mod term;
 mod theme;
 pub use flowplan::plan_lines;
 use flowplan::{flow_lines, SPIN};
 use markdown::{diff_lines, md_text};
+use sidebar::{hit, layout, max_offset, NodeKey, Row};
 use term::{copy_to_clipboard, sel_rows, sel_text, setup, teardown};
 use theme::{init_theme, next_theme, pal, stage_color};
 
 const SIDE_W: u16 = 40;
 const MIN_SIDE_W: u16 = 12;
-/// Sidebar columns per tree level.
-const INDENT: usize = 3;
 const REFRESH: Duration = Duration::from_millis(700);
 /// Run-log lines the FLOWPLAN view shows under the plan.
 const LOG_TAIL: usize = 15;
-
-/// (space, node path): what a fold toggle remembers.
-type NodeKey = (PathBuf, PathBuf);
-
-struct Row {
-    depth: usize,
-    kind: Kind,
-    label: String,
-    path: PathBuf,
-    space: PathBuf,
-    /// Agents: the thread they belong to.
-    thread: String,
-    /// Has children, so it shows a fold arrow.
-    folder: bool,
-    open: bool,
-    stage: Option<usize>,
-    worktree: Option<String>,
-}
 
 enum Tab {
     Term {
@@ -412,88 +394,6 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
     }
 }
 
-fn flatten(
-    n: &Node,
-    depth: usize,
-    space: &Path,
-    thread: &str,
-    toggled: &HashSet<NodeKey>,
-    out: &mut Vec<Row>,
-) {
-    let folder = !n.children.is_empty();
-    let default_open = matches!(n.kind, Kind::Space | Kind::Folder);
-    let open = folder && default_open != toggled.contains(&(space.into(), n.path.clone()));
-    let thread = if n.kind == Kind::Thread {
-        n.label.as_str()
-    } else {
-        thread
-    };
-    out.push(Row {
-        depth,
-        kind: n.kind.clone(),
-        label: n.label.clone(),
-        path: n.path.clone(),
-        space: space.into(),
-        thread: thread.into(),
-        folder,
-        open,
-        stage: n.stage,
-        worktree: n.worktree.clone(),
-    });
-    if open {
-        n.children
-            .iter()
-            .for_each(|c| flatten(c, depth + 1, space, thread, toggled, out));
-    }
-}
-
-/// The rows that fit in `h` sidebar lines from row `offset`, as (line, row index).
-/// A blank line goes above each space and each thread but a space's first.
-fn layout(rows: &[Row], offset: usize, h: usize) -> Vec<(usize, usize)> {
-    let mut y = 0;
-    let mut out = vec![];
-    for (i, r) in rows.iter().enumerate().skip(offset) {
-        if i > offset
-            && (r.kind == Kind::Space || r.kind == Kind::Thread && rows[i - 1].kind != Kind::Space)
-        {
-            y += 1;
-        }
-        if y >= h {
-            break;
-        }
-        out.push((y, i));
-        y += 1;
-    }
-    out
-}
-
-/// The smallest offset that still shows the last row in `h` lines.
-fn max_offset(rows: &[Row], h: usize) -> usize {
-    (0..rows.len())
-        .find(|&o| {
-            layout(rows, o, h)
-                .last()
-                .is_some_and(|&(_, i)| i + 1 == rows.len())
-        })
-        .unwrap_or(0)
-}
-
-/// The sidebar row under a click, and whether the click hit its fold arrow.
-fn hit(inner: Rect, offset: usize, rows: &[Row], col: u16, row: u16) -> Option<(usize, bool)> {
-    if !inner.contains(Position { x: col, y: row }) {
-        return None;
-    }
-    let dy = (row - inner.y) as usize;
-    let i = layout(rows, offset, inner.height as usize)
-        .into_iter()
-        .find(|&(y, _)| y == dy)?
-        .1;
-    let r = &rows[i];
-    let arrow_x = (r.depth * INDENT) as u16;
-    let x = col - inner.x;
-    Some((i, r.folder && x >= arrow_x && x < arrow_x + 2))
-}
-
 /// A key as the bytes a terminal would send. `app_cursor` = DECCKM (arrows as ESC O x).
 fn key_bytes(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
     let (ctrl, alt) = (
@@ -737,106 +637,6 @@ impl App {
                 .map(|l| Line::styled(l.to_string(), Style::new().fg(pal().overlay0))),
         );
         Some(lines)
-    }
-
-    /// Re-flattens the tree (after a refresh or a fold), keeping the selected node.
-    fn reflow(&mut self) {
-        let keep = self
-            .rows
-            .get(self.sel)
-            .map(|r| (r.space.clone(), r.path.clone()));
-        let mut rows = Vec::new();
-        for s in &self.tree {
-            flatten(s, 0, &s.path, "", &self.toggled, &mut rows);
-        }
-        self.rows = rows;
-        if let Some(i) = keep.and_then(|k| {
-            self.rows
-                .iter()
-                .position(|r| (&r.space, &r.path) == (&k.0, &k.1))
-        }) {
-            self.sel = i;
-        }
-        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
-        if self.space.as_os_str().is_empty() {
-            if let Some(r) = self.rows.first() {
-                self.space = r.space.clone();
-            }
-        }
-        if self.thread.is_empty() {
-            if let Some(r) = self.rows.iter().find(|r| r.kind == Kind::Thread) {
-                self.thread = r.label.clone();
-            }
-        }
-    }
-
-    fn move_sel(&mut self, d: isize) {
-        if self.rows.is_empty() {
-            return;
-        }
-        self.sel = (self.sel as isize + d).clamp(0, self.rows.len() as isize - 1) as usize;
-        self.follow(self.sel);
-        let h = (self.side_inner.height as usize).max(1);
-        self.offset = self.offset.min(self.sel);
-        while self.offset < self.sel
-            && !layout(&self.rows, self.offset, h)
-                .iter()
-                .any(|&(_, i)| i == self.sel)
-        {
-            self.offset += 1;
-        }
-    }
-
-    /// Row `i`'s space and (unless it is a space row) thread become the shown ones.
-    fn follow(&mut self, i: usize) {
-        let r = &self.rows[i];
-        self.space = r.space.clone();
-        if !r.thread.is_empty() {
-            self.thread = r.thread.clone();
-        }
-    }
-
-    fn toggle(&mut self, i: usize) {
-        let key = (self.rows[i].space.clone(), self.rows[i].path.clone());
-        if !self.toggled.remove(&key) {
-            self.toggled.insert(key);
-        }
-        self.reflow();
-    }
-
-    /// Click or Enter on row `i`: open an agent's terminal, an output.md viewer or a file's diff; fold anything else.
-    fn activate(&mut self, i: usize, arrow: bool) {
-        if i >= self.rows.len() {
-            return;
-        }
-        self.follow(i);
-        let r = &self.rows[i];
-        match r.kind {
-            Kind::Output | Kind::Diff if !arrow => {
-                let (path, thread) = (r.path.clone(), r.thread.clone());
-                self.open_view(thread, path);
-            }
-            Kind::Agent if !arrow => {
-                let (thread, agent, stage) =
-                    (r.thread.clone(), tree::agent_id(&r.path, &r.label), r.stage);
-                if r.folder && !r.open {
-                    self.toggle(i);
-                }
-                self.open_agent(thread.clone(), &thread, &agent, stage);
-            }
-            Kind::Terminal => {
-                let (key, name) = (r.thread.clone(), r.label.clone());
-                if let Some((a, _)) = self
-                    .live_shells()
-                    .into_iter()
-                    .find(|(a, t)| a.agent == name && *t == key)
-                {
-                    self.open_agent(key, &a.thread, &name, None);
-                }
-            }
-            _ if r.folder => self.toggle(i),
-            _ => {}
-        }
     }
 
     /// Opens registry agent (thread, agent) as a tab in brigd thread `key`'s focused pane
@@ -1634,26 +1434,6 @@ impl App {
         }
     }
 
-    fn side_key(&mut self, k: KeyEvent) {
-        let sel = self.rows.get(self.sel).map(|r| (r.folder, r.open));
-        match k.code {
-            KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
-            KeyCode::PageUp => self.move_sel(-10),
-            KeyCode::PageDown => self.move_sel(10),
-            KeyCode::Enter => self.activate(self.sel, false),
-            KeyCode::Right | KeyCode::Char('l') if sel == Some((true, false)) => {
-                self.toggle(self.sel)
-            }
-            KeyCode::Left | KeyCode::Char('h') if sel == Some((true, true)) => {
-                self.toggle(self.sel)
-            }
-            KeyCode::Tab => self.focus_main = self.cur().is_some(),
-            KeyCode::Char('q') => self.ask_quit(),
-            _ => {}
-        }
-    }
-
     fn on_mouse(&mut self, m: MouseEvent) {
         if self.newt.as_ref().is_some_and(|n| !n.hidden) || self.confirm_run.is_some() {
             return;
@@ -1870,114 +1650,6 @@ impl App {
             s.replace('\n', "\r")
         };
         self.send(bytes.as_bytes());
-    }
-
-    fn row_line(&self, r: &Row, selected: bool, width: usize) -> Line<'static> {
-        let arrow = match (r.folder, r.open) {
-            (false, _) => "  ",
-            (true, true) => "▾ ",
-            (true, false) => "▸ ",
-        };
-        let mut spans = vec![Span::raw(format!(
-            "{}{arrow}",
-            " ".repeat(r.depth * INDENT)
-        ))];
-        let mut label = Style::new();
-        match r.kind {
-            Kind::Agent | Kind::Terminal => {
-                // A terminal shows "$" unless claude runs in it (refresh puts that status in agent_status).
-                let st = self
-                    .agent_status
-                    .get(&(r.thread.clone(), r.label.clone()))
-                    .copied()
-                    .unwrap_or(if r.kind == Kind::Terminal { "$" } else { "off" });
-                let (g, style) = match st {
-                    "$" => ("$ ", Style::new().fg(pal().green)),
-                    "running" => ("● ", Style::new().fg(pal().green)),
-                    "idle" => ("◦ ", Style::new().fg(pal().green)),
-                    "blocked" => (
-                        "! ",
-                        Style::new()
-                            .fg(pal().red)
-                            .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-                    ),
-                    "done" => ("✓ ", Style::new().fg(pal().blue)),
-                    "failed" => ("✗ ", Style::new().fg(pal().red)),
-                    _ => ("○ ", Style::new().fg(pal().overlay0)),
-                };
-                label = if st == "blocked" {
-                    style
-                } else if r.kind == Kind::Terminal {
-                    label.fg(pal().text)
-                } else {
-                    label.fg(stage_color(r.stage))
-                };
-                spans.push(Span::styled(g, style));
-                if let Some(s) = r.stage {
-                    spans.push(Span::styled(
-                        format!("{}·", s + 1),
-                        Style::new().fg(stage_color(r.stage)),
-                    ));
-                }
-            }
-            Kind::Output => label = label.fg(pal().sky),
-            Kind::Diff => label = label.fg(pal().yellow),
-            Kind::Space => label = label.fg(pal().mauve).add_modifier(Modifier::BOLD),
-            Kind::Thread => label = label.fg(pal().text).add_modifier(Modifier::BOLD),
-            _ => label = label.fg(pal().subtext0),
-        }
-        let slash = if matches!(r.kind, Kind::Output | Kind::Diff | Kind::Terminal) {
-            ""
-        } else {
-            "/"
-        };
-        spans.push(Span::styled(format!("{}{slash}", r.label), label));
-        // Worktree name (agents) and +add -del (diffs) sit flush right, one column of padding.
-        let mut right = vec![];
-        if let Some(wt) = &r.worktree {
-            right.push(Span::styled(wt.clone(), Style::new().fg(pal().overlay0)));
-        }
-        if let Some((add, del)) = (r.kind == Kind::Diff)
-            .then(|| crate::diffs::diff_stat(&r.path))
-            .flatten()
-        {
-            right.push(Span::styled(
-                format!("+{add}"),
-                Style::new().fg(pal().green),
-            ));
-            right.push(Span::raw(" "));
-            right.push(Span::styled(format!("-{del}"), Style::new().fg(pal().red)));
-        }
-        if !right.is_empty() {
-            let used: usize = spans
-                .iter()
-                .chain(&right)
-                .map(|s| s.content.chars().count())
-                .sum();
-            spans.push(Span::raw(" ".repeat(width.saturating_sub(used + 1).max(1))));
-            spans.extend(right);
-        }
-        if r.kind == Kind::Thread {
-            let st = self
-                .thread_status
-                .get(&r.path)
-                .map(String::as_str)
-                .unwrap_or("");
-            spans.push(Span::styled(
-                format!(" {st}"),
-                Style::new().fg(pal().overlay0),
-            ));
-        }
-        let line = Line::from(spans);
-        match (selected, self.focus_main) {
-            (true, false) => line.style(Style::new().add_modifier(Modifier::REVERSED)),
-            (true, true) => line.style(Style::new().bg(pal().surface1)),
-            // The space (repo) whose tabs show.
-            _ if r.kind == Kind::Space && r.space == self.space => {
-                line.style(Style::new().bg(pal().surface0))
-            }
-            _ => line,
-        }
     }
 
     /// Pane `j` of the shown thread: its tab bar (the thread name first on pane 0), then the active tab.

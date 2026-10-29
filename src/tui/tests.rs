@@ -1,3 +1,4 @@
+use super::sidebar::flatten;
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
 use super::*;
