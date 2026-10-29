@@ -14,6 +14,11 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// How long a cached git listing is trusted before git is asked again.
+const GIT_RECHECK: Duration = Duration::from_secs(3);
+/// How long after output.md is written the transcript counts as settled and the diffs get sealed.
+const SEAL_AFTER: Duration = Duration::from_secs(10);
+
 /// Transcript path → (bytes parsed, up to the last full line; files it changed so far).
 static PARSED: Mutex<BTreeMap<PathBuf, (u64, Vec<PathBuf>)>> = Mutex::new(BTreeMap::new());
 
@@ -211,12 +216,12 @@ pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
 fn refresh_listing(cwd: &Path, repo: &Path, dir: &Path, sealed: &Path) -> Listing {
     let mut names = NAMES.lock().unwrap();
     let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
-    if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
+    if entry.1.is_none() || entry.0.elapsed() >= GIT_RECHECK {
         // first check: backdate by a stable per-dir 0–3s phase so agents' rechecks spread out
         let mut h = DefaultHasher::new();
         dir.hash(&mut h);
         let phase = Duration::from_millis(if entry.1.is_none() {
-            h.finish() % 3000
+            h.finish() % GIT_RECHECK.as_millis() as u64
         } else {
             0
         });
@@ -236,7 +241,7 @@ fn refresh_listing(cwd: &Path, repo: &Path, dir: &Path, sealed: &Path) -> Listin
         // done ≥10s ago (transcript settled) after a good git pass, or cwd gone: seal
         let old = fs::metadata(dir.join("output.md"))
             .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= Duration::from_secs(10)));
+            .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= SEAL_AFTER));
         if (entry.1.is_some() && old) || !cwd.exists() {
             let _ = fs::create_dir_all(dir.join(".diff")).and_then(|_| fs::write(sealed, ""));
         }

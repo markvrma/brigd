@@ -185,6 +185,17 @@ fn ensure_worktree(repo: &Path, thread: &str, key: &str) -> Res<PathBuf> {
     Ok(path)
 }
 
+/// supervise's clock: one tick per second.
+const TICK: Duration = Duration::from_secs(1);
+/// Ticks between subagent syncs.
+const SYNC_EVERY: u32 = 5;
+/// Ticks after a nudge before idle counts again (a nudge needs a moment to show as working).
+const NUDGE_COOLDOWN: u32 = 30;
+/// Idle ticks in a row before an agent counts as stopped.
+const IDLE_DEBOUNCE: u32 = 3;
+/// Between typing the nudge and its Enter, so the Enter is not read as part of a paste.
+const PASTE_GAP: Duration = Duration::from_millis(300);
+
 /// Drives one agent to completion: done = output.md exists once it is idle (or exited).
 /// One nudge when it goes idle without output. Blocked prompts are left for the user.
 fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mutex<State>) -> bool {
@@ -200,9 +211,9 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
     let sync = || transcript::sync_agent(&home, &live.cwd, &live.dir);
     let (mut tick, mut idle_for, mut nudged_at, mut blocked) = (0u32, 0, None::<u32>, false);
     let ok = loop {
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(TICK);
         tick += 1;
-        if tick % 5 == 0 {
+        if tick % SYNC_EVERY == 0 {
             sync();
         }
         let (alive, status) = (live.alive(), live.status());
@@ -234,13 +245,13 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             let _ = set_agent(state, &a.name, "running");
         }
         // "starting" (e.g. a trust dialog) and "working" just wait. A nudge needs a moment to show as working.
-        if status != "idle" || nudged_at.is_some_and(|t| tick - t < 30) {
+        if status != "idle" || nudged_at.is_some_and(|t| tick - t < NUDGE_COOLDOWN) {
             idle_for = 0;
             continue;
         }
         idle_for += 1;
         // ponytail: fixed 3s debounce on idle; Stop hooks are exact, the transcript fallback is not.
-        if idle_for < 3 {
+        if idle_for < IDLE_DEBOUNCE {
             continue;
         }
         if nudged_at.is_some() {
@@ -254,7 +265,7 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
         idle_for = 0;
         log(thread, &format!("{} idle without output, nudging", a.name));
         let typed = live.write(nudge.as_bytes()).and_then(|_| {
-            thread::sleep(Duration::from_millis(300)); // separate Enter so it is not read as part of a paste
+            thread::sleep(PASTE_GAP);
             live.write(b"\r")
         });
         if let Err(e) = typed {
@@ -340,6 +351,11 @@ pub(crate) fn terminate(thread: &str, agent: &str) -> Res<usize> {
     Ok(n)
 }
 
+/// stop_agent polls every KILL_POLL for KILL_POLLS polls, sending SIGKILL at poll KILL_ESCALATE.
+const KILL_POLL: Duration = Duration::from_millis(100);
+const KILL_POLLS: u32 = 40;
+const KILL_ESCALATE: u32 = 20;
+
 /// Kills `agent`'s claude (its LiveAgent, or a stray's pid) and waits for it to be gone.
 /// Marks it `terminated` first, so a supervise thread that sees it die does not report it done.
 fn stop_agent(thread: &str, agent: &str) -> Res<()> {
@@ -353,7 +369,7 @@ fn stop_agent(thread: &str, agent: &str) -> Res<()> {
         let _ = Command::new("kill").arg(pid.trim()).status();
     }
     // Wait for the process to be gone so it cannot rewrite a file after the revert.
-    for i in 0..40 {
+    for i in 0..KILL_POLLS {
         if !runner::live(thread, agent).is_some_and(|l| l.alive())
             && !pid
                 .as_ref()
@@ -361,12 +377,12 @@ fn stop_agent(thread: &str, agent: &str) -> Res<()> {
         {
             break;
         }
-        if i == 20 {
+        if i == KILL_ESCALATE {
             if let Some(pid) = &pid {
                 let _ = Command::new("kill").args(["-9", pid.trim()]).status(); // ignored SIGTERM
             }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(KILL_POLL);
     }
     let _ = fs::remove_file(dir.join("pid"));
     Ok(())
