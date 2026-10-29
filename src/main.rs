@@ -13,6 +13,7 @@
 //! as a tree plus the run log; an agent's flow.md, a mermaid chart of the steps it took;
 //! `--flow <file>`, a hand-written flowmap.json to run; and the `flow` module.
 
+mod agents;
 mod diffs;
 mod engine;
 mod flow;
@@ -28,8 +29,8 @@ use crate::engine::{execute, reconcile, thread_busy};
 use crate::flow::{flow_from_json, plan, read_flow, SKILL};
 use crate::launch::{background, launch_bg, resume_how, tui_alive, ResumeMode};
 use crate::store::{
-    ago, check_new_thread, create_thread, load, now, output_path, root, thread_dir, write_json,
-    Flow, State, Status,
+    ago, check_new_thread, create_thread, home, load, now, output_path, root, thread_dir,
+    write_json, Flow, State, Status, RESERVED,
 };
 use crate::stray::stray;
 use crate::tui::flow_text;
@@ -78,7 +79,7 @@ const USAGE: &str = "usage:
   brigd master                 the master session: tell it what you want, it starts threads
                                (also the TUI's pinned master row; one at a time)
   brigd install-skill          install brigd-plan, plan-review-go, grill-me, grilling, brigd-resume,
-                               find-skills, brigd-master into ~/.claude/skills";
+                               find-skills, brigd-master into each configured agent's skills dir";
 
 fn main() {
     if let Err(e) = real_main() {
@@ -94,6 +95,12 @@ fn real_main() -> Res<()> {
     let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     let bg = background(bg_flag, tty, |k| env::var(k).ok());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Only what plans or runs agents needs the agent config (and its first-run questions).
+    if matches!(argv.as_slice(), [] | ["resume", _] | [_, "--flow", _])
+        || matches!(argv.as_slice(), [name, task] if !RESERVED.contains(name) && !task.starts_with('-'))
+    {
+        agents::init(!bg)?;
+    }
     match argv.as_slice() {
         [] => tui::run(None),
         ["stray", ..] => stray(&args[1..]),
@@ -164,7 +171,7 @@ fn cmd_new(name: &str, task: &str, bg: bool) -> Res<()> {
     } else {
         task.to_string()
     };
-    eprintln!("planning with opus (brigd-plan)…");
+    eprintln!("planning with {} (brigd-plan)…", agents::config().base);
     new_thread(name, plan(&task, &env::current_dir()?)?, bg)
 }
 
@@ -354,11 +361,35 @@ fn cmd_master() -> Res<()> {
     Ok(())
 }
 
+/// Writes SKILLS into each configured agent's skills dir (agents on PATH before the first run, else claude).
 fn install_skill() -> Res<()> {
-    for (name, text) in SKILLS {
-        let dir = PathBuf::from(env::var("HOME")?)
-            .join(".claude/skills")
-            .join(name);
+    let cfg: Option<agents::Config> = fs::read_to_string(root().join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let mut dirs: Vec<PathBuf> = cfg
+        .map_or_else(
+            || {
+                let f: Vec<String> = agents::AGENTS
+                    .iter()
+                    .filter(|a| agents::on_path(a))
+                    .map(|a| a.to_string())
+                    .collect();
+                if f.is_empty() {
+                    vec!["claude".into()]
+                } else {
+                    f
+                }
+            },
+            |c| c.agents,
+        )
+        .iter()
+        .map(|a| agents::skills_dir(a, &home()))
+        .collect();
+    dirs.push(agents::skills_dir("claude", &home()));
+    dirs.sort();
+    dirs.dedup();
+    for (dir, (name, text)) in dirs.iter().flat_map(|d| SKILLS.iter().map(move |s| (d, s))) {
+        let dir = dir.join(name);
         fs::create_dir_all(&dir)?;
         fs::write(dir.join("SKILL.md"), text)?;
         println!("installed {}", dir.join("SKILL.md").display());

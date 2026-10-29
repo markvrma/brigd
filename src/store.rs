@@ -14,6 +14,9 @@ use std::{env, fs, io};
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Agent {
     pub(crate) name: String,
+    /// The coding agent (agents::AGENTS) that runs it; absent in older flowmaps = claude.
+    #[serde(default = "default_agent")]
+    pub(crate) agent: String,
     pub(crate) model: String,
     pub(crate) effort: String,
     #[serde(default)]
@@ -27,6 +30,10 @@ pub(crate) struct Agent {
 
 fn default_mode() -> String {
     "acceptEdits".into()
+}
+
+fn default_agent() -> String {
+    "claude".into()
 }
 
 #[derive(Serialize, Deserialize, Clone)]

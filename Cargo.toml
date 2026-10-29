@@ -2,7 +2,7 @@
 name = "brigd"
 version = "0.1.0"
 edition = "2021"
-description = "Plan a staged flow of Claude agents and run each one in its own PTY"
+description = "Plan a staged flow of coding agents (claude, codex, pi, kimi) and run each one in its own PTY"
 license = "MIT"
 authors = ["Mark Verma"]
 repository = "https://github.com/markvrma/brigd"

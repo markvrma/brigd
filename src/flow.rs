@@ -2,6 +2,7 @@
 //! one, and the text derived from it (each agent's prompt.md and claude flags; FLOWPLAN's is
 //! tui::flow_text).
 
+use crate::agents::{self, AGENTS};
 use crate::store::{output_path, thread_dir, valid_name, Agent, Flow};
 use crate::Res;
 use std::collections::{HashMap, HashSet};
@@ -20,9 +21,10 @@ const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required"
 "properties":{"goal":{"type":"string"},
 "stages":{"type":"array","minItems":1,"items":{"type":"array","minItems":1,"items":{
 "type":"object","additionalProperties":false,
-"required":["name","model","effort","worktree","task","files","mode"],
+"required":["name","agent","model","effort","worktree","task","files","mode"],
 "properties":{
 "name":{"type":"string","pattern":"^[a-z][a-z0-9_-]{0,18}$"},
+"agent":{"type":"string","enum":["claude","codex","pi","kimi"]},
 "model":{"type":"string"},
 "effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},
 "worktree":{"type":["string","null"]},
@@ -31,7 +33,7 @@ const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required"
 "mode":{"type":"string","enum":["default","acceptEdits","auto"]}}}}}}}"#;
 
 /// Checks what the schema cannot: at least one stage, no empty stage, unique valid agent
-/// names (not "log"), known effort and mode, valid worktree keys, and at most one editing
+/// names (not "log"), a known agent, effort and mode, valid worktree keys, and at most one editing
 /// agent (WRITE_MODES) per space per stage.
 fn validate(flow: &Flow) -> Result<(), String> {
     if flow.stages.is_empty() {
@@ -59,6 +61,9 @@ fn validate(flow: &Flow) -> Result<(), String> {
             }
             if a.model.trim().is_empty() || a.task.trim().is_empty() {
                 return Err(format!("{who}: model and task are required"));
+            }
+            if !AGENTS.contains(&a.agent.as_str()) {
+                return Err(format!("{who}: agent must be one of {AGENTS:?}"));
             }
             if !EFFORTS.contains(&a.effort.as_str()) {
                 return Err(format!("{who}: effort must be one of {EFFORTS:?}"));
@@ -105,78 +110,72 @@ pub(crate) fn read_flow(path: &Path) -> Result<Flow, String> {
     flow_from_json(&fs::read_to_string(path).map_err(|e| e.to_string())?)
 }
 
-/// Vars Claude Code's Bash tool sets that describe the calling session (seen in its env).
-pub(crate) const PARENT_SESSION_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "AI_AGENT",
-];
-
-/// Runs the planner in `repo` and returns a valid flow. Never prints: the TUI calls it too.
+/// Runs the planner (the base agent, read-only) in `repo` and returns a valid flow. Never
+/// prints: the TUI calls it too.
 pub(crate) fn plan(task: &str, repo: &Path) -> Res<Flow> {
-    let mut prompt = format!("Plan a brigd flow for this task:\n\n{task}");
+    let cfg = agents::config();
+    let base = cfg.base.as_str();
+    let mut prompt = format!(
+        "Plan a brigd flow for this task:\n\n{task}\n\nEnabled agents: {}. Base: {base}.",
+        cfg.agents.join(", ")
+    );
     for attempt in 0..2 {
-        // ponytail: skill text passed as system prompt so it works uninstalled; install-skill is for interactive /brigd-plan.
-        let mut cmd = Command::new("claude");
-        // brigd may run under Claude Code; the planner is a session of its own.
-        PARENT_SESSION_VARS
-            .iter()
-            .for_each(|v| _ = cmd.env_remove(v));
+        // ponytail: skill text passed in the planner call so it works uninstalled; install-skill is for interactive /brigd-plan.
+        let mut cmd = Command::new(base);
+        // brigd may run under an agent session; the planner is a session of its own.
+        agents::parent_session_vars().for_each(|v| _ = cmd.env_remove(v));
         let out = cmd
             .current_dir(repo)
-            .args([
-                "-p",
-                &prompt,
-                "--model",
-                "opus",
-                "--effort",
-                "high",
-                "--output-format",
-                "json",
-            ])
-            .args([
-                "--no-session-persistence",
-                "--json-schema",
-                SCHEMA,
-                "--tools",
-                "Read,Grep,Glob",
-            ])
-            .args(["--append-system-prompt", SKILL, "--permission-mode", "auto"])
+            .args(agents::planner_args(base, &prompt, SKILL, SCHEMA))
             .output()?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-            format!(
-                "planner output not JSON ({e}): {}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        })?;
-        let so = v
-            .get("structured_output")
-            .cloned()
-            .ok_or_else(|| format!("planner returned no structured_output: {v}"))?;
-        let flow: Flow = serde_json::from_value(so.clone())?;
-        match validate(&flow) {
-            Ok(()) => return Ok(flow),
-            Err(e) if attempt == 0 => prompt += &format!("\n\nYour previous flow was invalid: {e}\nPrevious flow: {so}\nReturn a fixed flow."),
-            Err(e) => return Err(format!("planner flow still invalid: {e}\n{}", serde_json::to_string_pretty(&so)?).into()),
+        let flow = planner_json(base, &out.stdout)
+            .map_err(|e| format!("{e}: {}", String::from_utf8_lossy(&out.stderr).trim()))
+            .and_then(|so| {
+                let f = serde_json::from_value::<Flow>(so.clone()).map_err(|e| e.to_string());
+                f.and_then(|f| validate(&f).map(|()| f))
+                    .map_err(|e| format!("{e}\nPrevious flow: {so}"))
+            });
+        match flow {
+            Ok(flow) => return Ok(flow),
+            Err(e) if attempt == 0 => {
+                prompt += &format!("\n\nYour previous flow was invalid: {e}\nReturn a fixed flow.")
+            }
+            Err(e) => return Err(format!("planner flow still invalid: {e}").into()),
         }
     }
     unreachable!()
 }
 
+/// The flow JSON in the planner's stdout: claude's `structured_output`, else the text from
+/// the first '{' to the last '}'.
+fn planner_json(base: &str, stdout: &[u8]) -> Result<serde_json::Value, String> {
+    let s = String::from_utf8_lossy(stdout);
+    if base == "claude" {
+        let v: serde_json::Value =
+            serde_json::from_str(&s).map_err(|e| format!("planner output not JSON ({e})"))?;
+        return v
+            .get("structured_output")
+            .cloned()
+            .ok_or_else(|| format!("planner returned no structured_output: {v}"));
+    }
+    let (Some(i), Some(j)) = (s.find('{'), s.rfind('}')) else {
+        return Err(format!("planner output has no JSON object: {s}"));
+    };
+    serde_json::from_str(&s[i..=j.max(i)]).map_err(|e| format!("planner output not JSON ({e})"))
+}
+
 /// The last line of the plan in FLOWPLAN; the run log follows it.
 pub(crate) const LOG_MARK: &str = "└  log";
 
-/// The prompt.md for agent `a` in stage `i`: the thread goal, its task and files, the
+/// The prompt.md for agent `a` in stage `i`: a non-claude agent's worker rules, the thread goal, its task and files, the
 /// output.md paths of every earlier agent, the live flowmap.json, and where to write its result.
 pub(crate) fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
-    let mut p = format!(
+    let mut p = if a.agent == "claude" {
+        String::new()
+    } else {
+        format!("{}\n\n", worker_rules(thread, a))
+    };
+    p += &format!(
         "# brigd task: {} (thread {thread}, stage {}/{})\n\nGoal of the whole thread: {}\n\n## Task\n{}\n",
         a.name,
         i + 1,
@@ -211,13 +210,27 @@ pub(crate) fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> Str
     p
 }
 
-/// claude flags for an agent, minus the session/hooks/prompt the runner adds.
-/// Variadic options use --flag=value so they cannot swallow the trailing prompt.
-pub(crate) fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
-    let dir = thread_dir(thread);
-    let sys = format!(
-        "BRIGD WORKER {thread}/{}: do the task. You may use the Task/Agent tool for subagents, \
-         but never run the `claude` CLI or start other claude sessions. \
+/// The BRIGD WORKER rules: do the task, never start other agents, write flow.md then
+/// output.md only when done, else ask the user. claude gets them as its system prompt (asking
+/// with AskUserQuestion, which its hooks report as blocked); the others at the top of prompt.md.
+fn worker_rules(thread: &str, a: &Agent) -> String {
+    let dir = thread_dir(thread).join(&a.name);
+    let (sub, ask) = if a.agent == "claude" {
+        (
+            "You may use the Task/Agent tool for subagents, but never",
+            "ask the user with AskUserQuestion offering 2-4 concrete ways forward (the \
+             user can pick Other to reply in free text and discuss). Never end your turn to wait for a \
+             reply; ask follow-ups with AskUserQuestion.",
+        )
+    } else {
+        (
+            "Never",
+            "ask the user, offering 2-4 concrete ways forward, and wait for the reply.",
+        )
+    };
+    format!(
+        "BRIGD WORKER {thread}/{}: do the task. {sub} run the `claude`, `codex`, `pi` or `kimi` CLI or start other agent sessions \
+         (run `brigd` only when your task says to). \
          When finished, first write {} holding only a ```mermaid code block: one small \
          `flowchart TD` of the steps you took (at most 10 nodes like A[short label], \
          edges only `-->` or `-->|label|`, no styling or subgraphs). \
@@ -225,20 +238,22 @@ pub(crate) fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
          COMPLETION: write flow.md and output.md only when the task is fully done. If you cannot \
          complete it for any reason (missing file/skill/tool/access, failed precondition, an earlier \
          stage's result missing or incomplete, ambiguity that materially changes the result), do NOT \
-         write either file; ask the user with AskUserQuestion offering 2-4 concrete ways forward (the \
-         user can pick Other to reply in free text and discuss). Never end your turn to wait for a \
-         reply; ask follow-ups with AskUserQuestion. If the user says stop or abort, end your turn \
+         write either file; {ask} If the user says stop or abort, end your turn \
          without writing them.",
         a.name,
-        dir.join(&a.name).join("flow.md").display(),
-        dir.join(&a.name).join("output.md").display()
-    );
+        dir.join("flow.md").display(),
+        dir.join("output.md").display()
+    )
+}
+
+/// claude flags for an agent, minus the session/hooks/prompt the runner adds.
+/// Variadic options use --flag=value so they cannot swallow the trailing prompt.
+pub(crate) fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
+    let dir = thread_dir(thread);
     let s = |x: &str| x.to_string();
-    vec![
-        s("--model"),
-        a.model.clone(),
-        s("--effort"),
-        a.effort.clone(),
+    let mut v = agents::model_args(&a.model);
+    v.extend(agents::effort_args("claude", &a.effort));
+    v.extend([
         s("--permission-mode"),
         s("auto"), // every brigd agent runs in auto mode; `mode` only marks editors
         s("-n"),
@@ -248,8 +263,9 @@ pub(crate) fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
         // Edit rules cover every file-writing tool; claude rejects Write(path) rules.
         s("--allowedTools=Read(~/.brigd/threads/**),Edit(~/.brigd/threads/**)"),
         s("--append-system-prompt"),
-        sys,
-    ]
+        worker_rules(thread, a),
+    ]);
+    v
 }
 
 #[cfg(test)]
@@ -259,6 +275,7 @@ pub(crate) mod tests {
     pub(crate) fn agent(name: &str, wt: Option<&str>, mode: &str) -> Agent {
         Agent {
             name: name.into(),
+            agent: "claude".into(),
             model: "haiku".into(),
             effort: "low".into(),
             worktree: wt.map(String::from),
@@ -330,5 +347,28 @@ pub(crate) mod tests {
     #[test]
     fn schema_is_json() {
         serde_json::from_str::<serde_json::Value>(SCHEMA).unwrap();
+    }
+
+    #[test]
+    fn planner_json_shapes() {
+        let v = planner_json(
+            "pi",
+            b"Here it is:\n```json\n{\"goal\":\"g\",\"x\":{}}\n```",
+        )
+        .unwrap();
+        assert_eq!(v["goal"], "g");
+        assert!(planner_json("codex", b"no flow").is_err());
+        let v = planner_json("claude", br#"{"structured_output":{"goal":"c"}}"#).unwrap();
+        assert_eq!(v["goal"], "c");
+        let old: Agent =
+            serde_json::from_str(r#"{"name":"a","model":"m","effort":"low","task":"t"}"#).unwrap();
+        assert_eq!(old.agent, "claude"); // flowmaps from before the agent field
+        let mut a = agent("a", None, "default");
+        a.agent = "gemini".into();
+        let bad = Flow {
+            goal: "g".into(),
+            stages: vec![vec![a]],
+        };
+        assert!(validate(&bad).unwrap_err().contains("agent must be"));
     }
 }

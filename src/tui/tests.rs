@@ -350,6 +350,7 @@ fn flow_md_draws_step_tree() {
 fn flowplan_view_draws_step_tree() {
     let agent = |name: &str, wt: Option<&str>| crate::store::Agent {
         name: name.into(),
+        agent: "claude".into(),
         model: "haiku".into(),
         effort: "low".into(),
         worktree: wt.map(String::from),

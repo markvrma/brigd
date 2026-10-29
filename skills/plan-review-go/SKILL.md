@@ -17,8 +17,7 @@ If the prompt starts with `# brigd task:` and has a `## Flow map` section naming
 flowmap.json path, you are a brigd stage-1 agent. Run steps 0-5 as usual. Step 6
 changes: after the user approves, do NOT implement. Instead:
 
-a. Read the brigd-plan skill (`~/.claude/skills/brigd-plan/SKILL.md`, or
-   `skills/brigd-plan/SKILL.md` in the brigd repo) for its rules.
+a. Read the installed brigd-plan skill (`~/.claude/skills/brigd-plan/SKILL.md` or `~/.agents/skills/brigd-plan/SKILL.md`; in the brigd repo, `skills/brigd-plan/SKILL.md`) for its rules.
 b. Append stages 2..N to the flowmap.json that implement the approved plan. Keep
    every existing stage unchanged.
 c. Re-read the file; check it parses as valid JSON matching the schema: names match
@@ -50,7 +49,7 @@ Keep it tight. No code yet.
 
 ## 2. Ponytail review
 
-Spawn a subagent (Agent tool) to run the over-engineering review — have it
+Use a subagent if your agent has them, else do it yourself, to run the over-engineering review — have it
 invoke the `ponytail:ponytail-review` skill (or review through the ponytail
 lens) on the drafted plan. Pass it the full plan text in the prompt. Ask it:
 what in this plan can be deleted, simplified, or replaced with stdlib/native?
@@ -63,7 +62,7 @@ nothing, note "no changes" and keep the plan as-is. Show the revised plan.
 
 ## 4. Grill the revised plan
 
-Spawn a subagent (Agent tool) to run the grilling — have it invoke the
+Use a subagent if your agent has them, else do it yourself, to run the grilling — have it invoke the
 `grill-me` skill (a `/grilling` session) on the plan as revised in step 3 (the
 version that already folds in ponytail's edits). Pass it the full revised plan
 in the prompt, and instruct it to return the list of questions it generates
@@ -79,7 +78,7 @@ rather than interviewing itself.
 
 ## 5. Todo list
 
-Turn the final plan into a todo list (TodoWrite), one item per concrete step.
+Turn the final plan into a todo list, one item per concrete step.
 
 ## 6. Ask permission
 
