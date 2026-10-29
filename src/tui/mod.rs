@@ -42,6 +42,12 @@ use threads::{
 const SIDE_W: u16 = 40;
 const MIN_SIDE_W: u16 = 12;
 const REFRESH: Duration = Duration::from_millis(700);
+/// The longest the run loop waits for input before it redraws (spinners animate at this rate).
+const POLL: Duration = Duration::from_millis(40);
+/// Refreshes between re-diffs of open diff tabs: 4 × REFRESH ≈ 3s.
+const DIFF_EVERY: u32 = 4;
+/// Refreshes between the slow syncs (reconcile_running, subagent mirroring): 7 × REFRESH ≈ 5s.
+const SYNC_EVERY: u32 = 7;
 /// Run-log lines the FLOWPLAN view shows under the plan.
 const LOG_TAIL: usize = 15;
 
@@ -148,7 +154,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
         });
         while !app.quit {
             term.draw(|f| app.draw(f))?;
-            if event::poll(Duration::from_millis(40))? {
+            if event::poll(POLL)? {
                 match event::read()? {
                     Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                     Event::Mouse(m) => app.on_mouse(m),
@@ -165,7 +171,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
             if let Some(t) = trees.try_iter().last() {
                 app.refresh_with(t);
                 app.claim_queued();
-                if app.ticks.is_multiple_of(7) {
+                if app.ticks.is_multiple_of(SYNC_EVERY) {
                     app.reconcile_running();
                 }
             }
@@ -245,7 +251,7 @@ impl App {
         (self.agent_status, self.thread_status, self.blocked) = (agents, threads, blocked);
 
         // Tabs follow a restart of their agent (execute or resume registers a new LiveAgent).
-        let diff_tick = self.ticks.is_multiple_of(4); // git diff open diff tabs each ~3s, not every refresh
+        let diff_tick = self.ticks.is_multiple_of(DIFF_EVERY); // git diff open diff tabs every few seconds, not every refresh
         for tab in self.all_tabs_mut() {
             match tab {
                 Tab::Term {
@@ -280,7 +286,7 @@ impl App {
         self.load_plans();
         self.resize_all();
         // supervise mirrors subagents only for agents execute runs; this covers ones resumed from the sidebar.
-        if self.ticks.is_multiple_of(7) {
+        if self.ticks.is_multiple_of(SYNC_EVERY) {
             let home = crate::store::home();
             let mut runs: Vec<(PathBuf, PathBuf)> = live_agents()
                 .into_iter()

@@ -4,7 +4,7 @@ use super::flowplan::{flow_lines, SPIN};
 use super::markdown::{diff_lines, md_text};
 use super::newt::{chunk, NEWT_W};
 use super::sidebar::{layout, max_offset};
-use super::tabs::{pane_rects, tab_window, tail, Tab};
+use super::tabs::{pane_rects, tab_window, tail, Tab, CLOSE_W, FADE};
 use super::term::sel_rows;
 use super::theme::{pal, stage_color};
 use super::threads::live_agents;
@@ -53,8 +53,8 @@ impl App {
         }
         let widths: Vec<u16> = titles
             .iter()
-            .map(|(t, _)| 3 + t.chars().count() as u16 + 2)
-            .collect(); // 3 fade cells + title + "× "
+            .map(|(t, _)| FADE + t.chars().count() as u16 + CLOSE_W)
+            .collect(); // fade cells + title + "× "
         let (first, end) = tab_window(
             &widths,
             0,
@@ -81,11 +81,13 @@ impl App {
             };
             tab_spans.push((x, x + widths[i], i));
             x += widths[i];
-            // Smooth left fade: three blank cells whose bg steps from the page bg to the tab bg.
-            for k in 1..=3u16 {
+            // Smooth left fade: FADE blank cells whose bg steps from the page bg to the tab bg.
+            for k in 1..=FADE {
                 let c = match (pal().mantle, bg) {
                     (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
-                        let m = |a: u8, b: u8| ((a as u16 * (4 - k) + b as u16 * k) / 4) as u8;
+                        let m = |a: u8, b: u8| {
+                            ((a as u16 * (FADE + 1 - k) + b as u16 * k) / (FADE + 1)) as u8
+                        };
                         Color::Rgb(m(r0, r1), m(g0, g1), m(b0, b1))
                     }
                     _ => bg,

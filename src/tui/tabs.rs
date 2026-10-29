@@ -85,6 +85,11 @@ pub(super) fn pane_rects(main: Rect, n: usize) -> Vec<(Rect, Rect)> {
         .collect()
 }
 
+/// Blank cells left of each tab title whose bg fades from the page to the tab.
+pub(super) const FADE: u16 = 3;
+/// Columns of the "× " close mark right of each tab title.
+pub(super) const CLOSE_W: u16 = 2;
+
 /// Tabs per tab bar; opening one more closes the oldest opened (its agent keeps running).
 const MAX_TABS: usize = 5;
 

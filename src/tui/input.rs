@@ -1,7 +1,7 @@
 //! Keyboard, mouse and paste input, routed by modal precedence to the open modal, menu, prefix command, tab or sidebar.
 
 use super::sidebar::{hit, max_offset};
-use super::tabs::Tab;
+use super::tabs::{Tab, CLOSE_W};
 use super::term::sel_text;
 use super::theme::next_theme;
 use super::threads::{Act, Menu};
@@ -9,6 +9,16 @@ use super::{App, MIN_SIDE_W, SIDE_W};
 use crate::tree::{self, Kind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
+
+/// Ctrl-o / Ctrl-t as bytes: pressed twice, the prefix key goes through to the tab.
+const CTRL_O: u8 = 0x0f;
+const CTRL_T: u8 = 0x14;
+/// Lines a viewer scrolls per PgUp/PgDn (and space).
+const PAGE: i32 = 20;
+/// Lines (or sidebar rows) per wheel notch.
+const WHEEL_STEP: i32 = 3;
+/// A scroll far enough to reach either end once clamped (g / G).
+const SCROLL_END: i32 = i32::MAX / 2;
 
 /// A key as the bytes a terminal would send. `app_cursor` = DECCKM (arrows as ESC O x).
 pub(super) fn key_bytes(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
@@ -156,7 +166,7 @@ impl App {
         if self.prefix {
             self.prefix = false;
             match k.code {
-                _ if ctrl_o => self.send(&[0x0f]), // Ctrl-o twice sends one to claude
+                _ if ctrl_o => self.send(&[CTRL_O]), // Ctrl-o twice sends one to claude
                 KeyCode::Char('s') => self.focus_main = false,
                 KeyCode::Char('n') => self.cycle(1),
                 KeyCode::Char('p') => self.cycle(-1),
@@ -183,7 +193,7 @@ impl App {
                 self.new_dir(),
             );
             match (k.code, thread) {
-                _ if ctrl_t => self.send(&[0x14]), // Ctrl-t twice sends one to claude
+                _ if ctrl_t => self.send(&[CTRL_T]), // Ctrl-t twice sends one to claude
                 (KeyCode::Char('d'), Some(t)) => self.confirm_delete = Some(t),
                 (KeyCode::Char('a'), Some(t)) => self.archive(&t),
                 (KeyCode::Char('d' | 'a'), None) => self.flash("no thread highlighted"),
@@ -216,10 +226,10 @@ impl App {
                 let d = match k.code {
                     KeyCode::Up | KeyCode::Char('k') => -1,
                     KeyCode::Down | KeyCode::Char('j') => 1,
-                    KeyCode::PageUp => -20,
-                    KeyCode::PageDown | KeyCode::Char(' ') => 20,
-                    KeyCode::Home | KeyCode::Char('g') => -i32::MAX / 2,
-                    KeyCode::End | KeyCode::Char('G') => i32::MAX / 2,
+                    KeyCode::PageUp => -PAGE,
+                    KeyCode::PageDown | KeyCode::Char(' ') => PAGE,
+                    KeyCode::Home | KeyCode::Char('g') => -SCROLL_END,
+                    KeyCode::End | KeyCode::Char('G') => SCROLL_END,
                     KeyCode::Tab | KeyCode::Esc => return self.focus_main = false,
                     _ => 0,
                 };
@@ -351,7 +361,7 @@ impl App {
                             .iter()
                             .find(|&&(a, b, _)| t.bar.contains(at) && (a..b).contains(&m.column))
                         {
-                            if m.column + 2 >= x1 {
+                            if m.column + CLOSE_W >= x1 {
                                 close = Some((t.active, i));
                             }
                             t.active = i;
@@ -399,7 +409,7 @@ impl App {
                     m.kind,
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft
                 );
-                let d: i32 = if back { -3 } else { 3 };
+                let d = if back { -WHEEL_STEP } else { WHEEL_STEP };
                 if self.side.contains(at) {
                     let max = max_offset(&self.rows, self.side_inner.height as usize) as i32;
                     self.offset = (self.offset as i32 + d).clamp(0, max.max(0)) as usize;
