@@ -1,7 +1,8 @@
 //! Thread data and its on-disk layout: ~/.brigd/threads/<thread>/{flowmap.json,state.json,FLOWPLAN}
 //! and <agent>/ dirs. Reading, writing, creating, archiving and deleting threads; no processes.
 
-use crate::{valid_name, Res, RESERVED, THREAD_MAX};
+use crate::flow::{valid_name, RESERVED, THREAD_MAX};
+use crate::Res;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -243,7 +244,7 @@ pub(crate) fn ago(t: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::agent;
+    use crate::flow::tests::agent;
 
     #[test]
     fn archive_moves_thread_and_refuses_overwrite() {

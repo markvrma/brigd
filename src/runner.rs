@@ -326,12 +326,9 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     } else {
         let (flow, state) = crate::store::load(thread)?;
         let a = flow
-            .stages
-            .iter()
-            .flatten()
-            .find(|a| a.name == agent)
+            .agent(agent)
             .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
-        cmd.args(crate::claude_flags(thread, a));
+        cmd.args(crate::flow::claude_flags(thread, a));
         crate::tree::space_cwd(
             &crate::store::root(),
             Path::new(&state.repo),

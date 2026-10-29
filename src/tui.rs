@@ -511,8 +511,8 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
     }
 }
 
-/// The flow as an npx-style step tree ending at crate::LOG_MARK; also the plain FLOWPLAN
-/// text (crate::flow_text). `status(agent)`: pending / running / blocked / done / failed.
+/// The flow as an npx-style step tree ending at crate::flow::LOG_MARK; also the plain FLOWPLAN
+/// text (crate::flow::flow_text). `status(agent)`: pending / running / blocked / done / failed.
 /// A task shows its first TASK_WORDS words and a "..." unless `expanded(agent)`. Each task
 /// line pushes (line index, clickable columns, agent) to `hits`: the "..." when collapsed,
 /// the whole line when expanded.
@@ -627,7 +627,7 @@ pub fn plan_lines(
         }
     }
     out.push(Line::from(guide("│")));
-    out.push(Line::from(guide(crate::LOG_MARK)));
+    out.push(Line::from(guide(crate::flow::LOG_MARK)));
     out
 }
 
@@ -1370,7 +1370,7 @@ impl App {
         let all: Vec<&str> = text.lines().collect();
         let start = all
             .iter()
-            .position(|l| l.trim_end() == crate::LOG_MARK)
+            .position(|l| l.trim_end() == crate::flow::LOG_MARK)
             .map(|i| i + 1)
             .or_else(|| all.iter().position(|l| l.starts_with("──")));
         let start = start
@@ -1984,14 +1984,17 @@ impl App {
         // ponytail: no cancel; quitting brigd mid-plan orphans the `claude -p` planner.
         std::thread::spawn(move || {
             let r = std::panic::catch_unwind(|| {
-                crate::plan(&task, &repo).and_then(|flow| {
+                crate::flow::plan(&task, &repo).and_then(|flow| {
                     crate::store::create_thread(
                         &crate::store::root(),
                         &name,
                         &repo.to_string_lossy(),
                         &flow,
                     )?;
-                    Ok(fs::write(dir.join("FLOWPLAN"), crate::flow_text(&flow))?)
+                    Ok(fs::write(
+                        dir.join("FLOWPLAN"),
+                        crate::flow::flow_text(&flow),
+                    )?)
                 })
             })
             .unwrap_or_else(|_| Err("planner panicked".into()));
@@ -3556,7 +3559,7 @@ mod tests {
                 vec![agent("review", None)],
             ],
         };
-        let text = crate::flow_text(&flow);
+        let text = crate::flow::flow_text(&flow);
         assert!(text.contains("tail-of-trace-auth"), "{text}");
         assert!(
             text.contains("│  ├─ ◇ check-db  ") && text.ends_with("│\n└  log\n"),
