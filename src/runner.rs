@@ -148,7 +148,7 @@ impl LiveAgent {
 pub fn read_status(dir: &Path, cwd: &Path) -> Status {
     if let Ok(s) = fs::read_to_string(dir.join("status")) {
         if !s.trim().is_empty() {
-            return Status::parse(&s);
+            return Status::parse(s.trim());
         }
     }
     let Ok(session) = fs::read_to_string(dir.join("session")) else {

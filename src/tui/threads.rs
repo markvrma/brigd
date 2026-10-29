@@ -247,8 +247,7 @@ impl App {
             .iter()
             .filter_map(|(p, st)| {
                 let name = p.file_name()?.to_string_lossy().into_owned();
-                crate::engine::claimable(*st, owner, crate::engine::executing(&name))
-                    .then_some(name)
+                crate::engine::claimable(st, owner, crate::engine::executing(&name)).then_some(name)
             })
             .collect();
         for name in queued {

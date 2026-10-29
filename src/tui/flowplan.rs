@@ -55,7 +55,7 @@ pub fn plan_lines(
         };
         out.push(Line::from(guide("│")));
         out.push(Line::from(vec![
-            step(st, frame),
+            step(&st, frame),
             Span::raw("  "),
             Span::styled(
                 format!("stage {}", i + 1),
@@ -73,7 +73,7 @@ pub fn plan_lines(
             let meta = format!("{} · {} · {wt}", a.model, a.effort);
             out.push(Line::from(vec![
                 guide(if last { "│  └─ " } else { "│  ├─ " }),
-                step(*st, frame),
+                step(st, frame),
                 Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)),
                 guide(&meta),
             ]));
@@ -294,7 +294,7 @@ pub(super) fn flow_lines(text: &str) -> Option<Vec<Line<'static>>> {
             ps.dedup();
             let mut l = vec![
                 Span::styled(lead, dim),
-                step(Status::Done, 0),
+                step(&Status::Done, 0),
                 Span::raw("  "),
             ];
             l.push(Span::styled(
@@ -315,7 +315,7 @@ pub(super) fn flow_lines(text: &str) -> Option<Vec<Line<'static>>> {
 }
 
 /// A step's glyph: pending ◇, running spinner, blocked !, done ✔, failed ✖.
-fn step(st: Status, frame: usize) -> Span<'static> {
+fn step(st: &Status, frame: usize) -> Span<'static> {
     match st {
         Status::Done => Span::styled("✔", Style::new().fg(pal().green)),
         Status::Failed => Span::styled("✖", Style::new().fg(pal().red)),

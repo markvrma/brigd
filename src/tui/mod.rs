@@ -347,13 +347,12 @@ impl App {
     ) -> Option<Vec<Line<'static>>> {
         let (flow, state) = self.plans.get(path)?;
         // Saved done/failed wins (a done agent idles on, live); else the live hook status.
-        let status = |a: &str| match state.agents.get(a).map(|s| s.status) {
+        let status = |a: &str| match state.agents.get(a).map(|s| &s.status) {
             Some(Status::Done) => Status::Done,
             Some(Status::Failed) => Status::Failed,
             _ => match self
                 .agent_status
                 .get(&(state.thread.clone(), a.to_string()))
-                .copied()
             {
                 Some(Status::Running | Status::Idle) => Status::Running,
                 Some(Status::Blocked) => Status::Blocked,

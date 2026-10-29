@@ -319,8 +319,8 @@ pub(crate) fn reconcile(name: &str, state: &mut State) -> Res<bool> {
 
 /// The TUI claims a thread only if it is queued, this TUI owns tui.pid, and this
 /// process is not already executing it.
-pub(crate) fn claimable(status: Status, owner: bool, busy: bool) -> bool {
-    status == Status::Queued && owner && !busy
+pub(crate) fn claimable(status: &Status, owner: bool, busy: bool) -> bool {
+    *status == Status::Queued && owner && !busy
 }
 
 /// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
@@ -426,10 +426,10 @@ mod tests {
 
     #[test]
     fn claimable_rules() {
-        assert!(claimable(Status::Queued, true, false));
-        assert!(!claimable(Status::Queued, false, false)); // another TUI owns tui.pid
-        assert!(!claimable(Status::Queued, true, true)); // already executing here
-        assert!(!claimable(Status::Stopped, true, false));
+        assert!(claimable(&Status::Queued, true, false));
+        assert!(!claimable(&Status::Queued, false, false)); // another TUI owns tui.pid
+        assert!(!claimable(&Status::Queued, true, true)); // already executing here
+        assert!(!claimable(&Status::Stopped, true, false));
     }
 
     /// Runs a two-stage flow against a fake `claude` on PATH: the second agent works in a

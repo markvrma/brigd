@@ -122,7 +122,7 @@ pub(super) fn hit(
 
 impl Status {
     /// An agent or terminal row's status glyph and its style.
-    fn glyph(self) -> (&'static str, Style) {
+    fn glyph(&self) -> (&'static str, Style) {
         match self {
             Status::Term => ("$ ", Style::new().fg(pal().green)),
             Status::Running => ("● ", Style::new().fg(pal().green)),
@@ -278,7 +278,7 @@ impl App {
                 let st = self
                     .agent_status
                     .get(&(r.thread.clone(), r.label.clone()))
-                    .copied()
+                    .cloned()
                     .unwrap_or(if r.kind == Kind::Terminal {
                         Status::Term
                     } else {

@@ -38,12 +38,11 @@ pub(crate) struct Flow {
 
 /// A thread's or agent's status: what state.json stores (lowercase), what the hooks write to an
 /// agent's status file, and the TUI's own off / `$` (a plain terminal).
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[serde(from = "String", into = "String")]
 pub(crate) enum Status {
     /// Nothing yet ("" in older state.json files).
     #[default]
-    #[serde(alias = "")]
     Pending,
     /// Thread: created, waiting to be run.
     Planned,
@@ -65,20 +64,33 @@ pub(crate) enum Status {
     /// TUI: the agent's process is gone and state.json says neither done nor failed.
     Off,
     /// TUI: a terminal tab with no claude running in it.
-    #[serde(rename = "$")]
     Term,
-    /// Any other value (a hand-edited state.json): read, never acted on.
-    #[serde(other)]
-    Unknown,
+    /// Any other value (a hand-edited state.json): shown and written back verbatim, never acted on.
+    Other(String),
 }
 
 impl Status {
-    /// A status from its stored or hook-written text ("" is Pending, anything unknown Unknown).
+    /// A status from its stored or hook-written text ("" is Pending).
     pub(crate) fn parse(s: &str) -> Status {
-        serde_json::from_value(serde_json::Value::from(s.trim())).unwrap_or(Status::Unknown)
+        match s {
+            "" | "pending" => Status::Pending,
+            "planned" => Status::Planned,
+            "queued" => Status::Queued,
+            "running" => Status::Running,
+            "stopped" => Status::Stopped,
+            "done" => Status::Done,
+            "failed" => Status::Failed,
+            "starting" => Status::Starting,
+            "working" => Status::Working,
+            "idle" => Status::Idle,
+            "blocked" => Status::Blocked,
+            "off" => Status::Off,
+            "$" => Status::Term,
+            other => Status::Other(other.into()),
+        }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             Status::Pending => "pending",
             Status::Planned => "planned",
@@ -93,8 +105,20 @@ impl Status {
             Status::Blocked => "blocked",
             Status::Off => "off",
             Status::Term => "$",
-            Status::Unknown => "unknown",
+            Status::Other(s) => s,
         }
+    }
+}
+
+impl From<String> for Status {
+    fn from(s: String) -> Status {
+        Status::parse(&s)
+    }
+}
+
+impl From<Status> for String {
+    fn from(s: Status) -> String {
+        s.as_str().into()
     }
 }
 
@@ -412,11 +436,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(st.status, Status::Stopped);
-        let a: Vec<Status> = st.agents.values().map(|a| a.status).collect();
-        assert_eq!(a, [Status::Pending, Status::Unknown, Status::Pending]);
+        let a: Vec<Status> = st.agents.values().map(|a| a.status.clone()).collect();
+        assert_eq!(
+            a,
+            [
+                Status::Pending,
+                Status::Other("weird".into()),
+                Status::Pending
+            ]
+        );
         let json = serde_json::to_string(&st).unwrap();
         assert!(json.contains(r#""status":"stopped""#) && json.contains(r#""status":"pending""#));
-        assert_eq!(Status::parse("idle\n"), Status::Idle);
+        assert!(json.contains(r#""status":"weird""#)); // kept verbatim
+        assert_eq!(Status::parse("$"), Status::Term);
         assert_eq!(format!("{:<8}|", Status::Done), "done    |");
     }
 }
