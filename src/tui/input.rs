@@ -70,6 +70,9 @@ pub(super) fn key_bytes(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
 }
 
 impl App {
+    /// Routes a key by modal precedence: the new-thread window, the run confirm, the menu, the
+    /// delete and quit confirms, the C-o then C-t prefix, Alt-h/l/t, then the sidebar or the
+    /// focused tab. A handler that takes the key returns true; nothing behind it sees the key.
     pub(super) fn on_key(&mut self, k: KeyEvent) {
         // A modal that opened while a prefix was armed must not leave it armed behind it.
         if self.newt.as_ref().is_some_and(|n| !n.hidden)
@@ -81,74 +84,7 @@ impl App {
             self.disarm_prefixes();
         }
         // The new-thread window and its run confirm come first: no key may reach anything behind them.
-        if let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) {
-            if n.planning {
-                // Read-only while planning; Esc only hides the box.
-                n.hidden = k.code == KeyCode::Esc;
-                return;
-            }
-            n.err = None;
-            if n.ask {
-                match k.code {
-                    KeyCode::Esc => n.ask = false,
-                    KeyCode::Char('y' | 'Y') | KeyCode::Char('n' | 'N') | KeyCode::Enter => {
-                        let yes = matches!(k.code, KeyCode::Char('y' | 'Y'));
-                        let n = self.newt.take().unwrap();
-                        self.submit_newt(n.fields, yes);
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            match k.code {
-                KeyCode::Esc => self.newt = None,
-                KeyCode::Tab | KeyCode::Down => n.focus = (n.focus + 1) % 3,
-                KeyCode::Up => n.focus = (n.focus + 2) % 3,
-                KeyCode::Enter if n.focus < 2 => n.focus += 1,
-                KeyCode::Enter => {
-                    if !crate::mentions_prg(&n.fields[2]) && Self::newt_check(&n.fields).is_none() {
-                        n.ask = true;
-                    } else {
-                        let n = self.newt.take().unwrap();
-                        self.submit_newt(n.fields, false);
-                    }
-                }
-                KeyCode::Backspace => _ = n.fields[n.focus].pop(),
-                KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    n.fields[n.focus].clear()
-                }
-                KeyCode::Char(c)
-                    if !k
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    n.fields[n.focus].push(c)
-                }
-                _ => {}
-            }
-            return;
-        }
-        if let Some((name, repo)) = self.confirm_run.take() {
-            match k.code {
-                KeyCode::Char('y' | 'Y') => self.run_planned(name),
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.delete(&name),
-                _ => {
-                    self.confirm_run = Some((name, repo));
-                    return;
-                }
-            }
-            self.confirm_run = self.queued.pop();
-            return;
-        }
-        if let Some(mut m) = self.menu.take() {
-            // ↑↓ move, Enter picks; Esc or any other key just closes the menu.
-            match k.code {
-                KeyCode::Up | KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1).min(m.items.len() - 1),
-                KeyCode::Enter => return self.pick(m.items.swap_remove(m.sel)),
-                _ => return,
-            }
-            self.menu = Some(m);
+        if self.key_newt(k) || self.key_confirm_run(k) || self.key_menu(k) {
             return;
         }
         if let Some(t) = self.confirm_delete.take() {
@@ -157,12 +93,119 @@ impl App {
             }
             return;
         }
-        let ctrl_o = k.code == KeyCode::Char('o') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.confirm_quit {
             self.confirm_quit = false;
             self.quit = matches!(k.code, KeyCode::Char('y' | 'Y'));
             return;
         }
+        if self.key_prefix(k) || self.key_thread_prefix(k) {
+            return;
+        }
+        // Alt-h/l/t from anywhere; '˙'/'¬'/'†' are what macOS Option-h/l/t types without "Option as Meta".
+        match (k.code, k.modifiers.contains(KeyModifiers::ALT)) {
+            (KeyCode::Char('h'), true) | (KeyCode::Char('˙'), _) => return self.cycle(-1),
+            (KeyCode::Char('l'), true) | (KeyCode::Char('¬'), _) => return self.cycle(1),
+            (KeyCode::Char('t'), true) | (KeyCode::Char('†'), _) => return self.new_term(),
+            _ => {}
+        }
+        if !self.focus_main {
+            return self.side_key(k);
+        }
+        self.key_view(k);
+    }
+
+    /// The new-thread window, unless hidden, takes every key: field editing, then the
+    /// plan-review-go question; read-only while planning.
+    fn key_newt(&mut self, k: KeyEvent) -> bool {
+        let Some(n) = self.newt.as_mut().filter(|n| !n.hidden) else {
+            return false;
+        };
+        if n.planning {
+            // Read-only while planning; Esc only hides the box.
+            n.hidden = k.code == KeyCode::Esc;
+            return true;
+        }
+        n.err = None;
+        if n.ask {
+            match k.code {
+                KeyCode::Esc => n.ask = false,
+                KeyCode::Char('y' | 'Y') | KeyCode::Char('n' | 'N') | KeyCode::Enter => {
+                    let yes = matches!(k.code, KeyCode::Char('y' | 'Y'));
+                    let n = self.newt.take().unwrap();
+                    self.submit_newt(n.fields, yes);
+                }
+                _ => {}
+            }
+            return true;
+        }
+        match k.code {
+            KeyCode::Esc => self.newt = None,
+            KeyCode::Tab | KeyCode::Down => n.focus = (n.focus + 1) % 3,
+            KeyCode::Up => n.focus = (n.focus + 2) % 3,
+            KeyCode::Enter if n.focus < 2 => n.focus += 1,
+            KeyCode::Enter => {
+                if !crate::mentions_prg(&n.fields[2]) && Self::newt_check(&n.fields).is_none() {
+                    n.ask = true;
+                } else {
+                    let n = self.newt.take().unwrap();
+                    self.submit_newt(n.fields, false);
+                }
+            }
+            KeyCode::Backspace => _ = n.fields[n.focus].pop(),
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                n.fields[n.focus].clear()
+            }
+            KeyCode::Char(c)
+                if !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                n.fields[n.focus].push(c)
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// "Run thread X?": y runs it, n/Esc deletes it, then the next queued plan asks; any other
+    /// key is swallowed and the question stays.
+    fn key_confirm_run(&mut self, k: KeyEvent) -> bool {
+        let Some((name, repo)) = self.confirm_run.take() else {
+            return false;
+        };
+        match k.code {
+            KeyCode::Char('y' | 'Y') => self.run_planned(name),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => self.delete(&name),
+            _ => {
+                self.confirm_run = Some((name, repo));
+                return true;
+            }
+        }
+        self.confirm_run = self.queued.pop();
+        true
+    }
+
+    /// The right-click menu: ↑↓ move, Enter picks; Esc or any other key just closes it.
+    fn key_menu(&mut self, k: KeyEvent) -> bool {
+        let Some(mut m) = self.menu.take() else {
+            return false;
+        };
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => m.sel = m.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => m.sel = (m.sel + 1).min(m.items.len() - 1),
+            KeyCode::Enter => {
+                self.pick(m.items.swap_remove(m.sel));
+                return true;
+            }
+            _ => return true,
+        }
+        self.menu = Some(m);
+        true
+    }
+
+    /// C-o arms the tab-command prefix; the next key is the command (C-o again sends one C-o).
+    fn key_prefix(&mut self, k: KeyEvent) -> bool {
+        let ctrl_o = k.code == KeyCode::Char('o') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.prefix {
             self.prefix = false;
             match k.code {
@@ -178,12 +221,17 @@ impl App {
                 KeyCode::Char('q') => self.ask_quit(),
                 _ => {}
             }
-            return;
+            return true;
         }
         if ctrl_o {
             (self.prefix, self.thread_prefix) = (true, false);
-            return;
+            return true;
         }
+        false
+    }
+
+    /// C-t arms the thread prefix: the next key acts on the highlighted thread (C-t again sends one C-t).
+    fn key_thread_prefix(&mut self, k: KeyEvent) -> bool {
         let ctrl_t = k.code == KeyCode::Char('t') && k.modifiers.contains(KeyModifiers::CONTROL);
         if self.thread_prefix {
             self.thread_prefix = false;
@@ -201,22 +249,17 @@ impl App {
                 (KeyCode::Char('m'), _) => self.open_newt_anywhere(repo),
                 _ => {}
             }
-            return;
+            return true;
         }
         if ctrl_t {
             self.thread_prefix = true;
-            return;
+            return true;
         }
-        // Alt-h/l/t from anywhere; '˙'/'¬'/'†' are what macOS Option-h/l/t types without "Option as Meta".
-        match (k.code, k.modifiers.contains(KeyModifiers::ALT)) {
-            (KeyCode::Char('h'), true) | (KeyCode::Char('˙'), _) => return self.cycle(-1),
-            (KeyCode::Char('l'), true) | (KeyCode::Char('¬'), _) => return self.cycle(1),
-            (KeyCode::Char('t'), true) | (KeyCode::Char('†'), _) => return self.new_term(),
-            _ => {}
-        }
-        if !self.focus_main {
-            return self.side_key(k);
-        }
+        false
+    }
+
+    /// A key for the focused tab: a terminal gets its bytes, a viewer scrolls (Tab/Esc back to the sidebar).
+    fn key_view(&mut self, k: KeyEvent) {
         match self.active_tab() {
             Some(Tab::Term { live, .. }) => {
                 let app_cursor = live.parser.lock().unwrap().screen().application_cursor();
@@ -240,6 +283,8 @@ impl App {
         }
     }
 
+    /// Routes a mouse event. Nothing behind an open new-thread window or run confirm gets it;
+    /// a press first disarms the prefixes and closes an open menu (a left click on an item picks it).
     pub(super) fn on_mouse(&mut self, m: MouseEvent) {
         if self.newt.as_ref().is_some_and(|n| !n.hidden) || self.confirm_run.is_some() {
             return;
@@ -262,124 +307,8 @@ impl App {
             }
         }
         match m.kind {
-            MouseEventKind::Down(MouseButton::Right) => {
-                let Some((i, _)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row)
-                else {
-                    return;
-                };
-                let r = &self.rows[i];
-                let items = match r.kind {
-                    Kind::Agent => vec![Act::Terminate {
-                        thread: r.thread.clone(),
-                        agent: tree::agent_id(&r.path, &r.label),
-                    }],
-                    Kind::Thread => {
-                        vec![Act::Delete(r.label.clone()), Act::Archive(r.label.clone())]
-                    }
-                    _ => return,
-                };
-                self.sel = i;
-                let (w, h) = (
-                    items.iter().map(|a| a.label().len()).max().unwrap_or(0) as u16,
-                    items.len() as u16,
-                );
-                let x = if self.screen.width == 0 {
-                    m.column
-                } else {
-                    m.column.min(self.screen.right().saturating_sub(w))
-                };
-                let y = if self.screen.height == 0 {
-                    m.row
-                } else {
-                    m.row.min(self.screen.bottom().saturating_sub(h))
-                };
-                self.menu = Some(Menu {
-                    rect: Rect::new(x, y, w, h),
-                    items,
-                    sel: 0,
-                });
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.resizing = self.divider.contains(at);
-                // The sidebar is not among these, so a drag starting there selects nothing.
-                let panes = self
-                    .tabs
-                    .get(&self.thread)
-                    .into_iter()
-                    .flat_map(|p| &p.list)
-                    .flat_map(|t| [t.bar, t.body]);
-                self.drag = panes
-                    .chain([self.hint])
-                    .find(|r| r.contains(at))
-                    .map(|r| (r, at, None));
-                if let Some(repo) = self
-                    .plus_btns
-                    .iter()
-                    .find(|(r, _)| r.contains(at))
-                    .map(|(_, p)| p.clone())
-                {
-                    self.disarm_prefixes();
-                    if self.header_plus.contains(at) {
-                        self.open_newt_anywhere(repo);
-                    } else {
-                        self.open_newt(repo);
-                    }
-                } else if let Some(t) = self
-                    .pause_btns
-                    .iter()
-                    .find(|(r, _)| r.contains(at))
-                    .map(|(_, t)| t.clone())
-                {
-                    self.toggle_pause(&t);
-                } else if let Some(k) = self
-                    .task_btns
-                    .iter()
-                    .find(|(r, _)| r.contains(at))
-                    .map(|(_, k)| k.clone())
-                {
-                    if !self.expanded.remove(&k) {
-                        self.expanded.insert(k);
-                    }
-                } else if let Some((i, arrow)) =
-                    hit(self.side_inner, self.offset, &self.rows, m.column, m.row)
-                {
-                    self.sel = i;
-                    self.activate(i, arrow);
-                    self.focus_main = false; // a click shows the item but keeps j/k on the sidebar
-                } else if let Some(p) = self.tabs.get_mut(&self.thread) {
-                    // A click on a pane focuses it; on one of its tabs, also shows that tab.
-                    if let Some(j) = p
-                        .list
-                        .iter()
-                        .position(|t| t.bar.contains(at) || t.body.contains(at))
-                    {
-                        let t = &mut p.list[j];
-                        // (previously active tab, clicked tab) when the click is on the "× ".
-                        let mut close = None;
-                        if let Some(&(_, x1, i)) = t
-                            .spans
-                            .iter()
-                            .find(|&&(a, b, _)| t.bar.contains(at) && (a..b).contains(&m.column))
-                        {
-                            if m.column + CLOSE_W >= x1 {
-                                close = Some((t.active, i));
-                            }
-                            t.active = i;
-                        }
-                        if !t.list.is_empty() {
-                            (p.focus, self.focus_main) = (j, true);
-                        }
-                        if let Some((prev, i)) = close {
-                            self.close_tab();
-                            // A neighbour closed: keep the tab that was showing (i == prev picks its own successor).
-                            let t = self.focused_pane();
-                            if i != prev {
-                                t.active = prev - (i < prev) as usize;
-                            }
-                        }
-                    }
-                }
-            }
+            MouseEventKind::Down(MouseButton::Right) => self.open_context_menu(m),
+            MouseEventKind::Down(MouseButton::Left) => self.click_left(m, at),
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.resizing {
                     self.side_w = Some(
@@ -404,35 +333,179 @@ impl App {
             MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
-            | MouseEventKind::ScrollRight => {
-                let back = matches!(
-                    m.kind,
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft
-                );
-                let d = if back { -WHEEL_STEP } else { WHEEL_STEP };
-                if self.side.contains(at) {
-                    let max = max_offset(&self.rows, self.side_inner.height as usize) as i32;
-                    self.offset = (self.offset as i32 + d).clamp(0, max.max(0)) as usize;
-                } else if let Some(t) = self
-                    .tabs
-                    .get_mut(&self.thread)
-                    .and_then(|p| p.list.iter_mut().find(|t| t.body.contains(at)))
-                {
-                    match t.list.get_mut(t.active) {
-                        Some(Tab::Term { live, .. }) => {
-                            let mut p = live.parser.lock().unwrap();
-                            let s = p.screen().scrollback() as i32;
-                            p.screen_mut().set_scrollback((s - d).max(0) as usize);
-                            // wheel up = further back
-                        }
-                        Some(Tab::View { scroll, .. }) => {
-                            *scroll = (*scroll as i32 + d).clamp(0, u16::MAX as i32) as u16
-                        }
-                        None => {}
-                    }
-                }
-            }
+            | MouseEventKind::ScrollRight => self.on_scroll(m, at),
             _ => {}
+        }
+    }
+
+    /// Right-click on an agent row (Terminate) or a thread row (Delete / Archive): selects the
+    /// row and opens its menu at the pointer, kept on screen.
+    fn open_context_menu(&mut self, m: MouseEvent) {
+        let Some((i, _)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) else {
+            return;
+        };
+        let r = &self.rows[i];
+        let items = match r.kind {
+            Kind::Agent => vec![Act::Terminate {
+                thread: r.thread.clone(),
+                agent: tree::agent_id(&r.path, &r.label),
+            }],
+            Kind::Thread => {
+                vec![Act::Delete(r.label.clone()), Act::Archive(r.label.clone())]
+            }
+            _ => return,
+        };
+        self.sel = i;
+        let (w, h) = (
+            items.iter().map(|a| a.label().len()).max().unwrap_or(0) as u16,
+            items.len() as u16,
+        );
+        let x = if self.screen.width == 0 {
+            m.column
+        } else {
+            m.column.min(self.screen.right().saturating_sub(w))
+        };
+        let y = if self.screen.height == 0 {
+            m.row
+        } else {
+            m.row.min(self.screen.bottom().saturating_sub(h))
+        };
+        self.menu = Some(Menu {
+            rect: Rect::new(x, y, w, h),
+            items,
+            sel: 0,
+        });
+    }
+
+    /// A left press: starts a divider drag or a text selection, then the first of: a sidebar
+    /// button, a sidebar row, a pane.
+    fn click_left(&mut self, m: MouseEvent, at: Position) {
+        self.resizing = self.divider.contains(at);
+        // The sidebar is not among these, so a drag starting there selects nothing.
+        let panes = self
+            .tabs
+            .get(&self.thread)
+            .into_iter()
+            .flat_map(|p| &p.list)
+            .flat_map(|t| [t.bar, t.body]);
+        self.drag = panes
+            .chain([self.hint])
+            .find(|r| r.contains(at))
+            .map(|r| (r, at, None));
+        if self.click_buttons(at) {
+            return;
+        }
+        if let Some((i, arrow)) = hit(self.side_inner, self.offset, &self.rows, m.column, m.row) {
+            self.sel = i;
+            self.activate(i, arrow);
+            self.focus_main = false; // a click shows the item but keeps j/k on the sidebar
+        } else {
+            self.click_pane(m, at);
+        }
+    }
+
+    /// A '+' (new thread), a pause dot, or a FLOWPLAN task's "..." under `at`: acts and returns true.
+    fn click_buttons(&mut self, at: Position) -> bool {
+        if let Some(repo) = self
+            .plus_btns
+            .iter()
+            .find(|(r, _)| r.contains(at))
+            .map(|(_, p)| p.clone())
+        {
+            self.disarm_prefixes();
+            if self.header_plus.contains(at) {
+                self.open_newt_anywhere(repo);
+            } else {
+                self.open_newt(repo);
+            }
+        } else if let Some(t) = self
+            .pause_btns
+            .iter()
+            .find(|(r, _)| r.contains(at))
+            .map(|(_, t)| t.clone())
+        {
+            self.toggle_pause(&t);
+        } else if let Some(k) = self
+            .task_btns
+            .iter()
+            .find(|(r, _)| r.contains(at))
+            .map(|(_, k)| k.clone())
+        {
+            if !self.expanded.remove(&k) {
+                self.expanded.insert(k);
+            }
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// A click on a pane focuses it; on one of its tabs, also shows that tab; on a tab's "× ", closes it.
+    fn click_pane(&mut self, m: MouseEvent, at: Position) {
+        let Some(p) = self.tabs.get_mut(&self.thread) else {
+            return;
+        };
+        let Some(j) = p
+            .list
+            .iter()
+            .position(|t| t.bar.contains(at) || t.body.contains(at))
+        else {
+            return;
+        };
+        let t = &mut p.list[j];
+        // (previously active tab, clicked tab) when the click is on the "× ".
+        let mut close = None;
+        if let Some(&(_, x1, i)) = t
+            .spans
+            .iter()
+            .find(|&&(a, b, _)| t.bar.contains(at) && (a..b).contains(&m.column))
+        {
+            if m.column + CLOSE_W >= x1 {
+                close = Some((t.active, i));
+            }
+            t.active = i;
+        }
+        if !t.list.is_empty() {
+            (p.focus, self.focus_main) = (j, true);
+        }
+        if let Some((prev, i)) = close {
+            self.close_tab();
+            // A neighbour closed: keep the tab that was showing (i == prev picks its own successor).
+            let t = self.focused_pane();
+            if i != prev {
+                t.active = prev - (i < prev) as usize;
+            }
+        }
+    }
+
+    /// The wheel scrolls the sidebar, or the pane under the pointer: a terminal's scrollback
+    /// (wheel up = further back) or a viewer.
+    fn on_scroll(&mut self, m: MouseEvent, at: Position) {
+        let back = matches!(
+            m.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft
+        );
+        let d = if back { -WHEEL_STEP } else { WHEEL_STEP };
+        if self.side.contains(at) {
+            let max = max_offset(&self.rows, self.side_inner.height as usize) as i32;
+            self.offset = (self.offset as i32 + d).clamp(0, max.max(0)) as usize;
+        } else if let Some(t) = self
+            .tabs
+            .get_mut(&self.thread)
+            .and_then(|p| p.list.iter_mut().find(|t| t.body.contains(at)))
+        {
+            match t.list.get_mut(t.active) {
+                Some(Tab::Term { live, .. }) => {
+                    let mut p = live.parser.lock().unwrap();
+                    let s = p.screen().scrollback() as i32;
+                    p.screen_mut().set_scrollback((s - d).max(0) as usize);
+                    // wheel up = further back
+                }
+                Some(Tab::View { scroll, .. }) => {
+                    *scroll = (*scroll as i32 + d).clamp(0, u16::MAX as i32) as u16
+                }
+                None => {}
+            }
         }
     }
 
