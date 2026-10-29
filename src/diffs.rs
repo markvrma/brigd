@@ -17,18 +17,15 @@ use std::time::{Duration, Instant};
 /// Transcript path → (bytes parsed, up to the last full line; files it changed so far).
 static PARSED: Mutex<BTreeMap<PathBuf, (u64, Vec<PathBuf>)>> = Mutex::new(BTreeMap::new());
 
-/// Agent dir → (when checked; its base commit and the files `git diff --numstat` lists vs it,
-/// with their (added, removed) line counts, "-" for binary).
-type Names = (
-    Instant,
-    Option<(String, HashMap<PathBuf, (String, String)>)>,
-);
-
+/// A base commit and the files `git diff --numstat` lists vs it, with their (added, removed)
+/// line counts, "-" for binary.
+type Listing = (String, HashMap<PathBuf, (String, String)>);
+/// Agent dir → (when checked; its listing, None when git failed).
+type Names = (Instant, Option<Listing>);
 static NAMES: Mutex<BTreeMap<PathBuf, Names>> = Mutex::new(BTreeMap::new());
 
 /// Diff node path → (agent cwd, base commit, file path relative to the cwd, (added, removed)).
 type View = (PathBuf, String, String, (String, String));
-
 static VIEWS: Mutex<BTreeMap<PathBuf, View>> = Mutex::new(BTreeMap::new());
 
 #[cfg(test)]
@@ -173,40 +170,7 @@ pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
     let (base, listed) = if sealed.exists() {
         Default::default()
     } else {
-        let mut names = NAMES.lock().unwrap();
-        let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
-        if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
-            // first check: backdate by a stable per-dir 0–3s phase so agents' rechecks spread out
-            let mut h = DefaultHasher::new();
-            dir.hash(&mut h);
-            let phase = Duration::from_millis(if entry.1.is_none() {
-                h.finish() % 3000
-            } else {
-                0
-            });
-            let b = base(cwd, repo, dir);
-            let listed = b.as_ref().and_then(|b| {
-                git(
-                    cwd,
-                    &["diff", "--numstat", "--no-renames", "--relative", "-z", b],
-                )
-            });
-            *entry = (
-                Instant::now()
-                    .checked_sub(phase)
-                    .unwrap_or_else(Instant::now),
-                b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))),
-            );
-            // done ≥10s ago (transcript settled) after a good git pass, or cwd gone: seal
-            let old = fs::metadata(dir.join("output.md"))
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= Duration::from_secs(10)));
-            if (entry.1.is_some() && old) || !cwd.exists() {
-                let _ = fs::create_dir_all(dir.join(".diff")).and_then(|_| fs::write(&sealed, ""));
-            }
-        }
-        // no base/listing (git failed): only the already frozen diffs can show
-        entry.1.clone().unwrap_or_default()
+        refresh_listing(cwd, repo, dir, &sealed)
     };
     // Once the agent is done (output.md written) its diffs are saved and never recomputed.
     let done = dir.join("output.md").exists();
@@ -220,14 +184,7 @@ pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
                 .join(file.strip_prefix("/").unwrap_or(&file));
             let label = file.file_name()?.to_string_lossy().into_owned();
             if path.is_file() {
-                return Some(Node {
-                    kind: Kind::Diff,
-                    label,
-                    path,
-                    children: vec![],
-                    stage: None,
-                    worktree: None,
-                });
+                return Some(Node::new(Kind::Diff, label, path));
             }
             let stat = listed.get(&file)?.clone();
             let rel = file.strip_prefix(cwd).ok()?.to_string_lossy().into_owned();
@@ -239,27 +196,53 @@ pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
                     })
                 };
                 if text.and_then(save).is_some() {
-                    return Some(Node {
-                        kind: Kind::Diff,
-                        label,
-                        path,
-                        children: vec![],
-                        stage: None,
-                        worktree: None,
-                    });
+                    return Some(Node::new(Kind::Diff, label, path));
                 }
             }
             views.insert(path.clone(), (cwd.into(), base.clone(), rel, stat));
-            Some(Node {
-                kind: Kind::Diff,
-                label,
-                path,
-                children: vec![],
-                stage: None,
-                worktree: None,
-            })
+            Some(Node::new(Kind::Diff, label, path))
         })
         .collect()
+}
+
+/// The agent's base commit and the files `git diff --numstat` lists vs it, from NAMES, asking
+/// git again at most every 3s; seals the agent once it is done and settled. Empty when git
+/// failed. Holds the NAMES lock across the git calls.
+fn refresh_listing(cwd: &Path, repo: &Path, dir: &Path, sealed: &Path) -> Listing {
+    let mut names = NAMES.lock().unwrap();
+    let entry = names.entry(dir.into()).or_insert((Instant::now(), None));
+    if entry.1.is_none() || entry.0.elapsed() >= Duration::from_secs(3) {
+        // first check: backdate by a stable per-dir 0–3s phase so agents' rechecks spread out
+        let mut h = DefaultHasher::new();
+        dir.hash(&mut h);
+        let phase = Duration::from_millis(if entry.1.is_none() {
+            h.finish() % 3000
+        } else {
+            0
+        });
+        let b = base(cwd, repo, dir);
+        let listed = b.as_ref().and_then(|b| {
+            git(
+                cwd,
+                &["diff", "--numstat", "--no-renames", "--relative", "-z", b],
+            )
+        });
+        *entry = (
+            Instant::now()
+                .checked_sub(phase)
+                .unwrap_or_else(Instant::now),
+            b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))),
+        );
+        // done ≥10s ago (transcript settled) after a good git pass, or cwd gone: seal
+        let old = fs::metadata(dir.join("output.md"))
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= Duration::from_secs(10)));
+        if (entry.1.is_some() && old) || !cwd.exists() {
+            let _ = fs::create_dir_all(dir.join(".diff")).and_then(|_| fs::write(sealed, ""));
+        }
+    }
+    // no base/listing (git failed): only the already frozen diffs can show
+    entry.1.clone().unwrap_or_default()
 }
 
 /// `git diff --numstat -z --no-renames` → path → (added, removed).

@@ -63,6 +63,20 @@ pub struct Node {
     pub worktree: Option<String>,
 }
 
+impl Node {
+    /// A node without children, stage or worktree.
+    pub(crate) fn new(kind: Kind, label: impl Into<String>, path: PathBuf) -> Node {
+        Node {
+            kind,
+            label: label.into(),
+            path,
+            children: vec![],
+            stage: None,
+            worktree: None,
+        }
+    }
+}
+
 /// The directory a space's agents run in: the repo for key "", else its worktree.
 pub fn space_cwd(root: &Path, repo: &Path, thread: &str, key: &str) -> PathBuf {
     if key.is_empty() {
@@ -85,70 +99,9 @@ pub fn build(root: &Path) -> Vec<Node> {
         .collect();
     threads.sort();
     for tdir in threads {
-        let read = |f: &str| {
-            fs::read_to_string(tdir.join(f))
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        };
-        let (Some(flow), Some(state)) = (read("flowmap.json"), read("state.json")) else {
-            continue;
-        };
-        let thread = tdir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let repo = PathBuf::from(state["repo"].as_str().unwrap_or_default());
-        let mut agents = Vec::new();
-        for (si, a) in flow["stages"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .flat_map(|(i, s)| s.as_array().into_iter().flatten().map(move |a| (i, a)))
-        {
-            // Only agents that have been launched: set_agent puts them in state.json's "agents".
-            let Some(name) = a["name"]
-                .as_str()
-                .filter(|n| !state["agents"][*n].is_null())
-            else {
-                continue;
-            };
-            let key = a["worktree"].as_str().unwrap_or("");
-            let cwd = space_cwd(root, &repo, &thread, key);
-            let mut agent = Node {
-                stage: Some(si),
-                worktree: Some(key.to_string()).filter(|k| !k.is_empty()),
-                ..dir_node(Kind::Agent, name, &tdir.join(name))
-            };
-            agent
-                .children
-                .extend(crate::diffs::diff_nodes(&home, &cwd, &repo, &agent.path));
-            agents.push(agent);
+        if let Some((repo, thread)) = read_thread(root, &home, &tdir) {
+            spaces.entry(repo).or_default().push(thread);
         }
-        // FLOWPLAN (the plan + live run log) is the thread's first child. Strays stay on disk only (stray agents/).
-        let plan = tdir.join("FLOWPLAN");
-        if plan.exists() {
-            agents.insert(
-                0,
-                Node {
-                    kind: Kind::Output,
-                    label: "FLOWPLAN".into(),
-                    path: plan,
-                    children: vec![],
-                    stage: None,
-                    worktree: None,
-                },
-            );
-        }
-        spaces.entry(repo).or_default().push(Node {
-            kind: Kind::Thread,
-            label: thread,
-            path: tdir.clone(),
-            children: agents,
-            stage: None,
-            worktree: None,
-        });
     }
     spaces
         .into_iter()
@@ -158,15 +111,67 @@ pub fn build(root: &Path) -> Vec<Node> {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| cwd.to_string_lossy().into_owned());
             Node {
-                kind: Kind::Space,
-                label,
-                path: cwd,
                 children,
-                stage: None,
-                worktree: None,
+                ..Node::new(Kind::Space, label, cwd)
             }
         })
         .collect()
+}
+
+/// A thread's repo and node: FLOWPLAN first, then its launched agents with their diffs.
+/// None unless both its flowmap.json and state.json parse.
+fn read_thread(root: &Path, home: &Path, tdir: &Path) -> Option<(PathBuf, Node)> {
+    let read = |f: &str| {
+        fs::read_to_string(tdir.join(f))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    };
+    let (Some(flow), Some(state)) = (read("flowmap.json"), read("state.json")) else {
+        return None;
+    };
+    let thread = tdir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let repo = PathBuf::from(state["repo"].as_str().unwrap_or_default());
+    let mut agents = Vec::new();
+    for (si, a) in flow["stages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(i, s)| s.as_array().into_iter().flatten().map(move |a| (i, a)))
+    {
+        // Only agents that have been launched: set_agent puts them in state.json's "agents".
+        let Some(name) = a["name"]
+            .as_str()
+            .filter(|n| !state["agents"][*n].is_null())
+        else {
+            continue;
+        };
+        let key = a["worktree"].as_str().unwrap_or("");
+        let cwd = space_cwd(root, &repo, &thread, key);
+        let mut agent = Node {
+            stage: Some(si),
+            worktree: Some(key.to_string()).filter(|k| !k.is_empty()),
+            ..dir_node(Kind::Agent, name, &tdir.join(name))
+        };
+        agent
+            .children
+            .extend(crate::diffs::diff_nodes(home, &cwd, &repo, &agent.path));
+        agents.push(agent);
+    }
+    // FLOWPLAN (the plan + live run log) is the thread's first child. Strays stay on disk only (stray agents/).
+    let plan = tdir.join("FLOWPLAN");
+    if plan.exists() {
+        agents.insert(0, Node::new(Kind::Output, "FLOWPLAN", plan));
+    }
+    let node = Node {
+        children: agents,
+        ..Node::new(Kind::Thread, thread, tdir.into())
+    };
+    Some((repo, node))
 }
 
 /// An agent or subagent dir: its output.md and flow.md (if written), then its subagent dirs.
@@ -175,14 +180,7 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
     for name in ["output.md", "flow.md"] {
         let out = dir.join(name);
         if out.exists() {
-            children.push(Node {
-                kind: Kind::Output,
-                label: name.into(),
-                path: out,
-                children: vec![],
-                stage: None,
-                worktree: None,
-            });
+            children.push(Node::new(Kind::Output, name, out));
         }
     }
     // dot dirs (.diff, the frozen diffs) are brigd's own, not subagents
@@ -207,12 +205,8 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
         ));
     }
     Node {
-        kind,
-        label: label.into(),
-        path: dir.into(),
         children,
-        stage: None,
-        worktree: None,
+        ..Node::new(kind, label, dir.into())
     }
 }
 
