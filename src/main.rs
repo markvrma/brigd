@@ -385,6 +385,7 @@ fn install_skill() -> Res<()> {
         .iter()
         .map(|a| agents::skills_dir(a, &home()))
         .collect();
+    dirs.push(agents::skills_dir("claude", &home()));
     dirs.sort();
     dirs.dedup();
     for (dir, (name, text)) in dirs.iter().flat_map(|d| SKILLS.iter().map(move |s| (d, s))) {
