@@ -70,7 +70,7 @@ pub(super) fn plan_lines(
                 .as_deref()
                 .filter(|w| !w.is_empty())
                 .map_or("main".into(), |w| format!("wt {w}"));
-            let meta = format!("{} · {} · {wt}", a.model, a.effort);
+            let meta = format!("{}:{} · {} · {wt}", a.agent, a.model, a.effort);
             out.push(Line::from(vec![
                 guide(if last { "│  └─ " } else { "│  ├─ " }),
                 step(st, frame),

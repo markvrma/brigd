@@ -1,8 +1,9 @@
 //! One agent = one PTY child. A reader thread feeds a vt100 parser the UI can
-//! render; status comes from a file the agent's own claude hooks write. Also the live
+//! render; status comes from a file the agent's own claude hooks write (a non-claude agent
+//! has no hooks: it is working while its PTY prints). Also the live
 //! registry, the hook/session args, resuming a saved session and pid checks.
 
-use crate::store::{home, Status};
+use crate::store::{home, thread_dir, Agent, Status};
 use crate::{transcript, Res};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
@@ -10,6 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use std::{fs, thread};
 
 /// (thread, agent)
@@ -19,6 +21,8 @@ pub type Registry = Arc<Mutex<BTreeMap<Key, Arc<LiveAgent>>>>;
 const ROWS: u16 = 40;
 const COLS: u16 = 120;
 const SCROLLBACK: usize = 2000;
+/// PTY silence after which a non-claude agent counts as idle.
+const QUIET: Duration = Duration::from_secs(20);
 
 /// The process-wide registry of agents started by this brigd. Dead agents stay
 /// in it (check `alive()`) until replaced by a new start of the same key.
@@ -46,6 +50,10 @@ pub struct LiveAgent {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
+    /// When the PTY last printed.
+    last_output: Arc<Mutex<Instant>>,
+    /// A non-claude agent: status from `last_output`, not hooks.
+    pub pty_status: bool,
 }
 
 impl LiveAgent {
@@ -76,12 +84,15 @@ impl LiveAgent {
         let w = writer.clone();
         let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, SCROLLBACK)));
         let p = parser.clone();
+        let last_output = Arc::new(Mutex::new(Instant::now()));
+        let last = last_output.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
+                *last.lock().unwrap() = Instant::now();
                 let mut p = p.lock().unwrap();
                 p.process(&buf[..n]);
                 // A child that asks where the cursor is (ESC[6n; ratatui does, at startup, so a brigd
@@ -105,6 +116,8 @@ impl LiveAgent {
             writer,
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
+            last_output,
+            pty_status: false,
         })
     }
 
@@ -137,9 +150,23 @@ impl LiveAgent {
         let _ = self.child.lock().unwrap().kill();
     }
 
-    /// Idle / Working / Blocked, or Starting before the first hook fires.
+    /// Idle / Working / Blocked, or Starting before the first hook fires. A non-claude agent
+    /// is only ever Working or Idle (engine::supervise marks it blocked in state.json).
     pub fn status(&self) -> Status {
+        if self.pty_status {
+            return quiet_status(self.last_output.lock().unwrap().elapsed());
+        }
         read_status(&self.dir, &self.cwd)
+    }
+}
+
+/// A non-claude agent's status after `quiet` without PTY output.
+// ponytail: a TUI that redraws while idle (a spinner, a clock) never reads as idle.
+fn quiet_status(quiet: Duration) -> Status {
+    if quiet < QUIET {
+        Status::Working
+    } else {
+        Status::Idle
     }
 }
 
@@ -246,40 +273,67 @@ pub fn session_args(dir: &Path) -> Res<[String; 4]> {
     ])
 }
 
-/// Starts `claude <flags> --session-id <new> --settings <hooks> "<prompt>"` in `cwd`,
-/// saves the session id to <dir>/session and registers the agent.
-pub fn start_claude(
+/// Starts agent `a` with `prompt` in `cwd` and registers it; <dir>/agent records which agent
+/// runs. claude: `claude <flags> --session-id <new> --settings <hooks> "<prompt>"`, the session
+/// id saved to <dir>/session. Others: agents::worker_args, with no session.
+pub fn start_agent(
     thread: &str,
-    agent: &str,
+    a: &Agent,
     cwd: &Path,
     dir: &Path,
-    flags: &[String],
     prompt: &str,
 ) -> Res<Arc<LiveAgent>> {
     fs::create_dir_all(dir)?;
-    let mut cmd = CommandBuilder::new("claude");
-    cmd.args(flags);
-    cmd.args(session_args(dir)?);
-    cmd.arg(prompt); // last, and flags use --flag=value so variadic options cannot swallow it
-    Ok(register(LiveAgent::spawn(cmd, thread, agent, cwd, dir)?))
+    fs::write(dir.join("agent"), &a.agent)?;
+    let mut cmd = CommandBuilder::new(&a.agent);
+    let claude = a.agent == "claude";
+    if claude {
+        cmd.args(crate::flow::claude_flags(thread, a));
+        cmd.args(session_args(dir)?);
+        cmd.arg(prompt); // last, and flags use --flag=value so variadic options cannot swallow it
+    } else {
+        reset_run_files(dir);
+        // A stale claude session would make diffs read its transcript.
+        let _ = fs::remove_file(dir.join("session"));
+        cmd.args(crate::agents::worker_args(
+            a,
+            &crate::store::root().join("threads"),
+            prompt,
+        ));
+    }
+    let mut live = LiveAgent::spawn(cmd, thread, &a.name, cwd, dir)?;
+    live.pty_status = !claude;
+    Ok(register(live))
 }
 
-/// The pid in <dir>/pid if it is a live claude on <dir>/session, else None (stale files are ignored).
-/// A missing session file never matches, so an agent without one is never blocked.
+/// The agent <dir>/agent says ran there; claude when missing (older threads, strays).
+pub(crate) fn agent_of(dir: &Path) -> String {
+    fs::read_to_string(dir.join("agent"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "claude".into())
+}
+
+/// The pid in <dir>/pid if it is a live agent of <dir>, else None (stale files are ignored):
+/// claude's command line carries <dir>/session, another agent's its <dir>/prompt.md path.
+/// A missing session file never matches, so a claude without one is never blocked.
 pub fn running_elsewhere(dir: &Path) -> Option<u32> {
     let pid: u32 = fs::read_to_string(dir.join("pid"))
         .ok()?
         .trim()
         .parse()
         .ok()?;
-    let session = fs::read_to_string(dir.join("session")).ok()?;
+    let needle = if agent_of(dir) == "claude" {
+        fs::read_to_string(dir.join("session")).ok()?
+    } else {
+        dir.join("prompt.md").display().to_string()
+    };
     let cmd = Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output()
         .ok()?;
     // ps prints nothing for a dead pid; matching the session id guards against pid reuse.
     String::from_utf8_lossy(&cmd.stdout)
-        .contains(session.trim())
+        .contains(needle.trim())
         .then_some(pid)
 }
 
@@ -334,7 +388,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     let dir = if thread == MASTER {
         master_dir()
     } else {
-        crate::store::thread_dir(thread).join(agent)
+        thread_dir(thread).join(agent)
     };
     if let Some(pid) = running_elsewhere(&dir) {
         return Err(format!("{thread}/{agent}: running in another brigd (pid {pid})").into());
@@ -357,6 +411,9 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
         let a = flow
             .agent(agent)
             .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
+        if a.agent != "claude" {
+            return Err(format!("resume not supported for {}", a.agent).into());
+        }
         cmd.args(crate::flow::claude_flags(thread, a));
         crate::tree::space_cwd(
             &crate::store::root(),
@@ -411,6 +468,27 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(100));
         }
         panic!("screen: {:?}", a.parser.lock().unwrap().screen().contents());
+    }
+
+    #[test]
+    fn non_claude_status_from_pty_output() {
+        assert_eq!(quiet_status(Duration::from_secs(1)), Status::Working);
+        assert_eq!(quiet_status(QUIET), Status::Idle);
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", "sleep 1; printf hi; sleep 5"]);
+        let tmp = std::env::temp_dir();
+        let mut a = LiveAgent::spawn(cmd, "t", "a", &tmp, &tmp).unwrap();
+        a.pty_status = true;
+        *a.last_output.lock().unwrap() -= QUIET; // as if it had been quiet for QUIET already
+        assert_eq!(a.status(), Status::Idle);
+        for _ in 0..50 {
+            if a.parser.lock().unwrap().screen().contents().contains("hi") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(a.status(), Status::Working); // "hi" reset the quiet clock
+        a.kill();
     }
 
     #[test]

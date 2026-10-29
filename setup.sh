@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot, idempotent brigd setup. Assumes Claude Code is the agent.
+# One-shot, idempotent brigd setup. Needs any one of claude, codex, pi, kimi.
 set -euo pipefail
 
 REPO_URL="https://github.com/markvrma/brigd.git"
@@ -10,9 +10,10 @@ command -v git >/dev/null || die "git not found; install git first."
 command -v cargo >/dev/null || die "cargo not found. Install Rust with:
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 then re-run ./setup.sh"
-command -v claude >/dev/null || die "claude (Claude Code) not found. Install it with:
-  npm install -g @anthropic-ai/claude-code
-or see https://docs.claude.com/en/docs/claude-code/setup, then log in with 'claude'."
+have_agent=
+for a in claude codex pi kimi; do command -v "$a" >/dev/null && have_agent=1; done
+[ -n "$have_agent" ] || die "no coding agent found; install one of: claude, codex, pi, kimi.
+For claude: npm install -g @anthropic-ai/claude-code, then log in with 'claude'."
 
 # Run from a brigd checkout, else clone/pull into \$BRIGD_DIR.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,8 +44,10 @@ esac
 "$cargo_bin/brigd" install-skill   # brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills
 
 # ponytail plugin (ponytail-review) for the opt-in plan-review-go path; non-fatal.
+if command -v claude >/dev/null; then
 claude plugin marketplace add DietrichGebert/ponytail >/dev/null 2>&1 || true # already added is fine
 claude plugin install ponytail@ponytail || echo "warning: ponytail install failed; run: claude plugin install ponytail@ponytail" >&2
+fi
 
 if command -v herdr >/dev/null; then echo "found herdr: --bg will use it."
 elif command -v tmux >/dev/null; then echo "found tmux: --bg will use it."
