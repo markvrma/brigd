@@ -1,8 +1,12 @@
+use super::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use super::input::key_bytes;
 use super::sidebar::flatten;
+use super::sidebar::hit;
 use super::tabs::Tabs;
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
 use super::threads::fresh_name;
+use super::threads::Act;
 use super::*;
 
 fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
