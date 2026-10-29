@@ -1,13 +1,13 @@
 //! The sidebar tree, read from disk: space (repo basename) → thread → agent →
-//! [output.md, flow.md, subagent dirs → output.md …, changed files]. Also mirrors claude's
-//! subagent transcripts into <agent>/<subagent>/output.md.
+//! [output.md, flow.md, subagent dirs → output.md …, changed files].
 
+use crate::transcript::{add, changed_files, subagents_dir, transcript_path};
 use crate::Res;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -57,11 +57,6 @@ pub struct Node {
     pub worktree: Option<String>,
 }
 
-/// claude's ~/.claude/projects dir name for a cwd: every `/` and `.` becomes `-`.
-pub fn slug(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace(['/', '.'], "-")
-}
-
 /// The directory a space's agents run in: the repo for key "", else its worktree.
 pub fn space_cwd(root: &Path, repo: &Path, thread: &str, key: &str) -> PathBuf {
     if key.is_empty() {
@@ -69,14 +64,6 @@ pub fn space_cwd(root: &Path, repo: &Path, thread: &str, key: &str) -> PathBuf {
     } else {
         root.join("worktrees").join(thread).join(key)
     }
-}
-
-/// Where claude keeps the subagent transcripts of a session.
-pub fn subagents_dir(home: &Path, cwd: &Path, session: &str) -> PathBuf {
-    home.join(".claude/projects")
-        .join(slug(cwd))
-        .join(session)
-        .join("subagents")
 }
 
 /// Builds the sidebar from `root` (~/.brigd): one space per repo, each thread under its
@@ -340,12 +327,7 @@ fn transcript_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
         .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
         .collect();
     logs.sort();
-    logs.insert(
-        0,
-        home.join(".claude/projects")
-            .join(slug(cwd))
-            .join(format!("{session}.jsonl")),
-    );
+    logs.insert(0, transcript_path(home, cwd, session));
     let mut files: Vec<PathBuf> = Vec::new();
     let mut parsed = PARSED.lock().unwrap();
     for log in logs {
@@ -541,156 +523,16 @@ pub fn revert(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Res<usize> {
     Ok(n)
 }
 
-/// Appends the files in `new` not yet in `out`.
-fn add(out: &mut Vec<PathBuf>, new: Vec<PathBuf>) {
-    for f in new {
-        if !out.contains(&f) {
-            out.push(f);
-        }
-    }
-}
-
-/// The files a transcript changed (Edit/MultiEdit/Write results, and Bash edits'
-/// bashEditDiff.files[]), in first-change order.
-pub fn changed_files(jsonl: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for v in jsonl
-        .lines()
-        .filter(|l| l.contains("\"filePath\""))
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-    {
-        let r = &v["toolUseResult"];
-        let bash = r["bashEditDiff"]["files"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|f| &f["filePath"]);
-        add(
-            &mut out,
-            bash.chain([&r["filePath"]])
-                .filter_map(Value::as_str)
-                .map(PathBuf::from)
-                .collect(),
-        );
-    }
-    out
-}
-
-/// The final text of a transcript: the last assistant end_turn record's text blocks.
-pub fn final_text(jsonl: &str) -> Option<String> {
-    let last = jsonl
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .rfind(|v| v["type"] == "assistant" && v["message"]["stop_reason"] == "end_turn")?;
-    let text: String = last["message"]["content"]
-        .as_array()?
-        .iter()
-        .filter(|b| b["type"] == "text")
-        .filter_map(|b| b["text"].as_str())
-        .collect();
-    (!text.is_empty()).then_some(text)
-}
-
-/// Dir name for a subagent: its description as a slug, plus a short id so it stays unique and stable.
-fn sub_name(id: &str, desc: &str) -> String {
-    let mut s: String = desc
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    while s.contains("--") {
-        s = s.replace("--", "-");
-    }
-    let s: String = s.trim_matches('-').chars().take(32).collect();
-    let s = s.trim_end_matches('-');
-    format!(
-        "{}-{}",
-        if s.is_empty() { "agent" } else { s },
-        &id[..id.len().min(7)]
-    )
-}
-
-/// Mirrors `subagents` (claude's flat transcript dir) into nested dirs under
-/// `agent_dir`, following meta.parentAgentId. Writes output.md once a subagent
-/// has finished. Missing `subagents` dir = no subagents yet.
-pub fn sync_subagents(subagents: &Path, agent_dir: &Path) -> io::Result<()> {
-    // ponytail: only subagents/ itself; workflow agents under subagents/workflows/ are skipped.
-    let mut metas: HashMap<String, (Option<String>, String)> = HashMap::new();
-    for e in fs::read_dir(subagents).into_iter().flatten().flatten() {
-        let f = e.file_name().to_string_lossy().into_owned();
-        let Some(id) = f
-            .strip_prefix("agent-")
-            .and_then(|f| f.strip_suffix(".meta.json"))
-        else {
-            continue;
-        };
-        let Ok(m) = fs::read_to_string(e.path())
-            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or_default())
-        else {
-            continue;
-        };
-        let parent = m["parentAgentId"].as_str().map(String::from);
-        metas.insert(
-            id.into(),
-            (parent, m["description"].as_str().unwrap_or("").into()),
-        );
-    }
-    for id in metas.keys() {
-        // Walk up to the top-level subagent; stop at unknown parents and at cycles.
-        let mut chain = vec![id.as_str()];
-        while let Some((Some(p), _)) = metas.get(*chain.last().unwrap()) {
-            if !metas.contains_key(p) || chain.contains(&p.as_str()) || chain.len() > 16 {
-                break;
-            }
-            chain.push(p);
-        }
-        let dir = chain.iter().rev().fold(agent_dir.to_path_buf(), |d, i| {
-            d.join(sub_name(i, &metas[*i].1))
-        });
-        fs::create_dir_all(&dir)?;
-        let jsonl =
-            fs::read_to_string(subagents.join(format!("agent-{id}.jsonl"))).unwrap_or_default();
-        if let Some(text) = final_text(&jsonl) {
-            let out = dir.join("output.md");
-            if fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
-                fs::write(out, text)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::transcript::slug;
 
-    fn tmp(name: &str) -> PathBuf {
+    pub(crate) fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("brigd-tree-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
-    }
-
-    fn end_turn(text: &str) -> String {
-        serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":text}]}}).to_string()
-    }
-
-    #[test]
-    fn changed_files_from_transcript() {
-        let res = |r: Value| serde_json::json!({"type": "user", "toolUseResult": r}).to_string();
-        let j = [
-            res(serde_json::json!({"filePath": "/r/src/main.rs", "structuredPatch": []})),
-            res(serde_json::json!({"type": "create", "filePath": "/r/new.md", "content": "x"})),
-            r#"{"type":"user","toolUseResult":"Error: old_string not found"}"#.into(),
-            res(serde_json::json!({"type": "text", "file": {"filePath": "/r/read.rs"}})), // a Read: not a change
-            res(serde_json::json!({"filePath": "/r/src/main.rs"})),
-            res(serde_json::json!({"stdout": "", "bashEditDiff": {"files": [{"filePath": "/r/src/main.rs"}, {"filePath": "/r/b.sh"}]}})),
-        ]
-        .join("\n");
-        assert_eq!(
-            changed_files(&j),
-            ["/r/src/main.rs", "/r/new.md", "/r/b.sh"].map(PathBuf::from)
-        );
     }
 
     #[test]
@@ -916,67 +758,6 @@ mod tests {
             .lines()
             .all(|l| l != "staged.rs"));
         assert_eq!(revert(&home, &cwd, &cwd, &dir).unwrap(), 0); // nothing left to revert
-        let _ = fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn slug_rule() {
-        assert_eq!(
-            slug(Path::new("/Users/alice/.brigd/x")),
-            "-Users-alice--brigd-x"
-        );
-    }
-
-    #[test]
-    fn final_text_picks_last_end_turn() {
-        let tool = r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"text","text":"no"}]}}"#;
-        let j = [
-            end_turn("first"),
-            tool.into(),
-            end_turn("last"),
-            r#"{"type":"user"}"#.into(),
-        ]
-        .join("\n");
-        assert_eq!(final_text(&j).as_deref(), Some("last"));
-        assert_eq!(final_text(tool), None);
-    }
-
-    #[test]
-    fn sync_nests_subagents() {
-        let d = tmp("sync");
-        let (subs, agent) = (d.join("subagents"), d.join("agent"));
-        fs::create_dir_all(&subs).unwrap();
-        let meta = |id: &str, m: Value| {
-            fs::write(subs.join(format!("agent-{id}.meta.json")), m.to_string()).unwrap()
-        };
-        meta(
-            "aaaaaaaa1",
-            serde_json::json!({"description": "Find the bug!", "spawnDepth": 0}),
-        );
-        meta(
-            "bbbbbbbb2",
-            serde_json::json!({"description": "grep", "spawnDepth": 1, "parentAgentId": "aaaaaaaa1"}),
-        );
-        meta(
-            "ccccccccc",
-            serde_json::json!({"description": "", "spawnDepth": 0}),
-        );
-        fs::write(subs.join("agent-aaaaaaaa1.jsonl"), end_turn("top done")).unwrap();
-        fs::write(subs.join("agent-bbbbbbbb2.jsonl"), end_turn("child done")).unwrap();
-        fs::write(subs.join("agent-ccccccccc.jsonl"), r#"{"type":"user"}"#).unwrap();
-        sync_subagents(&subs, &agent).unwrap();
-        let top = agent.join("find-the-bug-aaaaaaa");
-        assert_eq!(
-            fs::read_to_string(top.join("output.md")).unwrap(),
-            "top done"
-        );
-        assert_eq!(
-            fs::read_to_string(top.join("grep-bbbbbbb/output.md")).unwrap(),
-            "child done"
-        );
-        assert!(agent.join("agent-ccccccc").is_dir());
-        assert!(!agent.join("agent-ccccccc/output.md").exists()); // still running
-        sync_subagents(&d.join("missing"), &agent).unwrap();
         let _ = fs::remove_dir_all(&d);
     }
 

@@ -198,8 +198,10 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
     let home = home();
     let sync = || {
         if let Ok(s) = fs::read_to_string(live.dir.join("session")) {
-            let _ =
-                tree::sync_subagents(&tree::subagents_dir(&home, &live.cwd, s.trim()), &live.dir);
+            let _ = crate::transcript::sync_subagents(
+                &crate::transcript::subagents_dir(&home, &live.cwd, s.trim()),
+                &live.dir,
+            );
         }
     };
     let (mut tick, mut idle_for, mut nudged_at, mut blocked) = (0u32, 0, None::<u32>, false);

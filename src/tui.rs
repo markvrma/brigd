@@ -1311,7 +1311,10 @@ impl App {
             }
             for (dir, cwd) in runs {
                 if let Ok(s) = fs::read_to_string(dir.join("session")) {
-                    let _ = tree::sync_subagents(&tree::subagents_dir(&home, &cwd, s.trim()), &dir);
+                    let _ = crate::transcript::sync_subagents(
+                        &crate::transcript::subagents_dir(&home, &cwd, s.trim()),
+                        &dir,
+                    );
                 }
             }
         }

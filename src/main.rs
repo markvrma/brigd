@@ -9,6 +9,7 @@ mod launch;
 mod runner;
 mod store;
 mod stray;
+mod transcript;
 mod tree;
 mod tui;
 

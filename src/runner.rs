@@ -3,13 +3,14 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs, thread};
 
-use crate::Res;
+use crate::store::home;
+use crate::{transcript, Res};
 
 /// (thread, agent)
 pub type Key = (String, String);
@@ -153,36 +154,8 @@ pub fn read_status(dir: &Path, cwd: &Path) -> String {
     let Ok(session) = fs::read_to_string(dir.join("session")) else {
         return "starting".into();
     };
-    let home = crate::store::home();
-    let path = home
-        .join(".claude/projects")
-        .join(crate::tree::slug(cwd))
-        .join(format!("{}.jsonl", session.trim()));
-    transcript_status(&path).unwrap_or_else(|| "starting".into())
-}
-
-/// Last user/assistant record: assistant end_turn => idle, anything else => working.
-fn transcript_status(path: &Path) -> Option<String> {
-    let mut f = fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)))
-        .ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    for line in text.lines().rev() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match v["type"].as_str() {
-            Some("assistant") if v["message"]["stop_reason"] == "end_turn" => {
-                return Some("idle".into())
-            }
-            Some("assistant" | "user") => return Some("working".into()),
-            _ => {}
-        }
-    }
-    None
+    let path = transcript::transcript_path(&home(), cwd, session.trim());
+    transcript::transcript_status(&path).unwrap_or_else(|| "starting".into())
 }
 
 /// Is `pid` a running process? (`kill -0`)
