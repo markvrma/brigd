@@ -153,7 +153,7 @@ pub fn read_status(dir: &Path, cwd: &Path) -> String {
     let Ok(session) = fs::read_to_string(dir.join("session")) else {
         return "starting".into();
     };
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = crate::store::home();
     let path = home
         .join(".claude/projects")
         .join(crate::tree::slug(cwd))
@@ -311,7 +311,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     if let Some(a) = live(thread, agent).filter(|a| a.alive()) {
         return Ok(a);
     }
-    let dir = crate::thread_dir(thread).join(agent);
+    let dir = crate::store::thread_dir(thread).join(agent);
     if let Some(pid) = running_elsewhere(&dir) {
         return Err(format!("{thread}/{agent}: running in another brigd (pid {pid})").into());
     }
@@ -324,7 +324,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
                 .trim(),
         )
     } else {
-        let (flow, state) = crate::load(thread)?;
+        let (flow, state) = crate::store::load(thread)?;
         let a = flow
             .stages
             .iter()
@@ -333,7 +333,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
             .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
         cmd.args(crate::claude_flags(thread, a));
         crate::tree::space_cwd(
-            &crate::root(),
+            &crate::store::root(),
             Path::new(&state.repo),
             thread,
             a.worktree.as_deref().unwrap_or(""),

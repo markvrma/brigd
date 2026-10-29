@@ -4,16 +4,20 @@
 //! so a thread can be listed, inspected and resumed.
 
 mod runner;
+mod store;
 mod tree;
 mod tui;
 
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::store::{
+    ago, check_new_thread, create_thread, home, load, log, now, output_path, root, set_agent,
+    thread_dir, update, write_json, Agent, Flow, State,
+};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use std::{env, fs, thread};
 
 /// The app-wide result: errors are shown as text.
@@ -72,45 +76,6 @@ const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required"
 "task":{"type":"string"},
 "files":{"type":"array","items":{"type":"string"}},
 "mode":{"type":"string","enum":["default","acceptEdits","auto"]}}}}}}}"#;
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Agent {
-    name: String,
-    model: String,
-    effort: String,
-    #[serde(default)]
-    worktree: Option<String>,
-    task: String,
-    #[serde(default)]
-    files: Vec<String>,
-    #[serde(default = "default_mode")]
-    mode: String,
-}
-
-fn default_mode() -> String {
-    "acceptEdits".into()
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Flow {
-    goal: String,
-    stages: Vec<Vec<Agent>>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct AgentState {
-    status: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct State {
-    thread: String,
-    repo: String,
-    status: String,
-    stage: usize,
-    updated: u64,
-    agents: BTreeMap<String, AgentState>,
-}
 
 fn main() {
     if let Err(e) = real_main() {
@@ -212,52 +177,6 @@ fn ask_prg() -> bool {
 
 // ---------- threads on disk ----------
 
-/// ~/.brigd
-fn root() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".brigd")
-}
-
-fn thread_dir(name: &str) -> PathBuf {
-    root().join("threads").join(name)
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn load(name: &str) -> Res<(Flow, State)> {
-    let dir = thread_dir(name);
-    let read =
-        |f: &str| fs::read_to_string(dir.join(f)).map_err(|e| format!("thread {name}: {f}: {e}"));
-    Ok((
-        serde_json::from_str(&read("flowmap.json")?)?,
-        serde_json::from_str(&read("state.json")?)?,
-    ))
-}
-
-/// Writes via temp file + rename so a crash never leaves a half-written file.
-fn write_json(path: &Path, v: &impl Serialize) -> Res<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(v)?)?;
-    Ok(fs::rename(tmp, path)?)
-}
-
-fn update(state: &Mutex<State>, f: impl FnOnce(&mut State)) -> Res<()> {
-    let mut s = state.lock().unwrap();
-    f(&mut s);
-    s.updated = now();
-    write_json(&thread_dir(&s.thread).join("state.json"), &*s)
-}
-
-fn set_agent(state: &Mutex<State>, agent: &str, status: &str) -> Res<()> {
-    update(state, |s| {
-        s.agents.entry(agent.into()).or_default().status = status.into()
-    })
-}
-
 /// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
 /// files it changed to its base commit (tree::revert), keeps its dir and output.md, and
 /// marks it failed (state.json for a flow agent, the dir's `terminated` file for both).
@@ -287,12 +206,7 @@ fn terminate(thread: &str, agent: &str) -> Res<usize> {
         )
     };
     stop_agent(thread, agent)?;
-    let n = tree::revert(
-        &PathBuf::from(env::var("HOME").unwrap_or_default()),
-        &cwd,
-        &repo,
-        &dir,
-    )?;
+    let n = tree::revert(&home(), &cwd, &repo, &dir)?;
     if let Some(state) = state {
         set_agent(&Mutex::new(state), agent, "failed")?;
     }
@@ -360,131 +274,6 @@ fn stop_thread(thread: &str) {
     for a in agents {
         let _ = stop_agent(thread, &a);
     }
-}
-
-/// <root>/archive/threads/<thread>: where archive_thread moves a thread.
-fn archive_dir(root: &Path, thread: &str) -> PathBuf {
-    root.join("archive/threads").join(thread)
-}
-
-/// Moves <root>/threads/<thread> to archive_dir, unchanged; refuses if that exists. Its git
-/// worktrees stay in <root>/worktrees (moving them by hand would break git's links to them).
-fn archive_thread(root: &Path, thread: &str) -> Res<PathBuf> {
-    let to = archive_dir(root, thread);
-    if to.exists() {
-        return Err(format!("{} already exists", to.display()).into());
-    }
-    fs::create_dir_all(to.parent().unwrap_or(root))?;
-    fs::rename(root.join("threads").join(thread), &to)?;
-    Ok(to)
-}
-
-/// Removes `thread` for good: its git worktrees (in its state.json repo) and their
-/// brigd/<thread>/* branches, then <root>/threads/<thread> and <root>/worktrees/<thread>.
-fn delete_thread(root: &Path, thread: &str) -> Res<()> {
-    let (tdir, wdir) = (
-        root.join("threads").join(thread),
-        root.join("worktrees").join(thread),
-    );
-    let state: serde_json::Value = fs::read_to_string(tdir.join("state.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let repo = state["repo"]
-        .as_str()
-        .map(PathBuf::from)
-        .filter(|r| r.exists());
-    let git = |args: &[&str]| {
-        repo.as_ref().and_then(|r| {
-            Command::new("git")
-                .arg("-C")
-                .arg(r)
-                .args(args)
-                .output()
-                .ok()
-        })
-    };
-    for wt in fs::read_dir(&wdir).into_iter().flatten().flatten() {
-        let _ = git(&[
-            "worktree",
-            "remove",
-            "--force",
-            &wt.path().to_string_lossy(),
-        ]);
-    }
-    for d in [&tdir, &wdir] {
-        match fs::remove_dir_all(d) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(format!("{}: {e}", d.display()).into())
-            }
-            _ => {}
-        }
-    }
-    let _ = git(&["worktree", "prune"]); // forgets any worktree `remove` refused
-    let refs = git(&[
-        "for-each-ref",
-        "--format=%(refname:short)",
-        &format!("refs/heads/brigd/{thread}/"),
-    ])
-    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    .unwrap_or_default();
-    let mut kept = vec![];
-    for b in refs.lines() {
-        if !git(&["branch", "-D", b]).is_some_and(|o| o.status.success()) {
-            kept.push(b);
-        }
-    }
-    if !kept.is_empty() {
-        return Err(format!("could not delete branch(es) {}", kept.join(", ")).into());
-    }
-    Ok(())
-}
-
-/// Appends to ~/.brigd/threads/<thread>/FLOWPLAN, the plan followed by the live run log.
-/// execute never prints: the TUI owns the screen and shows this file.
-/// Log lines go under the plan's last line, LOG_MARK, which the TUI's FLOWPLAN view splits on.
-fn log(thread: &str, msg: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(thread_dir(thread).join("FLOWPLAN"))
-    {
-        let _ = writeln!(f, "   {msg}");
-    }
-}
-
-fn check_new_thread(name: &str) -> Res<()> {
-    if RESERVED.contains(&name) || !valid_name(name, THREAD_MAX) {
-        return Err(format!(
-            "bad thread name {name:?}: [a-z][a-z0-9_-], max {THREAD_MAX}, not one of {RESERVED:?}"
-        )
-        .into());
-    }
-    if thread_dir(name).exists() {
-        return Err(format!(
-            "thread {name} exists: `brigd resume {name}`, or delete {} to reuse the name",
-            thread_dir(name).display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Writes a new thread's dir (it may already exist, reserved by the TUI), state.json with
-/// status "planned" and flowmap.json. Callers write FLOWPLAN themselves.
-fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) -> Res<State> {
-    let dir = root.join("threads").join(name);
-    fs::create_dir_all(&dir)?;
-    let state = State {
-        thread: name.into(),
-        repo: repo.into(),
-        status: "planned".into(),
-        updated: now(),
-        ..Default::default()
-    };
-    write_json(&dir.join("state.json"), &state)?;
-    write_json(&dir.join("flowmap.json"), flow)?;
-    Ok(state)
 }
 
 fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
@@ -1127,10 +916,6 @@ fn ensure_worktree(repo: &Path, thread: &str, key: &str) -> Res<PathBuf> {
     Ok(path)
 }
 
-fn output_path(thread: &str, agent: &str) -> PathBuf {
-    thread_dir(thread).join(agent).join("output.md")
-}
-
 fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
     let mut p = format!(
         "# brigd task: {} (thread {thread}, stage {}/{})\n\nGoal of the whole thread: {}\n\n## Task\n{}\n",
@@ -1178,7 +963,7 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
         out.display(),
         live.dir.join("prompt.md").display()
     );
-    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    let home = home();
     let sync = || {
         if let Ok(s) = fs::read_to_string(live.dir.join("session")) {
             let _ =
@@ -1381,16 +1166,6 @@ fn ensure_shim() -> Res<PathBuf> {
 
 // ---------- ls / status / install-skill ----------
 
-fn ago(t: u64) -> String {
-    let d = now().saturating_sub(t);
-    match d {
-        0..=59 => format!("{d}s ago"),
-        60..=3599 => format!("{}m ago", d / 60),
-        3600..=86399 => format!("{}h ago", d / 3600),
-        _ => format!("{}d ago", d / 86400),
-    }
-}
-
 fn ls() -> Res<()> {
     let root = thread_dir("");
     let mut rows = Vec::new();
@@ -1482,10 +1257,10 @@ fn install_skill() -> Res<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn agent(name: &str, wt: Option<&str>, mode: &str) -> Agent {
+    pub(crate) fn agent(name: &str, wt: Option<&str>, mode: &str) -> Agent {
         Agent {
             name: name.into(),
             model: "haiku".into(),
@@ -1740,93 +1515,6 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         );
         assert_eq!(surfaces(env(&[("HERDR_ENV", "1")])), mac(vec![]));
         assert_eq!(surfaces(env(&[])), mac(vec![]));
-    }
-
-    #[test]
-    fn archive_moves_thread_and_refuses_overwrite() {
-        let root = env::temp_dir().join(format!("brigd-archive-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("threads/th/a")).unwrap();
-        fs::write(root.join("threads/th/a/output.md"), "x").unwrap();
-        let to = archive_thread(&root, "th").unwrap();
-        assert_eq!(to, root.join("archive/threads/th"));
-        assert!(!root.join("threads/th").exists() && to.join("a/output.md").exists());
-        fs::create_dir_all(root.join("threads/th")).unwrap();
-        assert!(archive_thread(&root, "th")
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
-        assert!(root.join("threads/th").exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn delete_removes_worktrees_branches_and_dirs() {
-        let root = env::temp_dir().join(format!("brigd-delete-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repo = root.join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        let git = |a: &[&str]| {
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(a)
-                .output()
-                .unwrap()
-        };
-        git(&["init", "-q"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&["branch", "brigd/other/k"]);
-        for k in ["k1", "k2"] {
-            let wt = root.join("worktrees/th").join(k);
-            assert!(git(&[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                &format!("brigd/th/{k}"),
-                &wt.to_string_lossy()
-            ])
-            .status
-            .success());
-        }
-        fs::create_dir_all(root.join("threads/th")).unwrap();
-        fs::write(
-            root.join("threads/th/state.json"),
-            format!(r#"{{"repo":{:?}}}"#, repo.to_string_lossy()),
-        )
-        .unwrap();
-        delete_thread(&root, "th").unwrap();
-        assert!(!root.join("threads/th").exists() && !root.join("worktrees/th").exists());
-        let out = |a: &[&str]| String::from_utf8_lossy(&git(a).stdout).into_owned();
-        assert_eq!(out(&["worktree", "list"]).lines().count(), 1);
-        assert_eq!(
-            out(&["branch", "--list", "brigd/*", "--format=%(refname:short)"]).trim(),
-            "brigd/other/k"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn create_thread_in_repo() {
-        let root = env::temp_dir().join(format!("brigd-create-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("threads/th")).unwrap(); // reserved by the TUI
-        let flow = Flow {
-            goal: "g".into(),
-            stages: vec![vec![agent("a", None, "default")]],
-        };
-        create_thread(&root, "th", "/some/repo", &flow).unwrap();
-        let st: State =
-            serde_json::from_str(&fs::read_to_string(root.join("threads/th/state.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            (st.repo.as_str(), st.status.as_str()),
-            ("/some/repo", "planned")
-        );
-        assert!(root.join("threads/th/flowmap.json").exists());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

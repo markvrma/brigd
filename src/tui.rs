@@ -287,7 +287,7 @@ struct App {
     /// Selected text waiting for the main loop to put on the clipboard.
     clip: Option<String>,
     /// Open FLOWPLAN tab path -> its thread's flowmap.json and state.json, which the view draws from.
-    plans: HashMap<PathBuf, (crate::Flow, crate::State)>,
+    plans: HashMap<PathBuf, (crate::store::Flow, crate::store::State)>,
     /// (FLOWPLAN path, agent) whose task shows in full. In memory only.
     expanded: HashSet<(PathBuf, String)>,
     /// Task "..." (or expanded task line) rects from the last draw -> the (FLOWPLAN path, agent) it toggles.
@@ -312,7 +312,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
         // The tree is rebuilt off the UI thread (git and disk reads take 40ms+): keys never wait on it.
         let (tx, trees) = mpsc::channel();
         std::thread::spawn(move || {
-            let root = crate::root();
+            let root = crate::store::root();
             while tx.send(tree::build(&root)).is_ok() {
                 std::thread::sleep(REFRESH);
             }
@@ -348,7 +348,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
         // A plan still running dies with brigd: free the names it reserved.
         app.planning
             .iter()
-            .for_each(|n| _ = fs::remove_dir_all(crate::thread_dir(n)));
+            .for_each(|n| _ = fs::remove_dir_all(crate::store::thread_dir(n)));
         Ok(())
     })();
     teardown();
@@ -517,7 +517,7 @@ fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
 /// line pushes (line index, clickable columns, agent) to `hits`: the "..." when collapsed,
 /// the whole line when expanded.
 pub fn plan_lines(
-    flow: &crate::Flow,
+    flow: &crate::store::Flow,
     status: impl Fn(&str) -> &'static str,
     expanded: impl Fn(&str) -> bool,
     hits: &mut Vec<(usize, Range<u16>, String)>,
@@ -1034,7 +1034,7 @@ fn theme_index(name: &str) -> usize {
 /// $BRIGD_THEME, else ~/.brigd/theme, else catppuccin-mocha.
 fn init_theme() {
     let name = env::var("BRIGD_THEME")
-        .or_else(|_| fs::read_to_string(crate::root().join("theme")))
+        .or_else(|_| fs::read_to_string(crate::store::root().join("theme")))
         .unwrap_or_default();
     THEME.store(theme_index(&name), Ordering::Relaxed);
 }
@@ -1042,7 +1042,10 @@ fn init_theme() {
 fn next_theme() -> &'static str {
     let i = (THEME.load(Ordering::Relaxed) + 1) % THEMES.len();
     THEME.store(i, Ordering::Relaxed);
-    let _ = fs::write(crate::root().join("theme"), format!("{}\n", THEMES[i].name)); // ponytail: best effort, lost write just means no persistence
+    let _ = fs::write(
+        crate::store::root().join("theme"),
+        format!("{}\n", THEMES[i].name),
+    ); // ponytail: best effort, lost write just means no persistence
     THEMES[i].name
 }
 
@@ -1191,7 +1194,7 @@ impl App {
 
     /// Re-reads the tree and statuses from disk and the registry.
     fn refresh(&mut self) {
-        self.refresh_with(tree::build(&crate::root()));
+        self.refresh_with(tree::build(&crate::store::root()));
     }
 
     /// `refresh` with a tree already built (by the worker in `run`).
@@ -1285,7 +1288,7 @@ impl App {
         self.resize_all();
         // supervise mirrors subagents only for agents execute runs; this covers ones resumed from the sidebar.
         if self.ticks.is_multiple_of(7) {
-            let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+            let home = crate::store::home();
             let mut runs: Vec<(PathBuf, PathBuf)> = live_agents()
                 .into_iter()
                 .filter(|a| !a.dir.as_os_str().is_empty())
@@ -1329,7 +1332,7 @@ impl App {
             .filter_map(|p| {
                 Some((
                     p.clone(),
-                    crate::load(&p.parent()?.file_name()?.to_string_lossy()).ok()?,
+                    crate::store::load(&p.parent()?.file_name()?.to_string_lossy()).ok()?,
                 ))
             })
             .collect();
@@ -1574,7 +1577,7 @@ impl App {
                 // zsh rcs often prepend PATH; the wrapper rc sources the user's, then puts the shim first again.
                 cmd.env("BRIGD_SHIM", &shim);
                 cmd.env("BRIGD_ZDOTDIR", env::var_os("ZDOTDIR").unwrap_or_default());
-                cmd.env("ZDOTDIR", crate::root().join("zsh"));
+                cmd.env("ZDOTDIR", crate::store::root().join("zsh"));
             }
         }
         match LiveAgent::spawn(cmd, &thread, &name, &cwd, Path::new("")).map(runner::register) {
@@ -1601,7 +1604,7 @@ impl App {
 
     /// Selects and opens a thread's FLOWPLAN viewer.
     fn open_flowplan(&mut self, thread: &str) {
-        let plan = crate::thread_dir(thread).join("FLOWPLAN");
+        let plan = crate::store::thread_dir(thread).join("FLOWPLAN");
         if let Some(i) = self
             .rows
             .iter()
@@ -1782,7 +1785,7 @@ impl App {
     /// run in). RESUME: "continue" + Enter to the same set.
     fn toggle_pause(&mut self, thread: &str) {
         let resume = self.paused.contains(thread);
-        let strays = stray_dirs(&crate::thread_dir(thread))
+        let strays = stray_dirs(&crate::store::thread_dir(thread))
             .iter()
             .any(|d| !matches!(stray_status(d), "off" | "done" | "failed"));
         let mut targets = live_agents()
@@ -1885,12 +1888,12 @@ impl App {
     }
 
     fn archive(&mut self, thread: &str) {
-        let to = crate::archive_dir(&crate::root(), thread);
+        let to = crate::store::archive_dir(&crate::store::root(), thread);
         if to.exists() {
             return self.flash(format!("archive {thread}: {} already exists", to.display()));
         }
         self.stop_thread(thread);
-        match crate::archive_thread(&crate::root(), thread) {
+        match crate::store::archive_thread(&crate::store::root(), thread) {
             Ok(to) => self.flash(format!(
                 "archived {thread} to {} (its worktrees stay put)",
                 to.display()
@@ -1902,7 +1905,7 @@ impl App {
 
     fn delete(&mut self, thread: &str) {
         self.stop_thread(thread);
-        match crate::delete_thread(&crate::root(), thread) {
+        match crate::store::delete_thread(&crate::store::root(), thread) {
             Ok(()) => self.flash(format!("deleted {thread}")),
             Err(e) => self.flash(format!("delete {thread}: {e}")),
         }
@@ -1930,7 +1933,7 @@ impl App {
             .filter(|p| p.is_dir())
         {
             None => Some((0, format!("no such directory: {typed}"))),
-            Some(_) => crate::check_new_thread(fields[1].trim())
+            Some(_) => crate::store::check_new_thread(fields[1].trim())
                 .err()
                 .map(|e| (1, e.to_string()))
                 .or_else(|| {
@@ -1950,11 +1953,11 @@ impl App {
         if prg {
             task = crate::with_prg(&task);
         }
-        let dir = crate::thread_dir(&name);
+        let dir = crate::store::thread_dir(&name);
         // Only the first failing check shows; create_dir reserves the name and tree::build hides
         // the dir until flowmap.json exists.
         let failed = Self::newt_check(&fields).or_else(|| {
-            fs::create_dir_all(crate::root().join("threads"))
+            fs::create_dir_all(crate::store::root().join("threads"))
                 .and_then(|_| fs::create_dir(&dir))
                 .err()
                 .map(|e| (1, e.to_string()))
@@ -1982,7 +1985,12 @@ impl App {
         std::thread::spawn(move || {
             let r = std::panic::catch_unwind(|| {
                 crate::plan(&task, &repo).and_then(|flow| {
-                    crate::create_thread(&crate::root(), &name, &repo.to_string_lossy(), &flow)?;
+                    crate::store::create_thread(
+                        &crate::store::root(),
+                        &name,
+                        &repo.to_string_lossy(),
+                        &flow,
+                    )?;
                     Ok(fs::write(dir.join("FLOWPLAN"), crate::flow_text(&flow))?)
                 })
             })
@@ -2047,13 +2055,14 @@ impl App {
         for name in queued {
             // Claim on disk before spawning so the next tick never sees it queued again.
             // The status cache may be a tick old: only claim what is still queued on disk.
-            let claimed = crate::load(&name).and_then(|(_, mut st)| {
+            let claimed = crate::store::load(&name).and_then(|(_, mut st)| {
                 if st.status != "queued" {
                     return Ok(false);
                 }
                 st.status = "running".into();
-                st.updated = crate::now(); // reconcile treats a stale `updated` as a dead run
-                crate::write_json(&crate::thread_dir(&name).join("state.json"), &st).map(|_| true)
+                st.updated = crate::store::now(); // reconcile treats a stale `updated` as a dead run
+                crate::store::write_json(&crate::store::thread_dir(&name).join("state.json"), &st)
+                    .map(|_| true)
             });
             match claimed {
                 Ok(false) => {}
@@ -2074,7 +2083,7 @@ impl App {
             .filter(|(_, st)| *st == "running")
             .filter_map(|(p, _)| Some(p.file_name()?.to_string_lossy().into_owned()))
         {
-            if let Ok((_, mut st)) = crate::load(&name) {
+            if let Ok((_, mut st)) = crate::store::load(&name) {
                 let _ = crate::reconcile(&name, &mut st);
             }
         }
@@ -2082,7 +2091,7 @@ impl App {
 
     /// y on a planned thread: the same execute as --flow / resume, off the UI thread.
     fn run_planned(&mut self, name: String) {
-        match crate::load(&name) {
+        match crate::store::load(&name) {
             Ok((flow, state)) => {
                 let tx = self.tx();
                 std::thread::spawn(move || {
@@ -3528,7 +3537,7 @@ mod tests {
 
     #[test]
     fn flowplan_view_draws_step_tree() {
-        let agent = |name: &str, wt: Option<&str>| crate::Agent {
+        let agent = |name: &str, wt: Option<&str>| crate::store::Agent {
             name: name.into(),
             model: "haiku".into(),
             effort: "low".into(),
@@ -3540,7 +3549,7 @@ mod tests {
             files: vec![],
             mode: "default".into(),
         };
-        let flow = crate::Flow {
+        let flow = crate::store::Flow {
             goal: "ship it".into(),
             stages: vec![
                 vec![agent("check-db", None), agent("trace-auth", Some("login"))],
@@ -3555,13 +3564,13 @@ mod tests {
         );
 
         let path = PathBuf::from("/th/FLOWPLAN");
-        let mut state = crate::State {
+        let mut state = crate::store::State {
             thread: "th".into(),
             ..Default::default()
         };
         state.agents.insert(
             "check-db".into(),
-            crate::AgentState {
+            crate::store::AgentState {
                 status: "done".into(),
             },
         );
@@ -4104,11 +4113,11 @@ mod tests {
         let mut app = mk("do it");
         enter(&mut app);
         assert!(app.newt.as_ref().unwrap().ask);
-        assert!(!crate::thread_dir(&name).exists());
+        assert!(!crate::store::thread_dir(&name).exists());
         app.on_key(key(KeyCode::Esc, KeyModifiers::NONE));
         let n = app.newt.as_ref().unwrap();
         assert!(!n.ask && !n.planning && n.focus == 2);
-        assert!(!crate::thread_dir(&name).exists());
+        assert!(!crate::store::thread_dir(&name).exists());
         // A bad field fails before asking.
         let mut bad = mk("");
         enter(&mut bad);

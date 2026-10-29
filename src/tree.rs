@@ -82,7 +82,7 @@ pub fn subagents_dir(home: &Path, cwd: &Path, session: &str) -> PathBuf {
 /// Builds the sidebar from `root` (~/.brigd): one space per repo, each thread under its
 /// repo once, holding all its agents (each tagged with the worktree it runs in).
 pub fn build(root: &Path) -> Vec<Node> {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let home = crate::store::home();
     let mut spaces: BTreeMap<PathBuf, Vec<Node>> = BTreeMap::new();
     let mut threads: Vec<PathBuf> = fs::read_dir(root.join("threads"))
         .into_iter()
