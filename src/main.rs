@@ -7,7 +7,6 @@ mod runner;
 mod tree;
 mod tui;
 
-use runner::Res;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
@@ -16,6 +15,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, thread};
+
+/// The app-wide result: errors are shown as text.
+pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const SKILL: &str = include_str!("../skills/brigd-plan/SKILL.md");
 // Installed by `brigd install-skill`; brigd-plan first, plan-review-go, grill-me, grilling and find-skills back the opt-in plan-review-go path; brigd-resume continues a thread.

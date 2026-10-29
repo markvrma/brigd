@@ -9,7 +9,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs, thread};
 
-pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::Res;
+
 /// (thread, agent)
 pub type Key = (String, String);
 pub type Registry = Arc<Mutex<BTreeMap<Key, Arc<LiveAgent>>>>;

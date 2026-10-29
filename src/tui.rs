@@ -2,8 +2,9 @@
 //! selected thread, one or two side-by-side panes, each a tab bar of agent terminals
 //! (runner.rs PTYs drawn with tui-term) and read-only output.md viewers.
 
-use crate::runner::{self, LiveAgent, Res};
+use crate::runner::{self, LiveAgent};
 use crate::tree::{self, Kind, Node};
+use crate::Res;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,

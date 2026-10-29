@@ -2,7 +2,7 @@
 //! [output.md, flow.md, subagent dirs → output.md …, changed files]. Also mirrors claude's
 //! subagent transcripts into <agent>/<subagent>/output.md.
 
-use crate::runner::Res;
+use crate::Res;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
