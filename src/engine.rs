@@ -5,6 +5,7 @@ use crate::diffs::record_base;
 use crate::flow::{claude_flags, read_flow, task_prompt};
 use crate::store::{
     home, load, log, now, root, set_agent, thread_dir, update, write_json, Agent, Flow, State,
+    Status,
 };
 use crate::{runner, transcript, tree, tui, Res};
 use std::collections::BTreeSet;
@@ -50,7 +51,7 @@ pub(crate) fn execute(name: &str, flow: &Flow, state: State) -> Res<()> {
     let mut i = state.stage;
     let mut flow = flow.clone();
     let state = Mutex::new(state);
-    update(&state, |s| s.status = "running".into())?;
+    update(&state, |s| s.status = Status::Running)?;
     loop {
         // flowmap.json is live: agents may rewrite later stages, so reread it before every stage.
         let path = thread_dir(name).join("flowmap.json");
@@ -71,7 +72,7 @@ pub(crate) fn execute(name: &str, flow: &Flow, state: State) -> Res<()> {
         );
         let outcome = run_stage(name, &flow, i, &state);
         if !matches!(outcome, Ok(true)) {
-            update(&state, |s| s.status = "failed".into())?;
+            update(&state, |s| s.status = Status::Failed)?;
             let why = outcome.err().map(|e| format!(": {e}")).unwrap_or_default();
             let msg = format!("stage {} failed{why}", i + 1);
             log(name, &msg);
@@ -80,7 +81,7 @@ pub(crate) fn execute(name: &str, flow: &Flow, state: State) -> Res<()> {
         i += 1;
     }
     update(&state, |s| {
-        s.status = "done".into();
+        s.status = Status::Done;
         s.stage = flow.stages.len();
     })?;
     log(name, "done");
@@ -109,7 +110,7 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
             .unwrap()
             .agents
             .get(&a.name)
-            .is_some_and(|s| s.status == "done");
+            .is_some_and(|s| s.status == Status::Done);
         if done {
             continue;
         }
@@ -141,7 +142,7 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
             &claude_flags(thread, a),
             &prompt,
         )?;
-        set_agent(state, &a.name, "running")?;
+        set_agent(state, &a.name, Status::Running)?;
         jobs.push((a, live));
     }
 
@@ -221,7 +222,7 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             log(thread, &format!("{} terminated", a.name));
             break false;
         }
-        if out.exists() && (!alive || status == "idle") {
+        if out.exists() && (!alive || status == Status::Idle) {
             log(thread, &format!("{} done", a.name));
             break true;
         }
@@ -232,20 +233,20 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
             );
             break false;
         }
-        if status == "blocked" {
+        if status == Status::Blocked {
             if !blocked {
                 blocked = true;
-                let _ = set_agent(state, &a.name, "blocked");
+                let _ = set_agent(state, &a.name, Status::Blocked);
                 log(thread, &format!("{} needs you (blocked)", a.name));
             }
             continue;
         }
         if blocked {
             blocked = false;
-            let _ = set_agent(state, &a.name, "running");
+            let _ = set_agent(state, &a.name, Status::Running);
         }
         // "starting" (e.g. a trust dialog) and "working" just wait. A nudge needs a moment to show as working.
-        if status != "idle" || nudged_at.is_some_and(|t| tick - t < NUDGE_COOLDOWN) {
+        if status != Status::Idle || nudged_at.is_some_and(|t| tick - t < NUDGE_COOLDOWN) {
             idle_for = 0;
             continue;
         }
@@ -274,14 +275,18 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
         }
     };
     sync();
-    let _ = set_agent(state, &a.name, if ok { "done" } else { "failed" });
+    let _ = set_agent(
+        state,
+        &a.name,
+        if ok { Status::Done } else { Status::Failed },
+    );
     ok
 }
 
 /// A live claude (this or another brigd) on a thread marked running. A running status alone
 /// can be stale after a crash, so the agents' pid files decide.
 pub(crate) fn thread_busy(name: &str, state: &State) -> Option<u32> {
-    if state.status != "running" {
+    if state.status != Status::Running {
         return None;
     }
     state
@@ -294,7 +299,7 @@ pub(crate) fn thread_busy(name: &str, state: &State) -> Option<u32> {
 /// executing it, nothing touched it for 30s and no agent pid file has a live claude.
 /// Leaves `updated` alone (ls sorts by it). True when it changed the state.
 pub(crate) fn reconcile(name: &str, state: &mut State) -> Res<bool> {
-    if state.status != "running"
+    if state.status != Status::Running
         || executing(name)
         || now().saturating_sub(state.updated) <= 30
         || thread_busy(name, state).is_some()
@@ -302,11 +307,11 @@ pub(crate) fn reconcile(name: &str, state: &mut State) -> Res<bool> {
         return Ok(false);
     }
     for a in state.agents.values_mut() {
-        if matches!(a.status.as_str(), "running" | "blocked") {
-            a.status = "failed".into();
+        if matches!(a.status, Status::Running | Status::Blocked) {
+            a.status = Status::Failed;
         }
     }
-    state.status = "failed".into();
+    state.status = Status::Failed;
     write_json(&thread_dir(name).join("state.json"), state)?;
     log(name, "stale: no live claude, marked failed");
     Ok(true)
@@ -314,8 +319,8 @@ pub(crate) fn reconcile(name: &str, state: &mut State) -> Res<bool> {
 
 /// The TUI claims a thread only if it is queued, this TUI owns tui.pid, and this
 /// process is not already executing it.
-pub(crate) fn claimable(status: &str, owner: bool, busy: bool) -> bool {
-    status == "queued" && owner && !busy
+pub(crate) fn claimable(status: Status, owner: bool, busy: bool) -> bool {
+    status == Status::Queued && owner && !busy
 }
 
 /// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
@@ -346,7 +351,7 @@ pub(crate) fn terminate(thread: &str, agent: &str) -> Res<usize> {
     stop_agent(thread, agent)?;
     let n = crate::diffs::revert(&home(), &cwd, &repo, &dir)?;
     if let Some(state) = state {
-        set_agent(&Mutex::new(state), agent, "failed")?;
+        set_agent(&Mutex::new(state), agent, Status::Failed)?;
     }
     Ok(n)
 }
@@ -421,10 +426,10 @@ mod tests {
 
     #[test]
     fn claimable_rules() {
-        assert!(claimable("queued", true, false));
-        assert!(!claimable("queued", false, false)); // another TUI owns tui.pid
-        assert!(!claimable("queued", true, true)); // already executing here
-        assert!(!claimable("stopped", true, false));
+        assert!(claimable(Status::Queued, true, false));
+        assert!(!claimable(Status::Queued, false, false)); // another TUI owns tui.pid
+        assert!(!claimable(Status::Queued, true, true)); // already executing here
+        assert!(!claimable(Status::Stopped, true, false));
     }
 
     /// Runs a two-stage flow against a fake `claude` on PATH: the second agent works in a
@@ -481,14 +486,14 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         let state = State {
             thread: "th".into(),
             repo: repo_s.clone(),
-            status: "planned".into(),
+            status: Status::Planned,
             ..Default::default()
         };
         execute("th", &flow, state).unwrap();
 
         let (_, st) = load("th").unwrap();
-        assert_eq!(st.status, "done");
-        assert!(st.agents.values().all(|a| a.status == "done"));
+        assert_eq!(st.status, Status::Done);
+        assert!(st.agents.values().all(|a| a.status == Status::Done));
         let d = thread_dir("th");
         assert_eq!(
             fs::read_to_string(d.join("first/cwd")).unwrap().trim(),
@@ -524,8 +529,8 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
 
         // reconcile: a fresh `updated` is left alone; a stale one with dead pids fails the thread.
         let (_, mut st) = load("th").unwrap();
-        st.status = "running".into();
-        st.agents.get_mut("nudge").unwrap().status = "running".into();
+        st.status = Status::Running;
+        st.agents.get_mut("nudge").unwrap().status = Status::Running;
         st.updated = now();
         let fresh = serde_json::to_string(&st).unwrap();
         assert!(!reconcile("th", &mut st).unwrap());
@@ -538,9 +543,9 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         st.updated = 0;
         assert!(reconcile("th", &mut st).unwrap());
         let (_, st) = load("th").unwrap();
-        assert_eq!((st.status.as_str(), st.updated), ("failed", 0));
-        assert_eq!(st.agents["nudge"].status, "failed");
-        assert_eq!(st.agents["first"].status, "done");
+        assert_eq!((st.status, st.updated), (Status::Failed, 0));
+        assert_eq!(st.agents["nudge"].status, Status::Failed);
+        assert_eq!(st.agents["first"].status, Status::Done);
         let _ = fs::remove_dir_all(&t);
     }
 }

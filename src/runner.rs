@@ -2,7 +2,7 @@
 //! render; status comes from a file the agent's own claude hooks write. Also the live
 //! registry, the hook/session args, resuming a saved session and pid checks.
 
-use crate::store::home;
+use crate::store::{home, Status};
 use crate::{transcript, Res};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
@@ -137,25 +137,25 @@ impl LiveAgent {
         let _ = self.child.lock().unwrap().kill();
     }
 
-    /// idle / working / blocked, or "starting" before the first hook fires.
-    pub fn status(&self) -> String {
+    /// Idle / Working / Blocked, or Starting before the first hook fires.
+    pub fn status(&self) -> Status {
         read_status(&self.dir, &self.cwd)
     }
 }
 
 /// Status from the hook-written <agent>/status file. Without it (hooks did not
 /// fire yet, or not at all), falls back to the tail of the session transcript.
-pub fn read_status(dir: &Path, cwd: &Path) -> String {
+pub fn read_status(dir: &Path, cwd: &Path) -> Status {
     if let Ok(s) = fs::read_to_string(dir.join("status")) {
         if !s.trim().is_empty() {
-            return s.trim().into();
+            return Status::parse(&s);
         }
     }
     let Ok(session) = fs::read_to_string(dir.join("session")) else {
-        return "starting".into();
+        return Status::Starting;
     };
     let path = transcript::transcript_path(&home(), cwd, session.trim());
-    transcript::transcript_status(&path).unwrap_or_else(|| "starting".into())
+    transcript::transcript_status(&path).unwrap_or(Status::Starting)
 }
 
 /// Is `pid` a running process? (`kill -0`)

@@ -1,6 +1,7 @@
 //! FLOWPLAN and flow.md rendering: the step tree of a thread's flow, and mermaid flowcharts drawn the same way.
 
 use super::theme::{pal, stage_color};
+use crate::store::Status;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::ops::Range;
@@ -18,7 +19,7 @@ const TASK_WORDS: usize = 10;
 /// the whole line when expanded.
 pub fn plan_lines(
     flow: &crate::store::Flow,
-    status: impl Fn(&str) -> &'static str,
+    status: impl Fn(&str) -> Status,
     expanded: impl Fn(&str) -> bool,
     hits: &mut Vec<(usize, Range<u16>, String)>,
     frame: usize,
@@ -34,15 +35,18 @@ pub fn plan_lines(
         .unwrap_or(0);
     for (i, stage) in flow.stages.iter().enumerate() {
         let c = stage_color(Some(i));
-        let sts: Vec<&str> = stage.iter().map(|a| status(&a.name)).collect();
-        let st = if sts.iter().all(|s| *s == "done") {
-            "done"
-        } else if sts.contains(&"failed") {
-            "failed"
-        } else if sts.iter().any(|s| matches!(*s, "running" | "blocked")) {
-            "running"
+        let sts: Vec<Status> = stage.iter().map(|a| status(&a.name)).collect();
+        let st = if sts.iter().all(|s| *s == Status::Done) {
+            Status::Done
+        } else if sts.contains(&Status::Failed) {
+            Status::Failed
+        } else if sts
+            .iter()
+            .any(|s| matches!(s, Status::Running | Status::Blocked))
+        {
+            Status::Running
         } else {
-            "pending"
+            Status::Pending
         };
         let n = if stage.len() == 1 {
             "1 agent".to_string()
@@ -69,7 +73,7 @@ pub fn plan_lines(
             let meta = format!("{} · {} · {wt}", a.model, a.effort);
             out.push(Line::from(vec![
                 guide(if last { "│  └─ " } else { "│  ├─ " }),
-                step(st, frame),
+                step(*st, frame),
                 Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)),
                 guide(&meta),
             ]));
@@ -288,7 +292,11 @@ pub(super) fn flow_lines(text: &str) -> Option<Vec<Line<'static>>> {
             let mut ps: Vec<usize> = ins.iter().map(|e| e.0).collect();
             ps.sort();
             ps.dedup();
-            let mut l = vec![Span::styled(lead, dim), step("done", 0), Span::raw("  ")];
+            let mut l = vec![
+                Span::styled(lead, dim),
+                step(Status::Done, 0),
+                Span::raw("  "),
+            ];
             l.push(Span::styled(
                 nodes[v].1.clone(),
                 Style::new().fg(stage_color(Some(i))),
@@ -307,12 +315,14 @@ pub(super) fn flow_lines(text: &str) -> Option<Vec<Line<'static>>> {
 }
 
 /// A step's glyph: pending ◇, running spinner, blocked !, done ✔, failed ✖.
-fn step(st: &str, frame: usize) -> Span<'static> {
+fn step(st: Status, frame: usize) -> Span<'static> {
     match st {
-        "done" => Span::styled("✔", Style::new().fg(pal().green)),
-        "failed" => Span::styled("✖", Style::new().fg(pal().red)),
-        "blocked" => Span::styled("!", Style::new().fg(pal().red).add_modifier(Modifier::BOLD)),
-        "running" => Span::styled(SPIN[frame % SPIN.len()], Style::new().fg(pal().sky)),
+        Status::Done => Span::styled("✔", Style::new().fg(pal().green)),
+        Status::Failed => Span::styled("✖", Style::new().fg(pal().red)),
+        Status::Blocked => {
+            Span::styled("!", Style::new().fg(pal().red).add_modifier(Modifier::BOLD))
+        }
+        Status::Running => Span::styled(SPIN[frame % SPIN.len()], Style::new().fg(pal().sky)),
         _ => Span::styled("◇", Style::new().fg(pal().overlay0)),
     }
 }

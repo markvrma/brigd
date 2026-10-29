@@ -2,6 +2,7 @@
 
 use super::theme::{pal, stage_color};
 use super::App;
+use crate::store::Status;
 use crate::tree::{self, Kind, Node};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Position, Rect};
@@ -117,6 +118,26 @@ pub(super) fn hit(
     let arrow_x = (r.depth * INDENT) as u16;
     let x = col - inner.x;
     Some((i, r.folder && x >= arrow_x && x < arrow_x + 2))
+}
+
+impl Status {
+    /// An agent or terminal row's status glyph and its style.
+    fn glyph(self) -> (&'static str, Style) {
+        match self {
+            Status::Term => ("$ ", Style::new().fg(pal().green)),
+            Status::Running => ("● ", Style::new().fg(pal().green)),
+            Status::Idle => ("◦ ", Style::new().fg(pal().green)),
+            Status::Blocked => (
+                "! ",
+                Style::new()
+                    .fg(pal().red)
+                    .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+            ),
+            Status::Done => ("✓ ", Style::new().fg(pal().blue)),
+            Status::Failed => ("✗ ", Style::new().fg(pal().red)),
+            _ => ("○ ", Style::new().fg(pal().overlay0)),
+        }
+    }
 }
 
 impl App {
@@ -258,22 +279,13 @@ impl App {
                     .agent_status
                     .get(&(r.thread.clone(), r.label.clone()))
                     .copied()
-                    .unwrap_or(if r.kind == Kind::Terminal { "$" } else { "off" });
-                let (g, style) = match st {
-                    "$" => ("$ ", Style::new().fg(pal().green)),
-                    "running" => ("● ", Style::new().fg(pal().green)),
-                    "idle" => ("◦ ", Style::new().fg(pal().green)),
-                    "blocked" => (
-                        "! ",
-                        Style::new()
-                            .fg(pal().red)
-                            .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
-                    ),
-                    "done" => ("✓ ", Style::new().fg(pal().blue)),
-                    "failed" => ("✗ ", Style::new().fg(pal().red)),
-                    _ => ("○ ", Style::new().fg(pal().overlay0)),
-                };
-                label = if st == "blocked" {
+                    .unwrap_or(if r.kind == Kind::Terminal {
+                        Status::Term
+                    } else {
+                        Status::Off
+                    });
+                let (g, style) = st.glyph();
+                label = if st == Status::Blocked {
                     style
                 } else if r.kind == Kind::Terminal {
                     label.fg(pal().text)
@@ -326,11 +338,7 @@ impl App {
             spans.extend(right);
         }
         if r.kind == Kind::Thread {
-            let st = self
-                .thread_status
-                .get(&r.path)
-                .map(String::as_str)
-                .unwrap_or("");
+            let st = self.thread_status.get(&r.path).map_or("", |s| s.as_str());
             spans.push(Span::styled(
                 format!(" {st}"),
                 Style::new().fg(pal().overlay0),

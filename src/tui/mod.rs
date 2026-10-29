@@ -18,6 +18,7 @@
 //! - `refresh_with` order: terminals join the tree, then statuses, tabs, plans, `resize_all`,
 //!   and `reflow` last.
 
+use crate::store::Status;
 use crate::tree::{self, Kind, Node};
 use crate::Res;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -83,7 +84,7 @@ struct App {
     /// (thread, agent) -> running / blocked / done / failed / off
     agent_status: AgentStatuses,
     /// thread dir -> state.json status
-    thread_status: HashMap<PathBuf, String>,
+    thread_status: HashMap<PathBuf, Status>,
     blocked: HashSet<(String, String)>,
     prefix: bool,
     /// Ctrl-t was pressed: the next key acts on the highlighted thread.
@@ -244,7 +245,7 @@ impl App {
     fn bell_on_new_blocked(&self, agents: &AgentStatuses) -> HashSet<(String, String)> {
         let blocked: HashSet<_> = agents
             .iter()
-            .filter(|(_, s)| **s == "blocked")
+            .filter(|(_, s)| **s == Status::Blocked)
             .map(|(k, _)| k.clone())
             .collect();
         if blocked.difference(&self.blocked).next().is_some() {
@@ -346,17 +347,17 @@ impl App {
     ) -> Option<Vec<Line<'static>>> {
         let (flow, state) = self.plans.get(path)?;
         // Saved done/failed wins (a done agent idles on, live); else the live hook status.
-        let status = |a: &str| match state.agents.get(a).map(|s| s.status.as_str()) {
-            Some("done") => "done",
-            Some("failed") => "failed",
+        let status = |a: &str| match state.agents.get(a).map(|s| s.status) {
+            Some(Status::Done) => Status::Done,
+            Some(Status::Failed) => Status::Failed,
             _ => match self
                 .agent_status
                 .get(&(state.thread.clone(), a.to_string()))
                 .copied()
             {
-                Some("running" | "idle") => "running",
-                Some("blocked") => "blocked",
-                _ => "pending",
+                Some(Status::Running | Status::Idle) => Status::Running,
+                Some(Status::Blocked) => Status::Blocked,
+                _ => Status::Pending,
             },
         };
         let frame = SystemTime::now()
@@ -392,25 +393,25 @@ impl App {
 }
 
 /// (thread, agent) -> its sidebar status (agent_glyph_status), terminals running claude included.
-type AgentStatuses = HashMap<(String, String), &'static str>;
+type AgentStatuses = HashMap<(String, String), Status>;
 
 /// Every agent's status (live hook status, else state.json) and every thread's state.json status.
-fn read_statuses(tree: &[Node], reg: &Snapshot) -> (AgentStatuses, HashMap<PathBuf, String>) {
+fn read_statuses(tree: &[Node], reg: &Snapshot) -> (AgentStatuses, HashMap<PathBuf, Status>) {
     let (mut agents, mut threads) = (HashMap::new(), HashMap::new());
     for t in tree.iter().flat_map(|s| &s.children) {
         let state: serde_json::Value = fs::read_to_string(t.path.join("state.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        threads.insert(
-            t.path.clone(),
-            state["status"].as_str().unwrap_or("").to_string(),
-        );
+        // No status (or ""): left out, so the sidebar shows none and nothing claims or reconciles it.
+        if let Some(st) = state["status"].as_str().filter(|s| !s.is_empty()) {
+            threads.insert(t.path.clone(), Status::parse(st));
+        }
         for a in t.children.iter().filter(|a| a.kind == Kind::Agent) {
             let key = (t.label.clone(), a.label.clone());
-            let saved = state["agents"][&a.label]["status"].as_str().unwrap_or("");
+            let saved = Status::parse(state["agents"][&a.label]["status"].as_str().unwrap_or(""));
             let live = reg.get(&key).filter(|l| l.alive()).map(|l| l.status());
-            agents.insert(key, agent_glyph_status(live.as_deref(), saved));
+            agents.insert(key, agent_glyph_status(live, saved));
         }
         // A terminal running claude (a stray whose pid lives) gets that claude's status; else it stays "$".
         for d in tree::stray_dirs(&t.path) {
@@ -418,7 +419,7 @@ fn read_statuses(tree: &[Node], reg: &Snapshot) -> (AgentStatuses, HashMap<PathB
                 stray_status(&d),
                 fs::read_to_string(d.join("term")).unwrap_or_default(),
             );
-            if !matches!(st, "off" | "failed") && !term.is_empty() {
+            if !matches!(st, Status::Off | Status::Failed) && !term.is_empty() {
                 agents.insert((t.label.clone(), term.trim().to_string()), st);
             }
         }

@@ -3,6 +3,7 @@
 use super::newt::Bg;
 use super::App;
 use crate::runner::{self, LiveAgent};
+use crate::store::Status;
 use crate::tree::{self, Kind, Node};
 use ratatui::layout::Rect;
 use std::collections::{BTreeMap, HashSet};
@@ -52,14 +53,14 @@ pub(super) fn live_agents() -> Vec<Arc<LiveAgent>> {
 
 /// While the process lives its hook status wins (a done agent the user types into is live
 /// again): running / blocked / idle. Once it exits: done / failed from state.json, else off.
-pub(super) fn agent_glyph_status(live: Option<&str>, saved: &str) -> &'static str {
+pub(super) fn agent_glyph_status(live: Option<Status>, saved: Status) -> Status {
     match live {
-        Some("blocked") => "blocked",
-        Some("idle") => "idle",
-        Some(_) => "running",
-        None if saved == "done" => "done",
-        None if saved == "failed" => "failed",
-        None => "off",
+        Some(Status::Blocked) => Status::Blocked,
+        Some(Status::Idle) => Status::Idle,
+        Some(_) => Status::Running,
+        None if saved == Status::Done => Status::Done,
+        None if saved == Status::Failed => Status::Failed,
+        None => Status::Off,
     }
 }
 
@@ -101,13 +102,13 @@ pub(super) fn add_terminals(tree: &mut [Node], terms: &[(String, String)]) {
 
 /// A stray running in a terminal tab is no LiveAgent: it is alive while the pid it saved
 /// (exec kept brigd's) runs; the pid file goes once it is gone. Status from its hooks.
-pub(super) fn stray_status(dir: &Path) -> &'static str {
+pub(super) fn stray_status(dir: &Path) -> Status {
     // Gone: terminated by the user (failed) or just exited (off).
     let gone = || {
         if dir.join(runner::TERMINATED).exists() {
-            "failed"
+            Status::Failed
         } else {
-            "off"
+            Status::Off
         }
     };
     let Ok(pid) = fs::read_to_string(dir.join("pid")) else {
@@ -118,7 +119,10 @@ pub(super) fn stray_status(dir: &Path) -> &'static str {
         return gone();
     }
     let cwd = fs::read_to_string(dir.join("cwd")).unwrap_or_default();
-    agent_glyph_status(Some(&runner::read_status(dir, Path::new(cwd.trim()))), "")
+    agent_glyph_status(
+        Some(runner::read_status(dir, Path::new(cwd.trim()))),
+        Status::Pending,
+    )
 }
 
 /// The first `term-<n>` not in `taken`.
@@ -137,7 +141,7 @@ impl App {
         let resume = self.paused.contains(thread);
         let strays = tree::stray_dirs(&crate::store::thread_dir(thread))
             .iter()
-            .any(|d| !matches!(stray_status(d), "off" | "done" | "failed"));
+            .any(|d| !matches!(stray_status(d), Status::Off | Status::Done | Status::Failed));
         let mut targets = live_agents()
             .into_iter()
             .filter(|a| a.thread == thread)
@@ -243,17 +247,18 @@ impl App {
             .iter()
             .filter_map(|(p, st)| {
                 let name = p.file_name()?.to_string_lossy().into_owned();
-                crate::engine::claimable(st, owner, crate::engine::executing(&name)).then_some(name)
+                crate::engine::claimable(*st, owner, crate::engine::executing(&name))
+                    .then_some(name)
             })
             .collect();
         for name in queued {
             // Claim on disk before spawning so the next tick never sees it queued again.
             // The status cache may be a tick old: only claim what is still queued on disk.
             let claimed = crate::store::load(&name).and_then(|(_, mut st)| {
-                if st.status != "queued" {
+                if st.status != Status::Queued {
                     return Ok(false);
                 }
-                st.status = "running".into();
+                st.status = Status::Running;
                 st.updated = crate::store::now(); // reconcile treats a stale `updated` as a dead run
                 crate::store::write_json(&crate::store::thread_dir(&name).join("state.json"), &st)
                     .map(|_| true)
@@ -274,7 +279,7 @@ impl App {
         for name in self
             .thread_status
             .iter()
-            .filter(|(_, st)| *st == "running")
+            .filter(|(_, st)| **st == Status::Running)
             .filter_map(|(p, _)| Some(p.file_name()?.to_string_lossy().into_owned()))
         {
             if let Ok((_, mut st)) = crate::store::load(&name) {

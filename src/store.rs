@@ -36,16 +36,86 @@ pub(crate) struct Flow {
     pub(crate) stages: Vec<Vec<Agent>>,
 }
 
+/// A thread's or agent's status: what state.json stores (lowercase), what the hooks write to an
+/// agent's status file, and the TUI's own off / `$` (a plain terminal).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Status {
+    /// Nothing yet ("" in older state.json files).
+    #[default]
+    #[serde(alias = "")]
+    Pending,
+    /// Thread: created, waiting to be run.
+    Planned,
+    /// Thread: handed to the open TUI (`brigd resume --bg`).
+    Queued,
+    Running,
+    /// Thread: set by hand (the brigd-resume skill) so it can be resumed.
+    Stopped,
+    Done,
+    Failed,
+    /// Hook status: claude has not reported yet.
+    Starting,
+    /// Hook status: claude is working.
+    Working,
+    /// Hook status: claude finished its turn.
+    Idle,
+    /// Hook status: claude waits for the user.
+    Blocked,
+    /// TUI: the agent's process is gone and state.json says neither done nor failed.
+    Off,
+    /// TUI: a terminal tab with no claude running in it.
+    #[serde(rename = "$")]
+    Term,
+    /// Any other value (a hand-edited state.json): read, never acted on.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Status {
+    /// A status from its stored or hook-written text ("" is Pending, anything unknown Unknown).
+    pub(crate) fn parse(s: &str) -> Status {
+        serde_json::from_value(serde_json::Value::from(s.trim())).unwrap_or(Status::Unknown)
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Status::Pending => "pending",
+            Status::Planned => "planned",
+            Status::Queued => "queued",
+            Status::Running => "running",
+            Status::Stopped => "stopped",
+            Status::Done => "done",
+            Status::Failed => "failed",
+            Status::Starting => "starting",
+            Status::Working => "working",
+            Status::Idle => "idle",
+            Status::Blocked => "blocked",
+            Status::Off => "off",
+            Status::Term => "$",
+            Status::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct AgentState {
-    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) status: Status,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct State {
     pub(crate) thread: String,
     pub(crate) repo: String,
-    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) status: Status,
     pub(crate) stage: usize,
     pub(crate) updated: u64,
     pub(crate) agents: BTreeMap<String, AgentState>,
@@ -97,9 +167,9 @@ pub(crate) fn update(state: &Mutex<State>, f: impl FnOnce(&mut State)) -> Res<()
     write_json(&thread_dir(&s.thread).join("state.json"), &*s)
 }
 
-pub(crate) fn set_agent(state: &Mutex<State>, agent: &str, status: &str) -> Res<()> {
+pub(crate) fn set_agent(state: &Mutex<State>, agent: &str, status: Status) -> Res<()> {
     update(state, |s| {
-        s.agents.entry(agent.into()).or_default().status = status.into()
+        s.agents.entry(agent.into()).or_default().status = status
     })
 }
 
@@ -141,7 +211,7 @@ pub(crate) fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) ->
     let state = State {
         thread: name.into(),
         repo: repo.into(),
-        status: "planned".into(),
+        status: Status::Planned,
         updated: now(),
         ..Default::default()
     };
@@ -327,10 +397,26 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(root.join("threads/th/state.json")).unwrap())
                 .unwrap();
         assert_eq!(
-            (st.repo.as_str(), st.status.as_str()),
-            ("/some/repo", "planned")
+            (st.repo.as_str(), st.status),
+            ("/some/repo", Status::Planned)
         );
         assert!(root.join("threads/th/flowmap.json").exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn status_wire_format() {
+        let st: State = serde_json::from_str(
+            r#"{"thread":"t","repo":"r","status":"stopped","stage":0,"updated":0,
+                "agents":{"a":{"status":""},"b":{"status":"weird"},"c":{}}}"#,
+        )
+        .unwrap();
+        assert_eq!(st.status, Status::Stopped);
+        let a: Vec<Status> = st.agents.values().map(|a| a.status).collect();
+        assert_eq!(a, [Status::Pending, Status::Unknown, Status::Pending]);
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(json.contains(r#""status":"stopped""#) && json.contains(r#""status":"pending""#));
+        assert_eq!(Status::parse("idle\n"), Status::Idle);
+        assert_eq!(format!("{:<8}|", Status::Done), "done    |");
     }
 }

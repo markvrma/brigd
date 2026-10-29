@@ -2,6 +2,7 @@
 //! where they are, the status, changed files and final text read from them, and mirroring
 //! subagent transcripts into <agent>/<subagent>/output.md.
 
+use crate::store::Status;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
@@ -29,7 +30,7 @@ pub(crate) fn subagents_dir(home: &Path, cwd: &Path, session: &str) -> PathBuf {
 }
 
 /// Last user/assistant record: assistant end_turn => idle, anything else => working.
-pub(crate) fn transcript_status(path: &Path) -> Option<String> {
+pub(crate) fn transcript_status(path: &Path) -> Option<Status> {
     let mut f = fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)))
@@ -43,9 +44,9 @@ pub(crate) fn transcript_status(path: &Path) -> Option<String> {
         };
         match v["type"].as_str() {
             Some("assistant") if v["message"]["stop_reason"] == "end_turn" => {
-                return Some("idle".into())
+                return Some(Status::Idle)
             }
-            Some("assistant" | "user") => return Some("working".into()),
+            Some("assistant" | "user") => return Some(Status::Working),
             _ => {}
         }
     }

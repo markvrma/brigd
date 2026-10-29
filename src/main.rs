@@ -29,7 +29,7 @@ use crate::flow::{flow_from_json, flow_text, plan, print_flow, read_flow, SKILL}
 use crate::launch::{background, launch_bg, resume_how, tui_alive, ResumeMode};
 use crate::store::{
     ago, check_new_thread, create_thread, load, now, output_path, root, thread_dir, write_json,
-    Flow,
+    Flow, Status,
 };
 use crate::stray::stray;
 use std::io::{self, IsTerminal, Write};
@@ -107,7 +107,7 @@ fn real_main() -> Res<()> {
 /// in a new terminal (see launch::resume_how).
 fn cmd_resume(name: &str, bg: bool) -> Res<()> {
     let (flow, state) = load(name)?;
-    if state.status == "done" {
+    if state.status == Status::Done {
         return Err(format!("thread {name} is already done").into());
     }
     // A thread saved with N at the confirm has no FLOWPLAN yet.
@@ -118,7 +118,7 @@ fn cmd_resume(name: &str, bg: bool) -> Res<()> {
     if let Some(pid) = thread_busy(name, &state) {
         return Err(format!("thread {name} is already running (pid {pid})").into());
     }
-    if bg && state.status == "queued" {
+    if bg && state.status == Status::Queued {
         println!("brigd: thread {name} is already queued");
         return Ok(());
     }
@@ -130,7 +130,7 @@ fn cmd_resume(name: &str, bg: bool) -> Res<()> {
             if let Some(pid) = thread_busy(name, &state) {
                 return Err(format!("thread {name} is already running (pid {pid})").into());
             }
-            state.status = "queued".into();
+            state.status = Status::Queued;
             state.updated = now();
             write_json(&thread_dir(name).join("state.json"), &state)?;
             println!("brigd: thread {name} queued; the open brigd TUI runs it");
@@ -228,7 +228,11 @@ fn cmd_ls() -> Res<()> {
         if let Ok((flow, mut st)) = load(&name) {
             let _ = reconcile(&name, &mut st);
             let total: usize = flow.stages.iter().map(Vec::len).sum();
-            let done = st.agents.values().filter(|a| a.status == "done").count();
+            let done = st
+                .agents
+                .values()
+                .filter(|a| a.status == Status::Done)
+                .count();
             let stage = format!(
                 "{}/{}",
                 (st.stage + 1).min(flow.stages.len()),
@@ -274,11 +278,7 @@ fn cmd_status(name: &str) -> Res<()> {
         println!("stage {}", i + 1);
         for a in stage {
             let s = st.agents.get(&a.name).cloned().unwrap_or_default();
-            let status = if s.status.is_empty() {
-                "pending"
-            } else {
-                &s.status
-            };
+            let status = s.status;
             let out = output_path(name, &a.name);
             let out = if out.exists() {
                 out.display().to_string()

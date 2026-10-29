@@ -2,7 +2,7 @@
 //! one, and the text derived from it (FLOWPLAN, each agent's prompt.md and claude flags).
 
 use crate::launch::PARENT_SESSION_VARS;
-use crate::store::{output_path, thread_dir, Agent, Flow};
+use crate::store::{output_path, thread_dir, Agent, Flow, Status};
 use crate::{tui, Res};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -176,7 +176,7 @@ pub(crate) const LOG_MARK: &str = "└  log";
 
 /// The TUI's FLOWPLAN tree (tui::plan_lines) as plain text, every step pending, ending at LOG_MARK.
 pub(crate) fn flow_text(flow: &Flow) -> String {
-    tui::plan_lines(flow, |_| "pending", |_| true, &mut vec![], 0, 100)
+    tui::plan_lines(flow, |_| Status::Pending, |_| true, &mut vec![], 0, 100)
         .iter()
         .map(|l| {
             l.spans

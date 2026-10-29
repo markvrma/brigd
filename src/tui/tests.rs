@@ -29,11 +29,12 @@ fn one_pane(list: Vec<Tab>) -> ThreadPanes {
 
 #[test]
 fn live_status_beats_saved() {
-    assert_eq!(agent_glyph_status(Some("working"), "done"), "running");
-    assert_eq!(agent_glyph_status(Some("idle"), "done"), "idle");
-    assert_eq!(agent_glyph_status(Some("blocked"), "failed"), "blocked");
-    assert_eq!(agent_glyph_status(None, "done"), "done");
-    assert_eq!(agent_glyph_status(None, ""), "off");
+    use Status::*;
+    assert_eq!(agent_glyph_status(Some(Working), Done), Running);
+    assert_eq!(agent_glyph_status(Some(Idle), Done), Idle);
+    assert_eq!(agent_glyph_status(Some(Blocked), Failed), Blocked);
+    assert_eq!(agent_glyph_status(None, Done), Done);
+    assert_eq!(agent_glyph_status(None, Pending), Off);
 }
 
 #[test]
@@ -381,12 +382,12 @@ fn flowplan_view_draws_step_tree() {
     state.agents.insert(
         "check-db".into(),
         crate::store::AgentState {
-            status: "done".into(),
+            status: Status::Done,
         },
     );
     let mut app = App::default();
     app.agent_status
-        .insert(("th".into(), "trace-auth".into()), "running");
+        .insert(("th".into(), "trace-auth".into()), Status::Running);
     app.plans.insert(path.clone(), (flow, state));
     let tab = Tab::View {
         path,
