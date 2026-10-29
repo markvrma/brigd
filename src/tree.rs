@@ -27,6 +27,19 @@ pub const STRAY: &str = "stray agents";
 /// The folder of a thread's live terminals (synthetic path <thread dir>/.terminal).
 pub const TERMS: &str = "terminal";
 
+/// The dirs of a thread's strays (<thread dir>/stray agents/*), recorded on disk but not in the tree.
+pub(crate) fn stray_dirs(thread_dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = fs::read_dir(thread_dir.join(STRAY))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    v.sort();
+    v
+}
+
 /// An agent's registry/state name: its label, or "stray agents/<label>" for a stray.
 pub fn agent_id(path: &Path, label: &str) -> String {
     if path.parent().is_some_and(|p| p.ends_with(STRAY)) {

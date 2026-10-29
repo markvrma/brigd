@@ -1,9 +1,9 @@
 //! Starting `brigd resume` somewhere else: a new herdr tab, tmux window or Terminal window,
 //! or the already open TUI (tui.pid) when `--bg` is asked for.
 
-use crate::Res;
-
+use crate::runner::{self, sh_quote};
 use crate::store::root;
+use crate::Res;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -32,21 +32,12 @@ pub(crate) fn tui_pid_path() -> PathBuf {
     root().join("tui.pid")
 }
 
-fn pid_alive(pid: u32) -> bool {
-    // ponytail: shells out to kill -0 (no libc dep); a recycled pid reads as alive.
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 pub(crate) fn tui_pid() -> Option<u32> {
     fs::read_to_string(tui_pid_path()).ok()?.trim().parse().ok()
 }
 
 pub(crate) fn tui_alive() -> bool {
-    tui_pid().is_some_and(pid_alive)
+    tui_pid().is_some_and(runner::pid_alive)
 }
 
 /// True when nobody can answer the y/N confirm or watch a fullscreen TUI here: `--bg`,
@@ -96,7 +87,6 @@ fn surfaces(var: impl Fn(&str) -> Option<String>) -> Vec<Surface> {
 /// server, tmux server or Terminal.app owns that process, so it is detached from this
 /// one and from the caller's terminal; brigd only runs short helper commands.
 pub(crate) fn launch_bg(name: &str, repo: &str) -> Res<String> {
-    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     // A tmux window inherits this process's env: drop the calling Claude session's vars so agents start clean.
     let unset: String = PARENT_SESSION_VARS
         .iter()
@@ -104,7 +94,7 @@ pub(crate) fn launch_bg(name: &str, repo: &str) -> Res<String> {
         .collect();
     let cmd = format!(
         "env {unset}{} resume {name}",
-        q(&env::current_exe()?.to_string_lossy())
+        sh_quote(&env::current_exe()?.to_string_lossy())
     );
     let label = format!("brigd-{name}");
     let mut errs = vec![];
@@ -123,7 +113,7 @@ pub(crate) fn launch_bg(name: &str, repo: &str) -> Res<String> {
             ]))
             .map(|_| format!("tmux window {label} (tmux select-window -t {label})")),
             Surface::Terminal => {
-                let sh = format!("cd {} && {cmd}", q(repo));
+                let sh = format!("cd {} && {cmd}", sh_quote(repo));
                 let script = format!(
                     "tell application \"Terminal\" to do script \"{}\"",
                     sh.replace('\\', "\\\\").replace('"', "\\\"")

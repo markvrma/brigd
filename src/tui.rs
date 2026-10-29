@@ -1228,7 +1228,7 @@ impl App {
                 agents.insert(key, agent_glyph_status(live.as_deref(), saved));
             }
             // A terminal running claude (a stray whose pid lives) gets that claude's status; else it stays "$".
-            for d in stray_dirs(&t.path) {
+            for d in tree::stray_dirs(&t.path) {
                 let (st, term) = (
                     stray_status(&d),
                     fs::read_to_string(d.join("term")).unwrap_or_default(),
@@ -1303,7 +1303,7 @@ impl App {
                 .tree
                 .iter()
                 .flat_map(|s| &s.children)
-                .flat_map(|t| stray_dirs(&t.path))
+                .flat_map(|t| tree::stray_dirs(&t.path))
                 .filter(|d| d.join("pid").exists())
             {
                 runs.extend(
@@ -1311,12 +1311,7 @@ impl App {
                 );
             }
             for (dir, cwd) in runs {
-                if let Ok(s) = fs::read_to_string(dir.join("session")) {
-                    let _ = crate::transcript::sync_subagents(
-                        &crate::transcript::subagents_dir(&home, &cwd, s.trim()),
-                        &dir,
-                    );
-                }
+                crate::transcript::sync_agent(&home, &cwd, &dir);
             }
         }
         self.reflow();
@@ -1792,7 +1787,7 @@ impl App {
     /// run in). RESUME: "continue" + Enter to the same set.
     fn toggle_pause(&mut self, thread: &str) {
         let resume = self.paused.contains(thread);
-        let strays = stray_dirs(&crate::store::thread_dir(thread))
+        let strays = tree::stray_dirs(&crate::store::thread_dir(thread))
             .iter()
             .any(|d| !matches!(stray_status(d), "off" | "done" | "failed"));
         let mut targets = live_agents()
@@ -3046,19 +3041,6 @@ impl App {
     }
 }
 
-/// The dirs of a thread's strays (<thread dir>/stray agents/*), recorded on disk but not in the tree.
-fn stray_dirs(thread_dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = fs::read_dir(thread_dir.join(tree::STRAY))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    v.sort();
-    v
-}
-
 /// Lists each thread's live terminals (`terms`: (thread, shell name)) in a TERMS folder, after its
 /// FLOWPLAN if it has one, else first.
 fn add_terminals(tree: &mut [Node], terms: &[(String, String)]) {
@@ -3114,7 +3096,7 @@ fn stray_status(dir: &Path) -> &'static str {
     let Ok(pid) = fs::read_to_string(dir.join("pid")) else {
         return gone();
     };
-    if !runner::pid_alive(&pid) {
+    if !pid.trim().parse().is_ok_and(runner::pid_alive) {
         let _ = fs::remove_file(dir.join("pid"));
         return gone();
     }

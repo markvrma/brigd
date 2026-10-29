@@ -121,6 +121,13 @@ fn sub_name(id: &str, desc: &str) -> String {
     )
 }
 
+/// Mirrors the subagents of the session in <dir>/session (run in `cwd`) into `dir`; best effort.
+pub(crate) fn sync_agent(home: &Path, cwd: &Path, dir: &Path) {
+    if let Ok(s) = fs::read_to_string(dir.join("session")) {
+        let _ = sync_subagents(&subagents_dir(home, cwd, s.trim()), dir);
+    }
+}
+
 /// Mirrors `subagents` (claude's flat transcript dir) into nested dirs under
 /// `agent_dir`, following meta.parentAgentId. Writes output.md once a subagent
 /// has finished. Missing `subagents` dir = no subagents yet.

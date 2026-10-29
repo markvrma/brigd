@@ -6,7 +6,7 @@ use crate::flow::{claude_flags, read_flow, task_prompt};
 use crate::store::{
     home, load, log, now, root, set_agent, thread_dir, update, write_json, Agent, Flow, State,
 };
-use crate::{runner, tree, tui, Res};
+use crate::{runner, transcript, tree, tui, Res};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -197,14 +197,7 @@ fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mute
         live.dir.join("prompt.md").display()
     );
     let home = home();
-    let sync = || {
-        if let Ok(s) = fs::read_to_string(live.dir.join("session")) {
-            let _ = crate::transcript::sync_subagents(
-                &crate::transcript::subagents_dir(&home, &live.cwd, s.trim()),
-                &live.dir,
-            );
-        }
-    };
+    let sync = || transcript::sync_agent(&home, &live.cwd, &live.dir);
     let (mut tick, mut idle_for, mut nudged_at, mut blocked) = (0u32, 0, None::<u32>, false);
     let ok = loop {
         thread::sleep(Duration::from_secs(1));
@@ -362,7 +355,9 @@ fn stop_agent(thread: &str, agent: &str) -> Res<()> {
     // Wait for the process to be gone so it cannot rewrite a file after the revert.
     for i in 0..40 {
         if !runner::live(thread, agent).is_some_and(|l| l.alive())
-            && !pid.as_ref().is_some_and(|p| runner::pid_alive(p))
+            && !pid
+                .as_ref()
+                .is_some_and(|p| p.trim().parse().is_ok_and(runner::pid_alive))
         {
             break;
         }
@@ -387,21 +382,14 @@ pub(crate) fn stop_thread(thread: &str) {
         .filter(|a| a.thread == thread && a.alive())
         .map(|a| a.agent.clone())
         .collect();
-    let strays = fs::read_dir(thread_dir(thread).join(tree::STRAY))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path());
     agents.extend(
-        strays
-            .filter(|d| fs::read_to_string(d.join("pid")).is_ok_and(|p| runner::pid_alive(&p)))
-            .filter_map(|d| {
-                Some(format!(
-                    "{}/{}",
-                    tree::STRAY,
-                    d.file_name()?.to_string_lossy()
-                ))
-            }),
+        tree::stray_dirs(&thread_dir(thread))
+            .into_iter()
+            .filter(|d| {
+                fs::read_to_string(d.join("pid"))
+                    .is_ok_and(|p| p.trim().parse().is_ok_and(runner::pid_alive))
+            })
+            .filter_map(|d| Some(tree::agent_id(&d, &d.file_name()?.to_string_lossy()))),
     );
     for a in agents {
         let _ = stop_agent(thread, &a);
