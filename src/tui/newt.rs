@@ -168,10 +168,7 @@ impl App {
                         &repo.to_string_lossy(),
                         &flow,
                     )?;
-                    Ok(fs::write(
-                        dir.join("FLOWPLAN"),
-                        crate::flow::flow_text(&flow),
-                    )?)
+                    Ok(fs::write(dir.join("FLOWPLAN"), super::flow_text(&flow))?)
                 })
             })
             .unwrap_or_else(|_| Err("planner panicked".into()));

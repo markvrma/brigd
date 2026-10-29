@@ -24,18 +24,19 @@ mod transcript;
 mod tree;
 mod tui;
 
-use crate::engine::{reconcile, run_in_tui, thread_busy};
-use crate::flow::{flow_from_json, flow_text, plan, print_flow, read_flow, SKILL};
+use crate::engine::{execute, reconcile, thread_busy};
+use crate::flow::{flow_from_json, plan, read_flow, SKILL};
 use crate::launch::{background, launch_bg, resume_how, tui_alive, ResumeMode};
 use crate::store::{
     ago, check_new_thread, create_thread, load, now, output_path, root, thread_dir, write_json,
-    Flow, Status,
+    Flow, State, Status,
 };
 use crate::stray::stray;
+use crate::tui::flow_text;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{env, fs};
+use std::{env, fs, thread};
 
 /// The app-wide result: errors are shown as text.
 pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -194,7 +195,7 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     }
     loop {
         write_json(&flow_path, &flow)?;
-        print_flow(&flow);
+        println!("\n{}", flow_text(&flow));
         print!("run thread {name}? [y/N/e(dit)] ");
         io::stdout().flush()?;
         let mut ans = String::new();
@@ -218,6 +219,25 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
             }
         }
     }
+}
+
+/// Runs the thread's flow on a background thread while the TUI owns the screen.
+fn run_in_tui(name: &str, flow: Flow, state: State) -> Res<()> {
+    let n = name.to_string();
+    let job = thread::spawn(move || execute(&n, &flow, state));
+    tui::run(Some(name))?;
+    match job.is_finished().then(|| job.join()) {
+        Some(Ok(Ok(()))) => println!("thread {name} done"),
+        Some(Ok(Err(e))) => println!("thread {name}: {e}"),
+        Some(Err(_)) => println!(
+            "thread {name}: runner panicked, see {}",
+            thread_dir(name).join("FLOWPLAN").display()
+        ),
+        None => {
+            println!("left brigd, agents stopped. `brigd resume {name}` continues thread {name}.")
+        }
+    }
+    Ok(())
 }
 
 fn cmd_ls() -> Res<()> {

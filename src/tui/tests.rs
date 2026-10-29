@@ -367,7 +367,7 @@ fn flowplan_view_draws_step_tree() {
             vec![agent("review", None)],
         ],
     };
-    let text = crate::flow::flow_text(&flow);
+    let text = flow_text(&flow);
     assert!(text.contains("tail-of-trace-auth"), "{text}");
     assert!(
         text.contains("│  ├─ ◇ check-db  ") && text.ends_with("│\n└  log\n"),

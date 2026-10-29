@@ -1,7 +1,6 @@
 //! Thread data and its on-disk layout: ~/.brigd/threads/<thread>/{flowmap.json,state.json,FLOWPLAN}
 //! and <agent>/ dirs. Reading, writing, creating, archiving and deleting threads; no processes.
 
-use crate::flow::{valid_name, RESERVED, THREAD_MAX};
 use crate::Res;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -208,6 +207,21 @@ pub(crate) fn log(thread: &str, msg: &str) {
     {
         let _ = writeln!(f, "   {msg}");
     }
+}
+
+/// Subcommand names, so never thread names.
+pub(crate) const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
+// Keeps "<thread>/<agent>" labels short enough for a sidebar (with flow's AGENT_MAX).
+pub(crate) const THREAD_MAX: usize = 12;
+
+/// A thread, agent or worktree name: [a-z][a-z0-9_-], at most `max` bytes.
+pub(crate) fn valid_name(s: &str, max: usize) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.len() <= max
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
 }
 
 pub(crate) fn check_new_thread(name: &str) -> Res<()> {
@@ -426,6 +440,12 @@ mod tests {
         );
         assert!(root.join("threads/th/flowmap.json").exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn thread_names() {
+        assert!(!valid_name("a-very-long-thread", THREAD_MAX));
+        assert!(RESERVED.contains(&"ls"));
     }
 
     #[test]

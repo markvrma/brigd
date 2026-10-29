@@ -1,6 +1,7 @@
 //! Starting `brigd resume` somewhere else: a new herdr tab, tmux window or Terminal window,
 //! or the already open TUI (tui.pid) when `--bg` is asked for.
 
+use crate::flow::PARENT_SESSION_VARS;
 use crate::runner::{self, sh_quote};
 use crate::store::root;
 use crate::Res;
@@ -47,20 +48,6 @@ pub(crate) fn tui_alive() -> bool {
 pub(crate) fn background(bg_flag: bool, tty: bool, var: impl Fn(&str) -> Option<String>) -> bool {
     bg_flag || !tty || var("CLAUDECODE").is_some_and(|v| !v.is_empty())
 }
-
-/// Vars Claude Code's Bash tool sets that describe the calling session (seen in its env).
-pub(crate) const PARENT_SESSION_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "AI_AGENT",
-];
 
 #[derive(Debug, PartialEq)]
 enum Surface {

@@ -157,9 +157,18 @@ fn read_thread(root: &Path, home: &Path, tdir: &Path) -> Option<(PathBuf, Node)>
             worktree: Some(key.to_string()).filter(|k| !k.is_empty()),
             ..dir_node(Kind::Agent, name, &tdir.join(name))
         };
-        agent
-            .children
-            .extend(crate::diffs::diff_nodes(home, &cwd, &repo, &agent.path));
+        agent.children.extend(
+            crate::diffs::diff_paths(home, &cwd, &repo, &agent.path)
+                .into_iter()
+                .map(|p| {
+                    let label = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    Node::new(Kind::Diff, label, p)
+                }),
+        );
         agents.push(agent);
     }
     // FLOWPLAN (the plan + live run log) is the thread's first child. Strays stay on disk only (stray agents/).

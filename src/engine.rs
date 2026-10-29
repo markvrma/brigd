@@ -7,32 +7,13 @@ use crate::store::{
     home, load, log, now, root, set_agent, thread_dir, update, write_json, Agent, Flow, State,
     Status,
 };
-use crate::{runner, transcript, tree, tui, Res};
+use crate::{runner, transcript, tree, Res};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{fs, thread};
-
-/// Runs the thread's flow on a background thread while the TUI owns the screen.
-pub(crate) fn run_in_tui(name: &str, flow: Flow, state: State) -> Res<()> {
-    let n = name.to_string();
-    let job = thread::spawn(move || execute(&n, &flow, state));
-    tui::run(Some(name))?;
-    match job.is_finished().then(|| job.join()) {
-        Some(Ok(Ok(()))) => println!("thread {name} done"),
-        Some(Ok(Err(e))) => println!("thread {name}: {e}"),
-        Some(Err(_)) => println!(
-            "thread {name}: runner panicked, see {}",
-            thread_dir(name).join("FLOWPLAN").display()
-        ),
-        None => {
-            println!("left brigd, agents stopped. `brigd resume {name}` continues thread {name}.")
-        }
-    }
-    Ok(())
-}
 
 /// Runs the flow from `state.stage` on and returns when it is done or a stage
 /// failed. Blocks, so the TUI calls it from a background thread. Never prints:

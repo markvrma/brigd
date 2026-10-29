@@ -3,7 +3,6 @@
 //! frozen to <agent>/.diff/ once it is done), and reverting them.
 
 use crate::transcript::{add, changed_files, subagents_dir, transcript_path};
-use crate::tree::{Kind, Node};
 use crate::Res;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -162,10 +161,11 @@ fn agent_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// One Diff node per file the agent's session (and its subagents) changed, inside its cwd
-/// and outside its brigd dir, that `git diff` vs its base still shows (so new untracked
-/// files don't). Git is asked at most every 3s per agent.
-pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<Node> {
+/// The diff view path (<dir>/.diff/<file>, read by diff_view) of each file the agent's session
+/// (and its subagents) changed, inside its cwd and outside its brigd dir, that `git diff` vs its
+/// base still shows (so new untracked files don't). Git is asked at most every 3s per agent.
+/// Each path keeps its file's name, which the sidebar shows.
+pub(crate) fn diff_paths(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Vec<PathBuf> {
     let files = agent_files(home, cwd, dir);
     if files.is_empty() {
         return vec![];
@@ -187,9 +187,9 @@ pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
             let path = dir
                 .join(".diff")
                 .join(file.strip_prefix("/").unwrap_or(&file));
-            let label = file.file_name()?.to_string_lossy().into_owned();
+            file.file_name()?;
             if path.is_file() {
-                return Some(Node::new(Kind::Diff, label, path));
+                return Some(path);
             }
             let stat = listed.get(&file)?.clone();
             let rel = file.strip_prefix(cwd).ok()?.to_string_lossy().into_owned();
@@ -201,11 +201,11 @@ pub(crate) fn diff_nodes(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
                     })
                 };
                 if text.and_then(save).is_some() {
-                    return Some(Node::new(Kind::Diff, label, path));
+                    return Some(path);
                 }
             }
             views.insert(path.clone(), (cwd.into(), base.clone(), rel, stat));
-            Some(Node::new(Kind::Diff, label, path))
+            Some(path)
         })
         .collect()
 }
@@ -341,8 +341,13 @@ mod tests {
     use crate::transcript::slug;
     use crate::tree::tests::tmp;
 
+    /// What the sidebar labels a diff path with.
+    fn name(p: &Path) -> &str {
+        p.file_name().unwrap().to_str().unwrap()
+    }
+
     #[test]
-    fn diff_nodes_from_git() {
+    fn diff_paths_from_git() {
         let d = tmp("diffs");
         let (home, cwd, dir) = (d.join("home"), d.join("repo"), d.join("agent"));
         fs::create_dir_all(&dir).unwrap();
@@ -377,20 +382,17 @@ mod tests {
             |f: &Path| serde_json::json!({"toolUseResult": {"filePath": f}}).to_string() + "\n";
         let (a, new) = (cwd.join("src/a.rs"), cwd.join("new.rs"));
         fs::write(&log, edit(&new) + &edit(&a)[..20]).unwrap(); // second line still being written
-        assert!(diff_nodes(&home, &cwd, &cwd, &dir).is_empty());
+        assert!(diff_paths(&home, &cwd, &cwd, &dir).is_empty());
         fs::write(&log, edit(&new) + &edit(&a) + &edit(&dir.join("output.md"))).unwrap();
-        let n = diff_nodes(&home, &cwd, &cwd, &dir);
-        assert_eq!(
-            (n.len(), n[0].label.as_str(), n[0].kind.clone()),
-            (1, "a.rs", Kind::Diff)
-        );
-        let (rel, text) = diff_view(&n[0].path).unwrap();
+        let n = diff_paths(&home, &cwd, &cwd, &dir);
+        assert_eq!((n.len(), name(&n[0])), (1, "a.rs"));
+        let (rel, text) = diff_view(&n[0]).unwrap();
         assert_eq!(rel, "src/a.rs");
         assert!(
             text.contains("+two\n") && text.contains("+three\n"),
             "{text}"
         );
-        assert_eq!(diff_stat(&n[0].path), Some(("2".into(), "0".into())));
+        assert_eq!(diff_stat(&n[0]), Some(("2".into(), "0".into())));
         // output.md lists a file the transcript never named (a Bash edit); the agent is done: diffs freeze
         fs::write(cwd.join("b.rs"), "b\n").unwrap();
         g(&["add", "b.rs"]);
@@ -404,22 +406,18 @@ mod tests {
         )
         .unwrap();
         NAMES.lock().unwrap().clear();
-        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        let n = diff_paths(&home, &cwd, &cwd, &dir);
         assert_eq!(
-            n.iter().map(|x| x.label.as_str()).collect::<Vec<_>>(),
+            n.iter().map(|x| name(x)).collect::<Vec<_>>(),
             ["a.rs", "b.rs"]
         );
-        let before = diff_view(&n[0].path).unwrap();
+        let before = diff_view(&n[0]).unwrap();
         // a later agent changes the file again, and the 3s git cache is stale: still the same diff
         fs::write(&a, "one\nLATER\n").unwrap();
         NAMES.lock().unwrap().clear();
-        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        let n = diff_paths(&home, &cwd, &cwd, &dir);
         assert_eq!(
-            (
-                n.len(),
-                diff_view(&n[0].path).unwrap(),
-                diff_stat(&n[0].path)
-            ),
+            (n.len(), diff_view(&n[0]).unwrap(), diff_stat(&n[0])),
             (2, before.clone(), Some(("2".into(), "0".into())))
         );
         assert!(!before.1.contains("LATER"));
@@ -466,9 +464,9 @@ mod tests {
         let sealed = dir.join(".diff/.sealed");
         // done just now: git runs, the diff freezes, but no seal yet (transcript may still settle)
         let before = calls();
-        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        let n = diff_paths(&home, &cwd, &cwd, &dir);
         assert!(calls() > before);
-        assert_eq!((n.len(), n[0].label.as_str()), (1, "a.rs"));
+        assert_eq!((n.len(), name(&n[0])), (1, "a.rs"));
         assert!(!sealed.exists());
         // done ≥10s ago: the next git pass seals it
         fs::File::options()
@@ -478,15 +476,15 @@ mod tests {
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(20))
             .unwrap();
         NAMES.lock().unwrap().remove(&dir);
-        diff_nodes(&home, &cwd, &cwd, &dir);
+        diff_paths(&home, &cwd, &cwd, &dir);
         assert!(sealed.exists());
         // sealed: no git at all (even with no cached check), the frozen diff still shows
         NAMES.lock().unwrap().remove(&dir);
         let before = calls();
-        let n = diff_nodes(&home, &cwd, &cwd, &dir);
+        let n = diff_paths(&home, &cwd, &cwd, &dir);
         assert_eq!(calls(), before);
-        assert_eq!((n.len(), n[0].label.as_str()), (1, "a.rs"));
-        assert_eq!(diff_stat(&n[0].path), Some(("1".into(), "0".into())));
+        assert_eq!((n.len(), name(&n[0])), (1, "a.rs"));
+        assert_eq!(diff_stat(&n[0]), Some(("1".into(), "0".into())));
         let _ = fs::remove_dir_all(&d);
     }
 

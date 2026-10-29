@@ -1,21 +1,19 @@
 //! The flow definition: its JSON schema and limits, validation, the planner call that writes
-//! one, and the text derived from it (FLOWPLAN, each agent's prompt.md and claude flags).
+//! one, and the text derived from it (each agent's prompt.md and claude flags; FLOWPLAN's is
+//! tui::flow_text).
 
-use crate::launch::PARENT_SESSION_VARS;
-use crate::store::{output_path, thread_dir, Agent, Flow, Status};
-use crate::{tui, Res};
+use crate::store::{output_path, thread_dir, valid_name, Agent, Flow};
+use crate::Res;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 pub(crate) const SKILL: &str = include_str!("../skills/brigd-plan/SKILL.md");
-pub(crate) const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const MODES: &[&str] = &["default", "acceptEdits", "auto"];
 const WRITE_MODES: &[&str] = &["acceptEdits", "auto"];
-// Keeps "<thread>/<agent>" labels short enough for a sidebar.
-pub(crate) const THREAD_MAX: usize = 12;
+// Keeps "<thread>/<agent>" labels short enough for a sidebar (with store::THREAD_MAX).
 const AGENT_MAX: usize = 19;
 
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","stages"],
@@ -31,15 +29,6 @@ const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required"
 "task":{"type":"string"},
 "files":{"type":"array","items":{"type":"string"}},
 "mode":{"type":"string","enum":["default","acceptEdits","auto"]}}}}}}}"#;
-
-pub(crate) fn valid_name(s: &str, max: usize) -> bool {
-    let b = s.as_bytes();
-    !b.is_empty()
-        && b.len() <= max
-        && b[0].is_ascii_lowercase()
-        && b.iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
-}
 
 /// Checks what the schema cannot: at least one stage, no empty stage, unique valid agent
 /// names (not "log"), known effort and mode, valid worktree keys, and at most one editing
@@ -116,6 +105,20 @@ pub(crate) fn read_flow(path: &Path) -> Result<Flow, String> {
     flow_from_json(&fs::read_to_string(path).map_err(|e| e.to_string())?)
 }
 
+/// Vars Claude Code's Bash tool sets that describe the calling session (seen in its env).
+pub(crate) const PARENT_SESSION_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "AI_AGENT",
+];
+
 /// Runs the planner in `repo` and returns a valid flow. Never prints: the TUI calls it too.
 pub(crate) fn plan(task: &str, repo: &Path) -> Res<Flow> {
     let mut prompt = format!("Plan a brigd flow for this task:\n\n{task}");
@@ -167,26 +170,8 @@ pub(crate) fn plan(task: &str, repo: &Path) -> Res<Flow> {
     unreachable!()
 }
 
-pub(crate) fn print_flow(flow: &Flow) {
-    println!("\n{}", flow_text(flow));
-}
-
 /// The last line of the plan in FLOWPLAN; the run log follows it.
 pub(crate) const LOG_MARK: &str = "└  log";
-
-/// The TUI's FLOWPLAN tree (tui::plan_lines) as plain text, every step pending, ending at LOG_MARK.
-pub(crate) fn flow_text(flow: &Flow) -> String {
-    tui::plan_lines(flow, |_| Status::Pending, |_| true, &mut vec![], 0, 100)
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                + "\n"
-        })
-        .collect()
-}
 
 /// The prompt.md for agent `a` in stage `i`: the thread goal, its task and files, the
 /// output.md paths of every earlier agent, the live flowmap.json, and where to write its result.
@@ -340,8 +325,6 @@ pub(crate) mod tests {
             stages: vec![vec![agent("a", None, "plan")]]
         })
         .is_err());
-        assert!(!valid_name("a-very-long-thread", THREAD_MAX));
-        assert!(RESERVED.contains(&"ls"));
     }
 
     #[test]
