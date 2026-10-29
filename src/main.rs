@@ -1,23 +1,46 @@
 //! brigd: plan a flow of Claude agents with the brigd-plan skill, then run it
 //! stage by stage, one PTY per agent. Progress lives in ~/.brigd/threads/<name>/
-//! ({flowmap.json,state.json,log} and <agent>/{prompt.md,output.md,status,session}),
-//! so a thread can be listed, inspected and resumed.
+//! ({flowmap.json,state.json,FLOWPLAN} and <agent>/{prompt.md,output.md,status,session}),
+//! so a thread can be listed, inspected and resumed. This file is the CLI.
+//!
+//! Modules: store (thread data on disk), flow (the flow definition and planner), engine
+//! (running a flow), launch (`--bg` and terminal surfaces), stray (the `claude` shim),
+//! runner (agent PTYs), tree (the sidebar model), diffs (agent diffs), transcript
+//! (claude's transcript files), tui (the screen).
+//!
+//! "Flow" names five things: `store::Flow`, the stages of agents, saved as a thread's
+//! flowmap.json (agents may edit later stages while it runs); FLOWPLAN, that flow rendered
+//! as a tree plus the run log; an agent's flow.md, a mermaid chart of the steps it took;
+//! `--flow <file>`, a hand-written flowmap.json to run; and the `flow` module.
 
+mod diffs;
+mod engine;
+mod flow;
+mod launch;
 mod runner;
+mod store;
+mod stray;
+mod transcript;
 mod tree;
 mod tui;
 
-use runner::Res;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use crate::engine::{execute, reconcile, thread_busy};
+use crate::flow::{flow_from_json, plan, read_flow, SKILL};
+use crate::launch::{background, launch_bg, resume_how, tui_alive, ResumeMode};
+use crate::store::{
+    ago, check_new_thread, create_thread, load, now, output_path, root, thread_dir, write_json,
+    Flow, State, Status,
+};
+use crate::stray::stray;
+use crate::tui::flow_text;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::Command;
 use std::{env, fs, thread};
 
-const SKILL: &str = include_str!("../skills/brigd-plan/SKILL.md");
+/// The app-wide result: errors are shown as text.
+pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 // Installed by `brigd install-skill`; brigd-plan first, plan-review-go, grill-me, grilling and find-skills back the opt-in plan-review-go path; brigd-resume continues a thread.
 const SKILLS: &[(&str, &str)] = &[
     ("brigd-plan", SKILL),
@@ -36,13 +59,6 @@ const SKILLS: &[(&str, &str)] = &[
         include_str!("../skills/find-skills/SKILL.md"),
     ),
 ];
-const RESERVED: &[&str] = &["ls", "status", "resume", "install-skill", "help", "stray"];
-const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const MODES: &[&str] = &["default", "acceptEdits", "auto"];
-const WRITE_MODES: &[&str] = &["acceptEdits", "auto"];
-// Keeps "<thread>/<agent>" labels short enough for a sidebar.
-const THREAD_MAX: usize = 12;
-const AGENT_MAX: usize = 19;
 
 const USAGE: &str = "usage:
   brigd                        open the TUI over all threads
@@ -57,59 +73,6 @@ const USAGE: &str = "usage:
                                like above) an open brigd TUI runs it, else a new tab/window
   brigd install-skill          install brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills into ~/.claude/skills";
 
-const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["goal","stages"],
-"properties":{"goal":{"type":"string"},
-"stages":{"type":"array","minItems":1,"items":{"type":"array","minItems":1,"items":{
-"type":"object","additionalProperties":false,
-"required":["name","model","effort","worktree","task","files","mode"],
-"properties":{
-"name":{"type":"string","pattern":"^[a-z][a-z0-9_-]{0,18}$"},
-"model":{"type":"string"},
-"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},
-"worktree":{"type":["string","null"]},
-"task":{"type":"string"},
-"files":{"type":"array","items":{"type":"string"}},
-"mode":{"type":"string","enum":["default","acceptEdits","auto"]}}}}}}}"#;
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Agent {
-    name: String,
-    model: String,
-    effort: String,
-    #[serde(default)]
-    worktree: Option<String>,
-    task: String,
-    #[serde(default)]
-    files: Vec<String>,
-    #[serde(default = "default_mode")]
-    mode: String,
-}
-
-fn default_mode() -> String {
-    "acceptEdits".into()
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Flow {
-    goal: String,
-    stages: Vec<Vec<Agent>>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct AgentState {
-    status: String,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct State {
-    thread: String,
-    repo: String,
-    status: String,
-    stage: usize,
-    updated: u64,
-    agents: BTreeMap<String, AgentState>,
-}
-
 fn main() {
     if let Err(e) = real_main() {
         eprintln!("brigd: {e}");
@@ -123,72 +86,75 @@ fn real_main() -> Res<()> {
     args.retain(|a| a != "--bg");
     let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
     let bg = background(bg_flag, tty, |k| env::var(k).ok());
-    let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    match a.as_slice() {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match argv.as_slice() {
         [] => tui::run(None),
         ["stray", ..] => stray(&args[1..]),
         ["help" | "-h" | "--help"] => {
             println!("{USAGE}");
             Ok(())
         }
-        ["ls"] => ls(),
-        ["status", name] => status(name),
-        ["resume", name] => {
-            let (flow, state) = load(name)?;
-            if state.status == "done" {
-                return Err(format!("thread {name} is already done").into());
-            }
-            // A thread saved with N at the confirm has no FLOWPLAN yet.
-            let plan = thread_dir(name).join("FLOWPLAN");
-            if !plan.exists() {
-                fs::write(plan, flow_text(&flow))?;
-            }
+        ["ls"] => cmd_ls(),
+        ["status", name] => cmd_status(name),
+        ["resume", name] => cmd_resume(name, bg),
+        ["install-skill"] => install_skill(),
+        [name, "--flow", file] => new_thread(name, read_flow(Path::new(file))?, bg),
+        [name, task] if !task.starts_with('-') => cmd_new(name, task, bg),
+        _ => Err(USAGE.into()),
+    }
+}
+
+/// `brigd resume <name>`: run a stopped thread here, queue it for the open TUI, or launch it
+/// in a new terminal (see launch::resume_how).
+fn cmd_resume(name: &str, bg: bool) -> Res<()> {
+    let (flow, state) = load(name)?;
+    if state.status == Status::Done {
+        return Err(format!("thread {name} is already done").into());
+    }
+    // A thread saved with N at the confirm has no FLOWPLAN yet.
+    let plan = thread_dir(name).join("FLOWPLAN");
+    if !plan.exists() {
+        fs::write(plan, flow_text(&flow))?;
+    }
+    if let Some(pid) = thread_busy(name, &state) {
+        return Err(format!("thread {name} is already running (pid {pid})").into());
+    }
+    if bg && state.status == Status::Queued {
+        println!("brigd: thread {name} is already queued");
+        return Ok(());
+    }
+    match resume_how(bg, tui_alive()) {
+        ResumeMode::Here => run_in_tui(name, flow, state),
+        ResumeMode::Queue => {
+            // Re-read so a stale snapshot never overwrites a thread that moved on.
+            let mut state = load(name)?.1;
             if let Some(pid) = thread_busy(name, &state) {
                 return Err(format!("thread {name} is already running (pid {pid})").into());
             }
-            if bg && state.status == "queued" {
-                println!("brigd: thread {name} is already queued");
-                return Ok(());
-            }
-            match resume_how(bg, tui_alive()) {
-                How::Here => run_in_tui(name, flow, state),
-                How::Queue => {
-                    // Re-read so a stale snapshot never overwrites a thread that moved on.
-                    let mut state = load(name)?.1;
-                    if let Some(pid) = thread_busy(name, &state) {
-                        return Err(format!("thread {name} is already running (pid {pid})").into());
-                    }
-                    state.status = "queued".into();
-                    state.updated = now();
-                    write_json(&thread_dir(name).join("state.json"), &state)?;
-                    println!("brigd: thread {name} queued; the open brigd TUI runs it");
-                    Ok(())
-                }
-                How::Launch => {
-                    let at = launch_bg(name, &state.repo)?;
-                    println!("brigd: thread {name} running in {at}");
-                    Ok(())
-                }
-            }
+            state.status = Status::Queued;
+            state.updated = now();
+            write_json(&thread_dir(name).join("state.json"), &state)?;
+            println!("brigd: thread {name} queued; the open brigd TUI runs it");
+            Ok(())
         }
-        ["install-skill"] => install_skill(),
-        [name, "--flow", file] => {
-            let flow: Flow = serde_json::from_str(&fs::read_to_string(file)?)?;
-            validate(&flow)?;
-            new_thread(name, flow, bg)
+        ResumeMode::Launch => {
+            let at = launch_bg(name, &state.repo)?;
+            println!("brigd: thread {name} running in {at}");
+            Ok(())
         }
-        [name, task] if !task.starts_with('-') => {
-            check_new_thread(name)?;
-            let task = if io::stdin().is_terminal() && !mentions_prg(task) && ask_prg() {
-                with_prg(task)
-            } else {
-                task.to_string()
-            };
-            eprintln!("planning with opus (brigd-plan)…");
-            new_thread(name, plan(&task, &env::current_dir()?)?, bg)
-        }
-        _ => Err(USAGE.into()),
     }
+}
+
+/// `brigd <name> "task"`: plan the task (asking about plan-review-go on a TTY), then new_thread.
+fn cmd_new(name: &str, task: &str, bg: bool) -> Res<()> {
+    check_new_thread(name)?;
+    let task = if io::stdin().is_terminal() && !mentions_prg(task) && ask_prg() {
+        with_prg(task)
+    } else {
+        task.to_string()
+    };
+    eprintln!("planning with opus (brigd-plan)…");
+    new_thread(name, plan(&task, &env::current_dir()?)?, bg)
 }
 
 /// Whether the task already opts into plan-review-go (brigd-plan looks for this name).
@@ -206,283 +172,6 @@ fn ask_prg() -> bool {
     let mut line = String::new();
     io::stdin().read_line(&mut line).is_ok()
         && matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
-}
-
-// ---------- threads on disk ----------
-
-/// ~/.brigd
-fn root() -> PathBuf {
-    PathBuf::from(env::var("HOME").unwrap_or_default()).join(".brigd")
-}
-
-fn thread_dir(name: &str) -> PathBuf {
-    root().join("threads").join(name)
-}
-
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn load(name: &str) -> Res<(Flow, State)> {
-    let dir = thread_dir(name);
-    let read =
-        |f: &str| fs::read_to_string(dir.join(f)).map_err(|e| format!("thread {name}: {f}: {e}"));
-    Ok((
-        serde_json::from_str(&read("flowmap.json").or_else(|_| read("flow.json"))?)?,
-        serde_json::from_str(&read("state.json")?)?,
-    ))
-}
-
-/// Writes via temp file + rename so a crash never leaves half a journal.
-fn write_json(path: &Path, v: &impl Serialize) -> Res<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(v)?)?;
-    Ok(fs::rename(tmp, path)?)
-}
-
-fn update(state: &Mutex<State>, f: impl FnOnce(&mut State)) -> Res<()> {
-    let mut s = state.lock().unwrap();
-    f(&mut s);
-    s.updated = now();
-    write_json(&thread_dir(&s.thread).join("state.json"), &*s)
-}
-
-fn set_agent(state: &Mutex<State>, agent: &str, status: &str) -> Res<()> {
-    update(state, |s| {
-        s.agents.entry(agent.into()).or_default().status = status.into()
-    })
-}
-
-/// Terminates `agent` (a flow agent, or "stray agents/<n>"): kills its claude, reverts the
-/// files it changed to its base commit (tree::revert), keeps its dir and output.md, and
-/// marks it failed (state.json for a flow agent, the dir's `terminated` file for both).
-/// Returns how many files were reverted.
-fn terminate(thread: &str, agent: &str) -> Res<usize> {
-    let dir = thread_dir(thread).join(agent);
-    let (cwd, repo, state) = if Path::new(agent).starts_with(tree::STRAY) {
-        let cwd = PathBuf::from(
-            fs::read_to_string(dir.join("cwd"))
-                .map_err(|e| format!("{thread}/{agent}: no cwd: {e}"))?
-                .trim(),
-        );
-        (cwd.clone(), cwd, None)
-    } else {
-        let (flow, state) = load(thread)?;
-        let a = flow
-            .stages
-            .iter()
-            .flatten()
-            .find(|a| a.name == agent)
-            .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
-        let repo = PathBuf::from(&state.repo);
-        (
-            tree::space_cwd(&root(), &repo, thread, a.worktree.as_deref().unwrap_or("")),
-            repo,
-            Some(state),
-        )
-    };
-    stop_agent(thread, agent)?;
-    let n = tree::revert(
-        &PathBuf::from(env::var("HOME").unwrap_or_default()),
-        &cwd,
-        &repo,
-        &dir,
-    )?;
-    if let Some(state) = state {
-        set_agent(&Mutex::new(state), agent, "failed")?;
-    }
-    Ok(n)
-}
-
-/// Kills `agent`'s claude (its LiveAgent, or a stray's pid) and waits for it to be gone.
-/// Marks it `terminated` first, so a supervise thread that sees it die does not report it done.
-fn stop_agent(thread: &str, agent: &str) -> Res<()> {
-    let dir = thread_dir(thread).join(agent);
-    fs::write(dir.join(runner::TERMINATED), "")?;
-    let pid = fs::read_to_string(dir.join("pid")).ok(); // a stray running in a terminal tab
-    if let Some(l) = runner::live(thread, agent) {
-        l.kill();
-    }
-    if let Some(pid) = &pid {
-        let _ = Command::new("kill").arg(pid.trim()).status();
-    }
-    // Wait for the process to be gone so it cannot rewrite a file after the revert.
-    for i in 0..40 {
-        if !runner::live(thread, agent).is_some_and(|l| l.alive())
-            && !pid.as_ref().is_some_and(|p| runner::pid_alive(p))
-        {
-            break;
-        }
-        if i == 20 {
-            if let Some(pid) = &pid {
-                let _ = Command::new("kill").args(["-9", pid.trim()]).status(); // ignored SIGTERM
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let _ = fs::remove_file(dir.join("pid"));
-    Ok(())
-}
-
-// ---------- deleting / archiving threads ----------
-
-/// Stops every running agent of `thread`: its live flow agents and its strays with a live pid.
-/// Unlike terminate it reverts nothing (an archived thread keeps its work).
-fn stop_thread(thread: &str) {
-    let mut agents: Vec<String> = runner::registry()
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|a| a.thread == thread && a.alive())
-        .map(|a| a.agent.clone())
-        .collect();
-    let strays = fs::read_dir(thread_dir(thread).join(tree::STRAY))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path());
-    agents.extend(
-        strays
-            .filter(|d| fs::read_to_string(d.join("pid")).is_ok_and(|p| runner::pid_alive(&p)))
-            .filter_map(|d| {
-                Some(format!(
-                    "{}/{}",
-                    tree::STRAY,
-                    d.file_name()?.to_string_lossy()
-                ))
-            }),
-    );
-    for a in agents {
-        let _ = stop_agent(thread, &a);
-    }
-}
-
-/// <root>/archive/threads/<thread>: where archive_thread moves a thread.
-fn archive_dir(root: &Path, thread: &str) -> PathBuf {
-    root.join("archive/threads").join(thread)
-}
-
-/// Moves <root>/threads/<thread> to archive_dir, unchanged; refuses if that exists. Its git
-/// worktrees stay in <root>/worktrees (moving them by hand would break git's links to them).
-fn archive_thread(root: &Path, thread: &str) -> Res<PathBuf> {
-    let to = archive_dir(root, thread);
-    if to.exists() {
-        return Err(format!("{} already exists", to.display()).into());
-    }
-    fs::create_dir_all(to.parent().unwrap_or(root))?;
-    fs::rename(root.join("threads").join(thread), &to)?;
-    Ok(to)
-}
-
-/// Removes `thread` for good: its git worktrees (in its state.json repo) and their
-/// brigd/<thread>/* branches, then <root>/threads/<thread> and <root>/worktrees/<thread>.
-fn delete_thread(root: &Path, thread: &str) -> Res<()> {
-    let (tdir, wdir) = (
-        root.join("threads").join(thread),
-        root.join("worktrees").join(thread),
-    );
-    let state: serde_json::Value = fs::read_to_string(tdir.join("state.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let repo = state["repo"]
-        .as_str()
-        .map(PathBuf::from)
-        .filter(|r| r.exists());
-    let git = |args: &[&str]| {
-        repo.as_ref().and_then(|r| {
-            Command::new("git")
-                .arg("-C")
-                .arg(r)
-                .args(args)
-                .output()
-                .ok()
-        })
-    };
-    for wt in fs::read_dir(&wdir).into_iter().flatten().flatten() {
-        let _ = git(&[
-            "worktree",
-            "remove",
-            "--force",
-            &wt.path().to_string_lossy(),
-        ]);
-    }
-    for d in [&tdir, &wdir] {
-        match fs::remove_dir_all(d) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                return Err(format!("{}: {e}", d.display()).into())
-            }
-            _ => {}
-        }
-    }
-    let _ = git(&["worktree", "prune"]); // forgets any worktree `remove` refused
-    let refs = git(&[
-        "for-each-ref",
-        "--format=%(refname:short)",
-        &format!("refs/heads/brigd/{thread}/"),
-    ])
-    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    .unwrap_or_default();
-    let mut kept = vec![];
-    for b in refs.lines() {
-        if !git(&["branch", "-D", b]).is_some_and(|o| o.status.success()) {
-            kept.push(b);
-        }
-    }
-    if !kept.is_empty() {
-        return Err(format!("could not delete branch(es) {}", kept.join(", ")).into());
-    }
-    Ok(())
-}
-
-/// Appends to ~/.brigd/threads/<thread>/FLOWPLAN, the plan followed by the live run log.
-/// execute never prints: the TUI owns the screen and shows this file.
-/// Log lines go under the plan's last line, LOG_MARK, which the TUI's FLOWPLAN view splits on.
-fn log(thread: &str, msg: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(thread_dir(thread).join("FLOWPLAN"))
-    {
-        let _ = writeln!(f, "   {msg}");
-    }
-}
-
-fn check_new_thread(name: &str) -> Res<()> {
-    if RESERVED.contains(&name) || !valid_name(name, THREAD_MAX) {
-        return Err(format!(
-            "bad thread name {name:?}: [a-z][a-z0-9_-], max {THREAD_MAX}, not one of {RESERVED:?}"
-        )
-        .into());
-    }
-    if thread_dir(name).exists() {
-        return Err(format!(
-            "thread {name} exists: `brigd resume {name}`, or delete {} to reuse the name",
-            thread_dir(name).display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-/// Writes a new thread's dir (it may already exist, reserved by the TUI), state.json with
-/// status "planned" and flowmap.json. Callers write FLOWPLAN themselves.
-fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) -> Res<State> {
-    let dir = root.join("threads").join(name);
-    fs::create_dir_all(&dir)?;
-    let state = State {
-        thread: name.into(),
-        repo: repo.into(),
-        status: "planned".into(),
-        updated: now(),
-        ..Default::default()
-    };
-    write_json(&dir.join("state.json"), &state)?;
-    write_json(&dir.join("flowmap.json"), flow)?;
-    Ok(state)
 }
 
 fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
@@ -506,7 +195,7 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
     }
     loop {
         write_json(&flow_path, &flow)?;
-        print_flow(&flow);
+        println!("\n{}", flow_text(&flow));
         print!("run thread {name}? [y/N/e(dit)] ");
         io::stdout().flush()?;
         let mut ans = String::new();
@@ -519,10 +208,7 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
             "e" | "E" => {
                 let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".into());
                 Command::new(editor).arg(&flow_path).status()?;
-                match serde_json::from_str::<Flow>(&fs::read_to_string(&flow_path)?)
-                    .map_err(|e| e.to_string())
-                    .and_then(|f| validate(&f).map(|_| f))
-                {
+                match flow_from_json(&fs::read_to_string(&flow_path)?) {
                     Ok(f) => flow = f,
                     Err(e) => eprintln!("edited flow invalid, keeping previous one: {e}"),
                 }
@@ -534,375 +220,6 @@ fn new_thread(name: &str, mut flow: Flow, bg: bool) -> Res<()> {
         }
     }
 }
-
-// ---------- background launch ----------
-
-#[derive(Debug, PartialEq)]
-enum How {
-    /// Take over this terminal with the TUI.
-    Here,
-    /// Mark the thread "queued" for the open TUI to claim.
-    Queue,
-    /// Open a new herdr tab / tmux window / Terminal window running `brigd resume`.
-    Launch,
-}
-
-fn resume_how(bg: bool, tui: bool) -> How {
-    match (bg, tui) {
-        (false, _) => How::Here,
-        (true, true) => How::Queue,
-        (true, false) => How::Launch,
-    }
-}
-
-/// The open TUI that claims "queued" threads writes its pid here.
-fn tui_pid_path() -> PathBuf {
-    root().join("tui.pid")
-}
-
-fn pid_alive(pid: u32) -> bool {
-    // ponytail: shells out to kill -0 (no libc dep); a recycled pid reads as alive.
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-fn tui_pid() -> Option<u32> {
-    fs::read_to_string(tui_pid_path()).ok()?.trim().parse().ok()
-}
-
-fn tui_alive() -> bool {
-    tui_pid().is_some_and(pid_alive)
-}
-
-/// A live claude (this or another brigd) on a thread marked running. A running status alone
-/// can be stale after a crash, so the agents' pid files decide.
-fn thread_busy(name: &str, state: &State) -> Option<u32> {
-    if state.status != "running" {
-        return None;
-    }
-    state
-        .agents
-        .keys()
-        .find_map(|a| runner::running_elsewhere(&thread_dir(name).join(a)))
-}
-
-/// Marks a thread failed when it says running but no claude is alive: this process is not
-/// executing it, nothing touched it for 30s and no agent pid file has a live claude.
-/// Leaves `updated` alone (ls sorts by it). True when it changed the state.
-fn reconcile(name: &str, state: &mut State) -> Res<bool> {
-    if state.status != "running"
-        || executing(name)
-        || now().saturating_sub(state.updated) <= 30
-        || thread_busy(name, state).is_some()
-    {
-        return Ok(false);
-    }
-    for a in state.agents.values_mut() {
-        if matches!(a.status.as_str(), "running" | "blocked") {
-            a.status = "failed".into();
-        }
-    }
-    state.status = "failed".into();
-    write_json(&thread_dir(name).join("state.json"), state)?;
-    log(name, "stale: no live claude, marked failed");
-    Ok(true)
-}
-
-/// The TUI claims a thread only if it is queued, this TUI owns tui.pid, and this
-/// process is not already executing it.
-fn claimable(status: &str, owner: bool, busy: bool) -> bool {
-    status == "queued" && owner && !busy
-}
-
-/// Threads `execute` is running in this process.
-static EXECUTING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-fn executing_set() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
-    EXECUTING.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn executing(name: &str) -> bool {
-    executing_set().contains(name)
-}
-
-/// True when nobody can answer the y/N confirm or watch a fullscreen TUI here: `--bg`,
-/// no TTY on stdin/stdout, or Claude Code's Bash tool (it sets CLAUDECODE=1).
-fn background(bg_flag: bool, tty: bool, var: impl Fn(&str) -> Option<String>) -> bool {
-    bg_flag || !tty || var("CLAUDECODE").is_some_and(|v| !v.is_empty())
-}
-
-/// Vars Claude Code's Bash tool sets that describe the calling session (seen in its env).
-const PARENT_SESSION_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_CHILD_SESSION",
-    "CLAUDE_CODE_SESSION_ATTENDED",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_PID",
-    "AI_AGENT",
-];
-
-#[derive(Debug, PartialEq)]
-enum Surface {
-    Herdr(String),
-    Tmux,
-    Terminal,
-}
-
-/// Terminal surfaces that can host `brigd resume`, best first.
-fn surfaces(var: impl Fn(&str) -> Option<String>) -> Vec<Surface> {
-    let set = |k: &str| var(k).filter(|v| !v.is_empty());
-    let mut v = vec![];
-    if let (Some(_), Some(ws)) = (set("HERDR_ENV"), set("HERDR_WORKSPACE_ID")) {
-        v.push(Surface::Herdr(ws));
-    }
-    if set("TMUX").is_some() {
-        v.push(Surface::Tmux);
-    }
-    if cfg!(target_os = "macos") {
-        v.push(Surface::Terminal);
-    }
-    v
-}
-
-/// Opens `brigd resume <name>` in a new terminal surface and says where. The herdr
-/// server, tmux server or Terminal.app owns that process, so it is detached from this
-/// one and from the caller's terminal; brigd only runs short helper commands.
-fn launch_bg(name: &str, repo: &str) -> Res<String> {
-    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
-    // A tmux window inherits this process's env: drop the calling Claude session's vars so agents start clean.
-    let unset: String = PARENT_SESSION_VARS
-        .iter()
-        .map(|v| format!("-u {v} "))
-        .collect();
-    let cmd = format!(
-        "env {unset}{} resume {name}",
-        q(&env::current_exe()?.to_string_lossy())
-    );
-    let label = format!("brigd-{name}");
-    let mut errs = vec![];
-    for s in surfaces(|k| env::var(k).ok()) {
-        let r = match &s {
-            Surface::Herdr(ws) => herdr_tab(ws, repo, &label, &cmd),
-            // `|| read` keeps the window open on an error so it can be read.
-            Surface::Tmux => run_ok(Command::new("tmux").args([
-                "new-window",
-                "-d",
-                "-n",
-                &label,
-                "-c",
-                repo,
-                &format!("{cmd} || read _"),
-            ]))
-            .map(|_| format!("tmux window {label} (tmux select-window -t {label})")),
-            Surface::Terminal => {
-                let sh = format!("cd {} && {cmd}", q(repo));
-                let script = format!(
-                    "tell application \"Terminal\" to do script \"{}\"",
-                    sh.replace('\\', "\\\\").replace('"', "\\\"")
-                );
-                run_ok(Command::new("osascript").args(["-e", &script]))
-                    .map(|_| "a new Terminal window".to_string())
-            }
-        };
-        match r {
-            Ok(at) => return Ok(at),
-            Err(e) => errs.push(format!("{s:?}: {e}")),
-        }
-    }
-    let why = if errs.is_empty() {
-        "not in herdr or tmux, not on macOS".into()
-    } else {
-        errs.join("; ")
-    };
-    Err(format!("no terminal to run thread {name} in ({why}); it is saved, `brigd resume {name}` in a terminal runs it").into())
-}
-
-/// Opens an unfocused herdr tab in workspace `ws` and runs `cmd` in its shell.
-fn herdr_tab(ws: &str, repo: &str, label: &str, cmd: &str) -> Res<String> {
-    let out = run_ok(Command::new("herdr").args([
-        "tab",
-        "create",
-        "--workspace",
-        ws,
-        "--cwd",
-        repo,
-        "--label",
-        label,
-        "--no-focus",
-    ]))?;
-    let v: serde_json::Value = serde_json::from_str(&out)?;
-    let pane = v["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .ok_or_else(|| format!("no root pane in {out}"))?;
-    // A fresh pane reports busy for a few seconds while its shell starts.
-    let mut last = String::new();
-    for _ in 0..20 {
-        match run_ok(Command::new("herdr").args(["pane", "run", pane, cmd])) {
-            Ok(_) => return Ok(format!("herdr tab {label} (workspace {ws}, pane {pane})")),
-            Err(e) => last = e.to_string(),
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    Err(format!("herdr pane run {pane}: {last}").into())
-}
-
-/// Runs a short helper command; returns its stdout, or its stderr as the error.
-fn run_ok(c: &mut Command) -> Res<String> {
-    let out = c.stdin(Stdio::null()).output()?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .to_string()
-            .into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-// ---------- planning ----------
-
-/// Runs the planner in `repo` and returns a valid flow. Never prints: the TUI calls it too.
-fn plan(task: &str, repo: &Path) -> Res<Flow> {
-    let mut prompt = format!("Plan a brigd flow for this task:\n\n{task}");
-    for attempt in 0..2 {
-        // ponytail: skill text passed as system prompt so it works uninstalled; install-skill is for interactive /brigd-plan.
-        let mut cmd = Command::new("claude");
-        // brigd may run under Claude Code; the planner is a session of its own.
-        PARENT_SESSION_VARS
-            .iter()
-            .for_each(|v| _ = cmd.env_remove(v));
-        let out = cmd
-            .current_dir(repo)
-            .args([
-                "-p",
-                &prompt,
-                "--model",
-                "opus",
-                "--effort",
-                "high",
-                "--output-format",
-                "json",
-            ])
-            .args([
-                "--no-session-persistence",
-                "--json-schema",
-                SCHEMA,
-                "--tools",
-                "Read,Grep,Glob",
-            ])
-            .args(["--append-system-prompt", SKILL, "--permission-mode", "auto"])
-            .output()?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
-            format!(
-                "planner output not JSON ({e}): {}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        })?;
-        let so = v
-            .get("structured_output")
-            .cloned()
-            .ok_or_else(|| format!("planner returned no structured_output: {v}"))?;
-        let flow: Flow = serde_json::from_value(so.clone())?;
-        match validate(&flow) {
-            Ok(()) => return Ok(flow),
-            Err(e) if attempt == 0 => prompt += &format!("\n\nYour previous flow was invalid: {e}\nPrevious flow: {so}\nReturn a fixed flow."),
-            Err(e) => return Err(format!("planner flow still invalid: {e}\n{}", serde_json::to_string_pretty(&so)?).into()),
-        }
-    }
-    unreachable!()
-}
-
-fn valid_name(s: &str, max: usize) -> bool {
-    let b = s.as_bytes();
-    !b.is_empty()
-        && b.len() <= max
-        && b[0].is_ascii_lowercase()
-        && b.iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-' || *c == b'_')
-}
-
-fn validate(flow: &Flow) -> Result<(), String> {
-    if flow.stages.is_empty() {
-        return Err("flow has no stages".into());
-    }
-    let mut names = HashSet::new();
-    for (i, stage) in flow.stages.iter().enumerate() {
-        let n = i + 1;
-        if stage.is_empty() {
-            return Err(format!("stage {n} is empty"));
-        }
-        let mut editors: HashMap<&str, usize> = HashMap::new();
-        for a in stage {
-            let who = format!("stage {n} agent {:?}", a.name);
-            if !valid_name(&a.name, AGENT_MAX) {
-                return Err(format!(
-                    "{who}: name must be [a-z][a-z0-9_-], max {AGENT_MAX}"
-                ));
-            }
-            if a.name == "log" {
-                return Err(format!("{who}: \"log\" is reserved (the thread log file)"));
-            }
-            if !names.insert(a.name.as_str()) {
-                return Err(format!("{who}: duplicate name"));
-            }
-            if a.model.trim().is_empty() || a.task.trim().is_empty() {
-                return Err(format!("{who}: model and task are required"));
-            }
-            if !EFFORTS.contains(&a.effort.as_str()) {
-                return Err(format!("{who}: effort must be one of {EFFORTS:?}"));
-            }
-            if !MODES.contains(&a.mode.as_str()) {
-                return Err(format!("{who}: mode must be one of {MODES:?}"));
-            }
-            let wt = a.worktree.as_deref().unwrap_or("");
-            if !wt.is_empty() && !valid_name(wt, AGENT_MAX) {
-                return Err(format!(
-                    "{who}: worktree must be null or [a-z][a-z0-9_-], max {AGENT_MAX}"
-                ));
-            }
-            let c = editors.entry(wt).or_default();
-            *c += WRITE_MODES.contains(&a.mode.as_str()) as usize;
-            let space = if wt.is_empty() {
-                "main repo".into()
-            } else {
-                format!("worktree {wt:?}")
-            };
-            if *c > 1 {
-                return Err(format!("stage {n}: two editing agents ({WRITE_MODES:?}) in {space}; move one to the next stage"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn print_flow(flow: &Flow) {
-    println!("\n{}", flow_text(flow));
-}
-
-/// The last line of the plan in FLOWPLAN; the run log follows it.
-const LOG_MARK: &str = "└  log";
-
-/// The TUI's FLOWPLAN tree (tui::plan_lines) as plain text, every step pending, ending at LOG_MARK.
-fn flow_text(flow: &Flow) -> String {
-    tui::plan_lines(flow, |_| "pending", |_| true, &mut vec![], 0, 100)
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                + "\n"
-        })
-        .collect()
-}
-
-// ---------- running ----------
 
 /// Runs the thread's flow on a background thread while the TUI owns the screen.
 fn run_in_tui(name: &str, flow: Flow, state: State) -> Res<()> {
@@ -923,473 +240,7 @@ fn run_in_tui(name: &str, flow: Flow, state: State) -> Res<()> {
     Ok(())
 }
 
-/// Runs the flow from `state.stage` on and returns when it is done or a stage
-/// failed. Blocks, so the TUI calls it from a background thread. Never prints:
-/// progress goes to the thread log, state.json and the runner registry.
-fn execute(name: &str, flow: &Flow, state: State) -> Res<()> {
-    if !executing_set().insert(name.into()) {
-        return Err(format!("thread {name} is already running").into());
-    }
-    struct Running<'a>(&'a str);
-    impl Drop for Running<'_> {
-        fn drop(&mut self) {
-            executing_set().remove(self.0);
-        }
-    }
-    let _running = Running(name);
-    let mut i = state.stage;
-    let mut flow = flow.clone();
-    let state = Mutex::new(state);
-    update(&state, |s| s.status = "running".into())?;
-    loop {
-        // flowmap.json is live: agents may rewrite later stages, so reread it before every stage.
-        let path = thread_dir(name).join("flowmap.json");
-        match fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|t| serde_json::from_str::<Flow>(&t).map_err(|e| e.to_string()))
-            .and_then(|f| validate(&f).map(|_| f))
-        {
-            Ok(f) => flow = f,
-            Err(e) => log(
-                name,
-                &format!("{} invalid, keeping previous flow: {e}", path.display()),
-            ),
-        }
-        if i >= flow.stages.len() {
-            break;
-        }
-        update(&state, |s| s.stage = i)?;
-        log(
-            name,
-            &format!("── {name}: stage {}/{} ──", i + 1, flow.stages.len()),
-        );
-        let outcome = run_stage(name, &flow, i, &state);
-        if !matches!(outcome, Ok(true)) {
-            update(&state, |s| s.status = "failed".into())?;
-            let why = outcome.err().map(|e| format!(": {e}")).unwrap_or_default();
-            let msg = format!("stage {} failed{why}", i + 1);
-            log(name, &msg);
-            return Err(msg.into());
-        }
-        i += 1;
-    }
-    update(&state, |s| {
-        s.status = "done".into();
-        s.stage = flow.stages.len();
-    })?;
-    log(name, "done");
-    Ok(())
-}
-
-/// Starts every unfinished agent of stage `i`, waits for all, returns true if all are done.
-fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<bool> {
-    let dir = thread_dir(thread);
-    let repo = PathBuf::from(state.lock().unwrap().repo.clone());
-    let mut jobs = Vec::new();
-    for a in &flow.stages[i] {
-        let done = state
-            .lock()
-            .unwrap()
-            .agents
-            .get(&a.name)
-            .is_some_and(|s| s.status == "done");
-        if done {
-            continue;
-        }
-        if let Some(live) = runner::live(thread, &a.name).filter(|l| l.alive()) {
-            jobs.push((a, live)); // still live from an earlier execute: just supervise it
-            continue;
-        }
-        let key = a.worktree.as_deref().unwrap_or("");
-        let cwd = if key.is_empty() {
-            repo.clone()
-        } else {
-            ensure_worktree(&repo, thread, key)?
-        };
-        let adir = dir.join(&a.name);
-        fs::create_dir_all(&adir)?;
-        fs::write(adir.join("prompt.md"), task_prompt(thread, flow, i, a))?;
-        let prompt = format!(
-            "Read {} and do the task in it.",
-            adir.join("prompt.md").display()
-        );
-        log(thread, &format!("start {} in {}", a.name, cwd.display()));
-        record_base(&cwd, &adir);
-        // A trust dialog for a new worktree shows in the agent's own terminal; Mark answers it there.
-        let live = runner::start_claude(
-            thread,
-            &a.name,
-            &cwd,
-            &adir,
-            &claude_flags(thread, a),
-            &prompt,
-        )?;
-        set_agent(state, &a.name, "running")?;
-        jobs.push((a, live));
-    }
-
-    let results: Vec<bool> = thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .into_iter()
-            .map(|(a, live)| s.spawn(move || supervise(thread, a, live, state)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or(false))
-            .collect()
-    });
-    Ok(results.into_iter().all(|ok| ok))
-}
-
-/// The commit an agent started from, for its diffs; a relaunch keeps the first one.
-fn record_base(cwd: &Path, dir: &Path) {
-    if !dir.join("base").exists() {
-        if let Some(o) = Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-        {
-            let _ = fs::write(dir.join("base"), &o.stdout);
-        }
-    }
-}
-
-/// claude flags for an agent, minus the session/hooks/prompt the runner adds.
-/// Variadic options use --flag=value so they cannot swallow the trailing prompt.
-fn claude_flags(thread: &str, a: &Agent) -> Vec<String> {
-    let dir = thread_dir(thread);
-    let sys = format!(
-        "BRIGD WORKER {thread}/{}: do the task. You may use the Task/Agent tool for subagents, \
-         but never run the `claude` CLI or start other claude sessions. \
-         When finished, first write {} holding only a ```mermaid code block: one small \
-         `flowchart TD` of the steps you took (at most 10 nodes like A[short label], \
-         edges only `-->` or `-->|label|`, no styling or subgraphs). \
-         Then write your final result to {}. \
-         COMPLETION: write flow.md and output.md only when the task is fully done. If you cannot \
-         complete it for any reason (missing file/skill/tool/access, failed precondition, an earlier \
-         stage's result missing or incomplete, ambiguity that materially changes the result), do NOT \
-         write either file; ask the user with AskUserQuestion offering 2-4 concrete ways forward (the \
-         user can pick Other to reply in free text and discuss). Never end your turn to wait for a \
-         reply; ask follow-ups with AskUserQuestion. If the user says stop or abort, end your turn \
-         without writing them.",
-        a.name,
-        dir.join(&a.name).join("flow.md").display(),
-        dir.join(&a.name).join("output.md").display()
-    );
-    let s = |x: &str| x.to_string();
-    vec![
-        s("--model"),
-        a.model.clone(),
-        s("--effort"),
-        a.effort.clone(),
-        s("--permission-mode"),
-        s("auto"), // every brigd agent runs in auto mode; `mode` only marks editors
-        s("-n"),
-        a.name.clone(),
-        // The thread dir sits outside the agent's cwd; grant it so reading the task and writing the result never prompt.
-        format!("--add-dir={}", dir.display()),
-        // Edit rules cover every file-writing tool; claude rejects Write(path) rules.
-        s("--allowedTools=Read(~/.brigd/threads/**),Edit(~/.brigd/threads/**)"),
-        s("--append-system-prompt"),
-        sys,
-    ]
-}
-
-/// ~/.brigd/worktrees/<thread>/<key> on branch brigd/<thread>/<key>, created or reused.
-fn ensure_worktree(repo: &Path, thread: &str, key: &str) -> Res<PathBuf> {
-    let path = tree::space_cwd(&root(), repo, thread, key);
-    if path.exists() {
-        return Ok(path);
-    }
-    fs::create_dir_all(path.parent().unwrap_or(&path))?;
-    let git = |args: &[&str]| Command::new("git").arg("-C").arg(repo).args(args).output();
-    let (branch, p) = (
-        format!("brigd/{thread}/{key}"),
-        path.to_string_lossy().into_owned(),
-    );
-    let _ = git(&["worktree", "prune"]); // forget checkouts deleted by hand
-    let mut out = git(&["worktree", "add", "-b", &branch, &p])?;
-    if !out.status.success() {
-        out = git(&["worktree", "add", &p, &branch])?; // the branch outlived an earlier checkout
-    }
-    if !out.status.success() {
-        return Err(format!(
-            "git worktree add {p}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
-        .into());
-    }
-    Ok(path)
-}
-
-fn output_path(thread: &str, agent: &str) -> PathBuf {
-    thread_dir(thread).join(agent).join("output.md")
-}
-
-fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> String {
-    let mut p = format!(
-        "# brigd task: {} (thread {thread}, stage {}/{})\n\nGoal of the whole thread: {}\n\n## Task\n{}\n",
-        a.name,
-        i + 1,
-        flow.stages.len(),
-        flow.goal,
-        a.task
-    );
-    if !a.files.is_empty() {
-        p += "\n## Files to check\n";
-        for f in &a.files {
-            p += &format!("- {f}\n");
-        }
-    }
-    let earlier: Vec<&Agent> = flow.stages[..i].iter().flatten().collect();
-    if !earlier.is_empty() {
-        p += "\n## Results from earlier stages (read what you need)\n";
-        for e in earlier {
-            p += &format!("- {}: {}\n", e.name, output_path(thread, &e.name).display());
-        }
-    }
-    p += &format!(
-        "\n## Flow map\nThe live plan is {}. If the remaining plan must change, you may edit it: add, modify or remove \
-         LATER stages only (never this or earlier ones), same JSON schema, and it must stay valid. brigd rereads it before every stage.\n",
-        thread_dir(thread).join("flowmap.json").display()
-    );
-    p += &format!(
-        "\n## Output\nWrite your final result to {}. brigd waits for that file; the stage cannot finish without it. \
-         End it with a `## Files changed` section: one `- /absolute/path` line per file you created, edited or deleted, by any means \
-         (Edit/Write, or a script or shell command). brigd shows exactly those as this agent's diffs.\n",
-        output_path(thread, &a.name).display()
-    );
-    p
-}
-
-/// Drives one agent to completion: done = output.md exists once it is idle (or exited).
-/// One nudge when it goes idle without output. Blocked prompts are left for Mark.
-fn supervise(thread: &str, a: &Agent, live: Arc<runner::LiveAgent>, state: &Mutex<State>) -> bool {
-    let out = live.dir.join("output.md");
-    let nudge = format!(
-        "You stopped without writing your result file. If the task is fully done, write your final result to {}. \
-         If it is not done and you cannot finish it, do not write it: ask the user with AskUserQuestion \
-         (a few options plus free text), unless the user already told you to stop. Task: {}",
-        out.display(),
-        live.dir.join("prompt.md").display()
-    );
-    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
-    let sync = || {
-        if let Ok(s) = fs::read_to_string(live.dir.join("session")) {
-            let _ =
-                tree::sync_subagents(&tree::subagents_dir(&home, &live.cwd, s.trim()), &live.dir);
-        }
-    };
-    let (mut tick, mut idle_for, mut nudged_at, mut blocked) = (0u32, 0, None::<u32>, false);
-    let ok = loop {
-        thread::sleep(Duration::from_secs(1));
-        tick += 1;
-        if tick % 5 == 0 {
-            sync();
-        }
-        let (alive, status) = (live.alive(), live.status());
-        if live.dir.join(runner::TERMINATED).exists() {
-            log(thread, &format!("{} terminated", a.name));
-            break false;
-        }
-        if out.exists() && (!alive || status == "idle") {
-            log(thread, &format!("{} done", a.name));
-            break true;
-        }
-        if !alive {
-            log(
-                thread,
-                &format!("{} exited without {}", a.name, out.display()),
-            );
-            break false;
-        }
-        if status == "blocked" {
-            if !blocked {
-                blocked = true;
-                let _ = set_agent(state, &a.name, "blocked");
-                log(thread, &format!("{} needs you (blocked)", a.name));
-            }
-            continue;
-        }
-        if blocked {
-            blocked = false;
-            let _ = set_agent(state, &a.name, "running");
-        }
-        // "starting" (e.g. a trust dialog) and "working" just wait. A nudge needs a moment to show as working.
-        if status != "idle" || nudged_at.is_some_and(|t| tick - t < 30) {
-            idle_for = 0;
-            continue;
-        }
-        idle_for += 1;
-        // ponytail: fixed 3s debounce on idle; Stop hooks are exact, the transcript fallback is not.
-        if idle_for < 3 {
-            continue;
-        }
-        if nudged_at.is_some() {
-            log(
-                thread,
-                &format!("{} stopped without {}", a.name, out.display()),
-            );
-            break false;
-        }
-        nudged_at = Some(tick);
-        idle_for = 0;
-        log(thread, &format!("{} idle without output, nudging", a.name));
-        let typed = live.write(nudge.as_bytes()).and_then(|_| {
-            thread::sleep(Duration::from_millis(300)); // separate Enter so it is not read as part of a paste
-            live.write(b"\r")
-        });
-        if let Err(e) = typed {
-            log(thread, &format!("{}: nudge failed: {e}", a.name));
-            break false;
-        }
-    };
-    sync();
-    let _ = set_agent(state, &a.name, if ok { "done" } else { "failed" });
-    ok
-}
-
-// ---------- stray agents: claude typed in a brigd terminal ----------
-
-/// `claude` in a brigd terminal tab runs this (via the ~/.brigd/bin shim). In thread
-/// $BRIGD_THREAD it records a new session under <thread>/stray agents/stray-<n>/
-/// {cwd,session,base,pid,term} with the flow agents' hooks, then becomes the real claude
-/// (exec keeps the pid). Anything else (no thread, -p, --resume, …) is plain claude.
-fn stray(args: &[String]) -> Res<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new(real_claude().ok_or("no claude on PATH (outside ~/.brigd/bin)")?);
-    let thread = env::var("BRIGD_THREAD").unwrap_or_default();
-    if valid_name(&thread, THREAD_MAX) && thread_dir(&thread).is_dir() && !stray_passthrough(args) {
-        let setup = || -> Res<[String; 4]> {
-            let dir = new_stray_dir(&thread_dir(&thread).join(tree::STRAY))?;
-            let cwd = env::current_dir()?;
-            fs::write(dir.join("cwd"), cwd.to_string_lossy().as_bytes())?;
-            record_base(&cwd, &dir);
-            fs::write(dir.join("pid"), std::process::id().to_string())?;
-            fs::write(dir.join("term"), env::var("BRIGD_TERM").unwrap_or_default())?; // the terminal row shows this claude
-            runner::session_args(&dir)
-        };
-        match setup() {
-            Ok(a) => {
-                cmd.args(a).args(["--permission-mode", "auto"]); // before the user's args, so their own --permission-mode wins
-            }
-            Err(e) => eprintln!("brigd: not recording this session: {e}"),
-        }
-    }
-    Err(format!("exec claude: {}", cmd.args(args).exec()).into())
-}
-
-/// Args that pick their own session, print, or don't start a chat: no stray, plain claude.
-fn stray_passthrough(args: &[String]) -> bool {
-    const SUBCOMMANDS: &[&str] = &[
-        "mcp",
-        "plugin",
-        "doctor",
-        "update",
-        "install",
-        "setup-token",
-        "config",
-        "auth",
-    ];
-    const FLAGS: &[&str] = &[
-        "-p",
-        "--print",
-        "-r",
-        "--resume",
-        "-c",
-        "--continue",
-        "--session-id",
-        "-v",
-        "--version",
-        "-h",
-        "--help",
-    ];
-    args.first()
-        .is_some_and(|a| SUBCOMMANDS.contains(&a.as_str()))
-        || args
-            .iter()
-            .any(|a| FLAGS.contains(&a.split('=').next().unwrap_or(a)))
-}
-
-/// Creates and returns <parent>/stray-<n>, the first n not taken (create_dir, so two at once never share one).
-fn new_stray_dir(parent: &Path) -> Res<PathBuf> {
-    fs::create_dir_all(parent)?;
-    for n in 1.. {
-        let d = parent.join(format!("stray-{n}"));
-        match fs::create_dir(&d) {
-            Ok(()) => return Ok(d),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    unreachable!()
-}
-
-/// ~/.brigd/bin: holds the `claude` shim brigd terminals put first on PATH.
-fn shim_dir() -> PathBuf {
-    root().join("bin")
-}
-
-/// The first executable `claude` on PATH outside the shim dir (and not brigd itself).
-fn real_claude() -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let (shim, me) = (
-        shim_dir(),
-        env::current_exe().ok().and_then(|p| p.canonicalize().ok()),
-    );
-    let shim_c = shim.canonicalize().ok();
-    env::split_paths(&env::var_os("PATH")?)
-        .filter(|d| *d != shim && (shim_c.is_none() || d.canonicalize().ok() != shim_c))
-        .map(|d| d.join("claude"))
-        .find(|c| {
-            c.metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                && c.canonicalize().ok() != me
-        })
-}
-
-/// Writes the `claude` shim and the zsh startup wrappers (an rc that prepends
-/// ~/.local/bin would hide the shim; the wrappers re-prepend it after the user's
-/// rc). Returns the shim dir.
-fn ensure_shim() -> Res<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = shim_dir();
-    let shim = "#!/bin/sh\n[ -n \"$BRIGD_BIN\" ] && exec \"$BRIGD_BIN\" stray \"$@\"\n\
-                PATH=$(printf %s \"$PATH\" | tr : '\\n' | grep -vxF \"$(dirname \"$0\")\" | paste -sd: -)\nexec claude \"$@\"\n";
-    let zenv = "_brigd=$ZDOTDIR; ZDOTDIR=${BRIGD_ZDOTDIR:-$HOME}\n[ -f \"$ZDOTDIR/.zshenv\" ] && . \"$ZDOTDIR/.zshenv\"\nZDOTDIR=$_brigd; unset _brigd\n";
-    let zrc = "if [ -n \"$BRIGD_ZDOTDIR\" ]; then ZDOTDIR=$BRIGD_ZDOTDIR; else unset ZDOTDIR; fi\n\
-               [ -f \"${ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${ZDOTDIR:-$HOME}/.zshrc\"\nPATH=\"$BRIGD_SHIM:$PATH\"\n";
-    let z = root().join("zsh");
-    for (path, text) in [
-        (dir.join("claude"), shim),
-        (z.join(".zshenv"), zenv),
-        (z.join(".zshrc"), zrc),
-    ] {
-        if fs::read_to_string(&path).ok().as_deref() != Some(text) {
-            fs::create_dir_all(path.parent().unwrap_or(&dir))?;
-            fs::write(&path, text)?;
-        }
-    }
-    fs::set_permissions(dir.join("claude"), fs::Permissions::from_mode(0o755))?;
-    Ok(dir)
-}
-
-// ---------- ls / status / install-skill ----------
-
-fn ago(t: u64) -> String {
-    let d = now().saturating_sub(t);
-    match d {
-        0..=59 => format!("{d}s ago"),
-        60..=3599 => format!("{}m ago", d / 60),
-        3600..=86399 => format!("{}h ago", d / 3600),
-        _ => format!("{}d ago", d / 86400),
-    }
-}
-
-fn ls() -> Res<()> {
+fn cmd_ls() -> Res<()> {
     let root = thread_dir("");
     let mut rows = Vec::new();
     for entry in fs::read_dir(&root).into_iter().flatten().flatten() {
@@ -1397,7 +248,11 @@ fn ls() -> Res<()> {
         if let Ok((flow, mut st)) = load(&name) {
             let _ = reconcile(&name, &mut st);
             let total: usize = flow.stages.iter().map(Vec::len).sum();
-            let done = st.agents.values().filter(|a| a.status == "done").count();
+            let done = st
+                .agents
+                .values()
+                .filter(|a| a.status == Status::Done)
+                .count();
             let stage = format!(
                 "{}/{}",
                 (st.stage + 1).min(flow.stages.len()),
@@ -1427,7 +282,7 @@ fn ls() -> Res<()> {
     Ok(())
 }
 
-fn status(name: &str) -> Res<()> {
+fn cmd_status(name: &str) -> Res<()> {
     let (flow, mut st) = load(name)?;
     let _ = reconcile(name, &mut st);
     println!(
@@ -1443,11 +298,7 @@ fn status(name: &str) -> Res<()> {
         println!("stage {}", i + 1);
         for a in stage {
             let s = st.agents.get(&a.name).cloned().unwrap_or_default();
-            let status = if s.status.is_empty() {
-                "pending"
-            } else {
-                &s.status
-            };
+            let status = s.status;
             let out = output_path(name, &a.name);
             let out = if out.exists() {
                 out.display().to_string()
@@ -1480,355 +331,4 @@ fn install_skill() -> Res<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn agent(name: &str, wt: Option<&str>, mode: &str) -> Agent {
-        Agent {
-            name: name.into(),
-            model: "haiku".into(),
-            effort: "low".into(),
-            worktree: wt.map(String::from),
-            task: "t".into(),
-            files: vec![],
-            mode: mode.into(),
-        }
-    }
-
-    #[test]
-    fn validate_rules() {
-        let ok = Flow {
-            goal: "g".into(),
-            stages: vec![
-                vec![
-                    agent("a", None, "default"),
-                    agent("b", Some("x"), "acceptEdits"),
-                ],
-                vec![agent("c", Some("x"), "acceptEdits")],
-            ],
-        };
-        assert!(validate(&ok).is_ok());
-        let dup = Flow {
-            goal: "g".into(),
-            stages: vec![
-                vec![agent("a", None, "default")],
-                vec![agent("a", None, "default")],
-            ],
-        };
-        assert!(validate(&dup).unwrap_err().contains("duplicate"));
-        let two_writers = Flow {
-            goal: "g".into(),
-            stages: vec![vec![
-                agent("a", Some("x"), "acceptEdits"),
-                agent("b", Some("x"), "auto"),
-            ]],
-        };
-        assert!(validate(&two_writers).unwrap_err().contains("two editing"));
-        let crowded = Flow {
-            goal: "g".into(),
-            stages: vec![(0..6)
-                .map(|i| agent(&format!("a{i}"), None, "default"))
-                .collect()],
-        };
-        assert!(validate(&crowded).is_ok()); // no per-space cap without panes
-        assert!(validate(&Flow {
-            goal: "g".into(),
-            stages: vec![vec![agent("log", None, "default")]]
-        })
-        .unwrap_err()
-        .contains("reserved"));
-        assert!(validate(&Flow {
-            goal: "g".into(),
-            stages: vec![vec![]]
-        })
-        .is_err());
-        assert!(validate(&Flow {
-            goal: "g".into(),
-            stages: vec![vec![agent("Bad", None, "default")]]
-        })
-        .is_err());
-        assert!(validate(&Flow {
-            goal: "g".into(),
-            stages: vec![vec![agent("a", None, "plan")]]
-        })
-        .is_err());
-        assert!(!valid_name("a-very-long-thread", THREAD_MAX));
-        assert!(RESERVED.contains(&"ls"));
-    }
-
-    /// Runs a two-stage flow against a fake `claude` on PATH: the second agent works in a
-    /// fresh worktree and goes idle once without output, so it needs the nudge typed into its PTY.
-    #[test]
-    fn execute_with_fake_claude() {
-        let t = env::temp_dir().join(format!("brigd-exec-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&t);
-        let (bin, repo) = (t.join("bin"), t.join("repo"));
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&repo).unwrap();
-        let fake = r#"#!/bin/sh
-for x; do last=$x; done
-p=${last#Read }; p=${p% and do the task in it.}; d=$(dirname "$p")
-printf '%s\n' "$@" > "$d/args"; pwd > "$d/cwd"
-case "$d" in *nudge) printf idle > "$d/status"; read line; echo "$line" > "$d/nudged";; esac
-echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
-"#;
-        fs::write(bin.join("claude"), fake).unwrap();
-        Command::new("chmod")
-            .arg("+x")
-            .arg(bin.join("claude"))
-            .status()
-            .unwrap();
-        let git = |a: &[&str]| {
-            assert!(Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(a)
-                .output()
-                .unwrap()
-                .status
-                .success())
-        };
-        git(&["init", "-q"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-        env::set_var("HOME", &t);
-        env::set_var(
-            "PATH",
-            format!("{}:{}", bin.display(), env::var("PATH").unwrap()),
-        );
-
-        let flow = Flow {
-            goal: "g".into(),
-            stages: vec![
-                vec![agent("first", None, "default")],
-                vec![agent("nudge", Some("wt"), "acceptEdits")],
-            ],
-        };
-        let repo_s = repo.canonicalize().unwrap().to_string_lossy().into_owned();
-        fs::create_dir_all(thread_dir("th")).unwrap();
-        write_json(&thread_dir("th").join("flowmap.json"), &flow).unwrap();
-        let state = State {
-            thread: "th".into(),
-            repo: repo_s.clone(),
-            status: "planned".into(),
-            ..Default::default()
-        };
-        execute("th", &flow, state).unwrap();
-
-        let (_, st) = load("th").unwrap();
-        assert_eq!(st.status, "done");
-        assert!(st.agents.values().all(|a| a.status == "done"));
-        let d = thread_dir("th");
-        assert_eq!(
-            fs::read_to_string(d.join("first/cwd")).unwrap().trim(),
-            repo_s
-        );
-        let wt = t.join(".brigd/worktrees/th/wt");
-        assert_eq!(
-            fs::read_to_string(d.join("nudge/cwd")).unwrap().trim(),
-            wt.canonicalize().unwrap().to_string_lossy()
-        );
-        assert!(fs::read_to_string(d.join("nudge/nudged"))
-            .unwrap()
-            .starts_with("You stopped without writing"));
-        assert!(fs::read_to_string(d.join("nudge/prompt.md"))
-            .unwrap()
-            .contains(&d.join("first/output.md").display().to_string()));
-        assert!(fs::read_to_string(d.join("first/prompt.md"))
-            .unwrap()
-            .contains(&d.join("flowmap.json").display().to_string()));
-        let args = fs::read_to_string(d.join("first/args")).unwrap();
-        assert!(
-            args.contains("--session-id\n")
-                && args.contains("--settings\n")
-                && args.contains("--add-dir=")
-        );
-        assert_eq!(
-            fs::read_to_string(d.join("first/session")).unwrap().len(),
-            36
-        );
-        assert!(fs::read_to_string(d.join("FLOWPLAN"))
-            .unwrap()
-            .contains("nudging"));
-
-        // reconcile: a fresh `updated` is left alone; a stale one with dead pids fails the thread.
-        let (_, mut st) = load("th").unwrap();
-        st.status = "running".into();
-        st.agents.get_mut("nudge").unwrap().status = "running".into();
-        st.updated = now();
-        let fresh = serde_json::to_string(&st).unwrap();
-        assert!(!reconcile("th", &mut st).unwrap());
-        assert_eq!(serde_json::to_string(&st).unwrap(), fresh);
-        let mut dead = Command::new("true").spawn().unwrap();
-        dead.wait().unwrap();
-        for a in ["first", "nudge"] {
-            fs::write(d.join(a).join("pid"), dead.id().to_string()).unwrap();
-        }
-        st.updated = 0;
-        assert!(reconcile("th", &mut st).unwrap());
-        let (_, st) = load("th").unwrap();
-        assert_eq!((st.status.as_str(), st.updated), ("failed", 0));
-        assert_eq!(st.agents["nudge"].status, "failed");
-        assert_eq!(st.agents["first"].status, "done");
-        let _ = fs::remove_dir_all(&t);
-    }
-
-    #[test]
-    fn stray_names_and_passthrough() {
-        let d = env::temp_dir()
-            .join(format!("brigd-stray-{}", std::process::id()))
-            .join(tree::STRAY);
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(d.join("stray-1")).unwrap();
-        fs::create_dir_all(d.join("stray-3")).unwrap();
-        assert_eq!(new_stray_dir(&d).unwrap(), d.join("stray-2"));
-        assert_eq!(new_stray_dir(&d).unwrap(), d.join("stray-4"));
-        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(!stray_passthrough(&v(&[])));
-        assert!(!stray_passthrough(&v(&[
-            "--model",
-            "opus",
-            "fix the mcp bug"
-        ])));
-        for a in [
-            &["-p", "hi"][..],
-            &["--resume=abc"],
-            &["-c"],
-            &["--session-id", "x"],
-            &["--version"],
-            &["mcp", "list"],
-            &["--model", "opus", "-h"],
-        ] {
-            assert!(stray_passthrough(&v(a)), "{a:?}");
-        }
-        let _ = fs::remove_dir_all(d.parent().unwrap());
-    }
-
-    #[test]
-    fn background_decision() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string())
-        };
-        assert!(!background(false, true, env(&[])));
-        assert!(background(true, true, env(&[])));
-        assert!(background(false, false, env(&[])));
-        assert!(background(false, true, env(&[("CLAUDECODE", "1")])));
-        assert!(!background(false, true, env(&[("CLAUDECODE", "")])));
-        assert_eq!(resume_how(false, true), How::Here);
-        assert_eq!(resume_how(true, true), How::Queue);
-        assert_eq!(resume_how(true, false), How::Launch);
-        assert!(claimable("queued", true, false));
-        assert!(!claimable("queued", false, false)); // another TUI owns tui.pid
-        assert!(!claimable("queued", true, true)); // already executing here
-        assert!(!claimable("stopped", true, false));
-        let mac = |mut v: Vec<Surface>| {
-            if cfg!(target_os = "macos") {
-                v.push(Surface::Terminal);
-            }
-            v
-        };
-        const ALL: &[(&str, &str)] = &[
-            ("HERDR_ENV", "1"),
-            ("HERDR_WORKSPACE_ID", "w1"),
-            ("TMUX", "/tmp/t,1,0"),
-        ];
-        assert_eq!(
-            surfaces(env(ALL)),
-            mac(vec![Surface::Herdr("w1".into()), Surface::Tmux])
-        );
-        assert_eq!(surfaces(env(&[("HERDR_ENV", "1")])), mac(vec![]));
-        assert_eq!(surfaces(env(&[])), mac(vec![]));
-    }
-
-    #[test]
-    fn archive_moves_thread_and_refuses_overwrite() {
-        let root = env::temp_dir().join(format!("brigd-archive-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("threads/th/a")).unwrap();
-        fs::write(root.join("threads/th/a/output.md"), "x").unwrap();
-        let to = archive_thread(&root, "th").unwrap();
-        assert_eq!(to, root.join("archive/threads/th"));
-        assert!(!root.join("threads/th").exists() && to.join("a/output.md").exists());
-        fs::create_dir_all(root.join("threads/th")).unwrap();
-        assert!(archive_thread(&root, "th")
-            .unwrap_err()
-            .to_string()
-            .contains("already exists"));
-        assert!(root.join("threads/th").exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn delete_removes_worktrees_branches_and_dirs() {
-        let root = env::temp_dir().join(format!("brigd-delete-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repo = root.join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        let git = |a: &[&str]| {
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-                .args(a)
-                .output()
-                .unwrap()
-        };
-        git(&["init", "-q"]);
-        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&["branch", "brigd/other/k"]);
-        for k in ["k1", "k2"] {
-            let wt = root.join("worktrees/th").join(k);
-            assert!(git(&[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                &format!("brigd/th/{k}"),
-                &wt.to_string_lossy()
-            ])
-            .status
-            .success());
-        }
-        fs::create_dir_all(root.join("threads/th")).unwrap();
-        fs::write(
-            root.join("threads/th/state.json"),
-            format!(r#"{{"repo":{:?}}}"#, repo.to_string_lossy()),
-        )
-        .unwrap();
-        delete_thread(&root, "th").unwrap();
-        assert!(!root.join("threads/th").exists() && !root.join("worktrees/th").exists());
-        let out = |a: &[&str]| String::from_utf8_lossy(&git(a).stdout).into_owned();
-        assert_eq!(out(&["worktree", "list"]).lines().count(), 1);
-        assert_eq!(
-            out(&["branch", "--list", "brigd/*", "--format=%(refname:short)"]).trim(),
-            "brigd/other/k"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn create_thread_in_repo() {
-        let root = env::temp_dir().join(format!("brigd-create-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("threads/th")).unwrap(); // reserved by the TUI
-        let flow = Flow {
-            goal: "g".into(),
-            stages: vec![vec![agent("a", None, "default")]],
-        };
-        create_thread(&root, "th", "/some/repo", &flow).unwrap();
-        let st: State =
-            serde_json::from_str(&fs::read_to_string(root.join("threads/th/state.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            (st.repo.as_str(), st.status.as_str()),
-            ("/some/repo", "planned")
-        );
-        assert!(root.join("threads/th/flowmap.json").exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn schema_is_json() {
-        serde_json::from_str::<serde_json::Value>(SCHEMA).unwrap();
-    }
-}
+mod tests {}

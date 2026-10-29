@@ -1,15 +1,17 @@
 //! One agent = one PTY child. A reader thread feeds a vt100 parser the UI can
-//! render; status comes from a file the agent's own claude hooks write.
+//! render; status comes from a file the agent's own claude hooks write. Also the live
+//! registry, the hook/session args, resuming a saved session and pid checks.
 
+use crate::store::{home, Status};
+use crate::{transcript, Res};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs, thread};
 
-pub type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 /// (thread, agent)
 pub type Key = (String, String);
 pub type Registry = Arc<Mutex<BTreeMap<Key, Arc<LiveAgent>>>>;
@@ -135,69 +137,42 @@ impl LiveAgent {
         let _ = self.child.lock().unwrap().kill();
     }
 
-    /// idle / working / blocked, or "starting" before the first hook fires.
-    pub fn status(&self) -> String {
+    /// Idle / Working / Blocked, or Starting before the first hook fires.
+    pub fn status(&self) -> Status {
         read_status(&self.dir, &self.cwd)
     }
 }
 
 /// Status from the hook-written <agent>/status file. Without it (hooks did not
 /// fire yet, or not at all), falls back to the tail of the session transcript.
-pub fn read_status(dir: &Path, cwd: &Path) -> String {
+pub fn read_status(dir: &Path, cwd: &Path) -> Status {
     if let Ok(s) = fs::read_to_string(dir.join("status")) {
         if !s.trim().is_empty() {
-            return s.trim().into();
+            return Status::parse(s.trim());
         }
     }
     let Ok(session) = fs::read_to_string(dir.join("session")) else {
-        return "starting".into();
+        return Status::Starting;
     };
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    let path = home
-        .join(".claude/projects")
-        .join(crate::tree::slug(cwd))
-        .join(format!("{}.jsonl", session.trim()));
-    transcript_status(&path).unwrap_or_else(|| "starting".into())
-}
-
-/// Last user/assistant record: assistant end_turn => idle, anything else => working.
-fn transcript_status(path: &Path) -> Option<String> {
-    let mut f = fs::File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(256 * 1024)))
-        .ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    for line in text.lines().rev() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        match v["type"].as_str() {
-            Some("assistant") if v["message"]["stop_reason"] == "end_turn" => {
-                return Some("idle".into())
-            }
-            Some("assistant" | "user") => return Some("working".into()),
-            _ => {}
-        }
-    }
-    None
+    let path = transcript::transcript_path(&home(), cwd, session.trim());
+    transcript::transcript_status(&path).unwrap_or(Status::Starting)
 }
 
 /// Is `pid` a running process? (`kill -0`)
-pub fn pid_alive(pid: &str) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
+    // ponytail: shells out to kill -0 (no libc dep); a recycled pid reads as alive.
     std::process::Command::new("kill")
-        .args(["-0", pid.trim()])
+        .args(["-0", &pid.to_string()])
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
 
-/// <agent dir>/terminated: written when Mark terminates the agent, cleared when it is started again.
+/// <agent dir>/terminated: written when the user terminates the agent, cleared when it is started again.
 pub const TERMINATED: &str = "terminated";
 
 /// A random v4 UUID from /dev/urandom.
-pub fn new_uuid() -> Res<String> {
+fn new_uuid() -> Res<String> {
     let mut b = [0u8; 16];
     fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -213,12 +188,12 @@ pub fn new_uuid() -> Res<String> {
     ))
 }
 
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Inline --settings JSON whose hooks write idle/working/blocked to <dir>/status.
-pub fn hooks_json(dir: &Path) -> String {
+fn hooks_json(dir: &Path) -> String {
     let file = sh_quote(&dir.join("status").to_string_lossy());
     let cmd = |c: String| serde_json::json!([{"hooks": [{"type": "command", "command": c}]}]);
     let set = |s: &str| cmd(format!("printf {s} > {file}"));
@@ -249,13 +224,18 @@ pub fn register(a: LiveAgent) -> Arc<LiveAgent> {
     a
 }
 
+/// Clears what a previous run left in <dir>: its status, its `terminated` mark and its diff
+/// seal (a resumed agent's new edits must show again).
+fn reset_run_files(dir: &Path) {
+    let _ = fs::remove_file(dir.join("status"));
+    let _ = fs::remove_file(dir.join(TERMINATED));
+    let _ = fs::remove_file(dir.join(".diff/.sealed"));
+}
+
 /// `--session-id <new> --settings <hooks>` for a fresh session in <dir>: saves the id to
 /// <dir>/session and clears a stale <dir>/status.
 pub fn session_args(dir: &Path) -> Res<[String; 4]> {
-    let _ = fs::remove_file(dir.join("status"));
-    let _ = fs::remove_file(dir.join(TERMINATED));
-    // a resumed agent's new edits must show again
-    let _ = fs::remove_file(dir.join(".diff/.sealed"));
+    reset_run_files(dir);
     let session = new_uuid()?;
     fs::write(dir.join("session"), &session)?;
     Ok([
@@ -310,7 +290,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     if let Some(a) = live(thread, agent).filter(|a| a.alive()) {
         return Ok(a);
     }
-    let dir = crate::thread_dir(thread).join(agent);
+    let dir = crate::store::thread_dir(thread).join(agent);
     if let Some(pid) = running_elsewhere(&dir) {
         return Err(format!("{thread}/{agent}: running in another brigd (pid {pid})").into());
     }
@@ -323,16 +303,13 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
                 .trim(),
         )
     } else {
-        let (flow, state) = crate::load(thread)?;
+        let (flow, state) = crate::store::load(thread)?;
         let a = flow
-            .stages
-            .iter()
-            .flatten()
-            .find(|a| a.name == agent)
+            .agent(agent)
             .ok_or_else(|| format!("no agent {agent} in thread {thread}"))?;
-        cmd.args(crate::claude_flags(thread, a));
+        cmd.args(crate::flow::claude_flags(thread, a));
         crate::tree::space_cwd(
-            &crate::root(),
+            &crate::store::root(),
             Path::new(&state.repo),
             thread,
             a.worktree.as_deref().unwrap_or(""),
@@ -340,10 +317,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     };
     let session = fs::read_to_string(dir.join("session"))
         .map_err(|e| format!("{thread}/{agent}: no session: {e}"))?;
-    let _ = fs::remove_file(dir.join("status"));
-    let _ = fs::remove_file(dir.join(TERMINATED));
-    // a resumed agent's new edits must show again
-    let _ = fs::remove_file(dir.join(".diff/.sealed"));
+    reset_run_files(&dir);
     // ponytail: assumes --resume keeps the session id (subagent scan reads <session>/subagents); re-read it if not.
     cmd.args(["--resume", session.trim(), "--settings", &hooks_json(&dir)]);
     Ok(register(LiveAgent::spawn(cmd, thread, agent, &cwd, &dir)?))
