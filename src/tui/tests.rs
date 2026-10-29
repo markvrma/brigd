@@ -1,3 +1,4 @@
+use super::theme::{theme_index, THEMES};
 use super::*;
 
 fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
