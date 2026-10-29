@@ -1,6 +1,22 @@
 //! brigd's TUI: a sidebar of spaces (the tree.rs folder tree) and, for the
 //! selected thread, one or two side-by-side panes, each a tab bar of agent terminals
 //! (runner.rs PTYs drawn with tui-term) and read-only output.md viewers.
+//!
+//! All state lives in `App` (this file); the child modules add `impl App` blocks and helpers:
+//! theme, markdown and flowplan render; term is the host terminal; sidebar, tabs, newt (the
+//! new-thread window) and threads hold the actions; input routes events; draw paints.
+//!
+//! Contracts the code relies on:
+//! - Draw order (`draw`): sidebar, its buttons, panes, hint, menu, modal, then the drag
+//!   selection, which copies the finished frame (menu and modal included). The button rects
+//!   are cleared and refilled each draw; mouse hit-tests read the last frame's rects.
+//! - Key precedence (`on_key`): new-thread window, run confirm, menu, delete confirm, quit
+//!   confirm, C-o prefix, C-t prefix, Alt-h/l/t, then the sidebar or the focused tab. Modal
+//!   state is `take()`n first and put back when the key is not for it.
+//! - Locks: `registry_snapshot()` copies the registry so its lock is never held across PTY
+//!   calls; a `live.parser` guard is never held across a call to another `App` method.
+//! - `refresh_with` order: terminals join the tree, then statuses, tabs, plans, `resize_all`,
+//!   and `reflow` last.
 
 use crate::tree::{self, Kind, Node};
 use crate::Res;

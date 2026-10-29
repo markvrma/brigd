@@ -1,16 +1,16 @@
-use super::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+//! The TUI's tests: rendering, key and mouse handling, and the helpers, driven through `App`.
+
 use super::flowplan::{flow_lines, SPIN};
 use super::input::key_bytes;
 use super::markdown::{diff_lines, md_text};
 use super::newt::chunk;
-use super::sidebar::{flatten, hit};
-use super::sidebar::{layout, max_offset};
-use super::tabs::pane_rects;
-use super::tabs::Pane;
+use super::sidebar::{flatten, hit, layout, max_offset};
+use super::tabs::{pane_rects, Pane};
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
 use super::threads::{fresh_name, Act};
 use super::*;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::style::Modifier;
 
 fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
