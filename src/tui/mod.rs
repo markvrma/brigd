@@ -66,6 +66,8 @@ const POLL: Duration = Duration::from_millis(40);
 const DIFF_EVERY: u32 = 4;
 /// Refreshes between the slow syncs (reconcile_running, subagent mirroring): 7 × REFRESH ≈ 5s.
 const SYNC_EVERY: u32 = 7;
+/// How often the run loop looks for threads to auto-archive.
+const ARCHIVE_EVERY: Duration = Duration::from_secs(3600);
 /// Run-log lines the FLOWPLAN view shows under the plan.
 const LOG_TAIL: usize = 15;
 
@@ -172,6 +174,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
                 std::thread::sleep(REFRESH);
             }
         });
+        let mut archived: Option<Instant> = None;
         while !app.quit {
             term.draw(|f| app.draw(f))?;
             if event::poll(POLL)? {
@@ -191,6 +194,10 @@ pub fn run(open: Option<&str>) -> Res<()> {
             if let Some(t) = trees.try_iter().last() {
                 app.refresh_with(t);
                 app.claim_queued();
+                if archived.is_none_or(|t| t.elapsed() >= ARCHIVE_EVERY) {
+                    app.auto_archive();
+                    archived = Some(Instant::now());
+                }
                 if app.ticks.is_multiple_of(SYNC_EVERY) {
                     app.reconcile_running();
                     app.keep_master_alive();

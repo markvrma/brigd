@@ -273,6 +273,97 @@ pub(crate) fn create_thread(root: &Path, name: &str, repo: &str, flow: &Flow) ->
     Ok(state)
 }
 
+/// A thread with no activity for this long (secs) is auto-archived by the TUI.
+pub(crate) const ARCHIVE_AFTER: u64 = 7 * 86400;
+
+/// mtime of `meta` in unix secs; a missing or unreadable one reads as now, so it counts as active.
+fn mtime_secs(meta: io::Result<fs::Metadata>) -> u64 {
+    meta.and_then(|m| m.modified())
+        .map(|t| t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+        .unwrap_or_else(|_| now())
+}
+
+/// Raises `max` to the newest mtime of the files under `dir`. Directory mtimes and brigd's
+/// `.diff/` caches (rebuilt lazily, so they say nothing about use) are ignored, symlinks are
+/// never followed, and any read error but a missing dir counts as active now.
+fn newest_file(dir: &Path, max: &mut u64) {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => return *max = now(),
+    };
+    for e in rd {
+        let Ok(e) = e else {
+            *max = now();
+            continue;
+        };
+        match e.file_type() {
+            Ok(t) if t.is_dir() => {
+                if e.file_name() != ".diff" {
+                    newest_file(&e.path(), max)
+                }
+            }
+            Ok(t) if t.is_file() => *max = (*max).max(mtime_secs(e.metadata())),
+            Ok(_) => {}
+            Err(_) => *max = now(),
+        }
+    }
+}
+
+/// When a thread's own files last changed (unix secs; 0 if it has none). A future mtime is
+/// "now or later", so `now().saturating_sub` of it reads as just active.
+pub(crate) fn last_active(tdir: &Path) -> u64 {
+    let mut max = 0;
+    newest_file(tdir, &mut max);
+    max
+}
+
+/// The newest mtime of the claude transcripts (and subagent transcripts) of the thread's agents
+/// and strays, 0 if none: resuming a session outside brigd writes there, not under the thread.
+pub(crate) fn transcript_active(root: &Path, home: &Path, tdir: &Path) -> u64 {
+    let thread = tdir.file_name().unwrap_or_default().to_string_lossy();
+    let json = |f: &str| {
+        fs::read_to_string(tdir.join(f))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_default()
+    };
+    let (flow, state) = (json("flowmap.json"), json("state.json"));
+    let repo = PathBuf::from(state["repo"].as_str().unwrap_or_default());
+    let mut runs: Vec<(PathBuf, PathBuf)> = flow["stages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|s| s.as_array().into_iter().flatten())
+        .filter_map(|a| {
+            let key = a["worktree"].as_str().unwrap_or("");
+            Some((
+                tdir.join(a["name"].as_str()?),
+                crate::tree::space_cwd(root, &repo, &thread, key),
+            ))
+        })
+        .collect();
+    runs.extend(crate::tree::stray_dirs(tdir).into_iter().filter_map(|d| {
+        let cwd = fs::read_to_string(d.join("cwd")).ok()?;
+        Some((d, PathBuf::from(cwd.trim())))
+    }));
+    let mut max = 0;
+    for (dir, cwd) in runs {
+        let Ok(session) = fs::read_to_string(dir.join("session")) else {
+            continue;
+        };
+        let session = session.trim();
+        if let Ok(m) = fs::metadata(crate::transcript::transcript_path(home, &cwd, session)) {
+            max = max.max(mtime_secs(Ok(m)));
+        }
+        newest_file(
+            &crate::transcript::subagents_dir(home, &cwd, session),
+            &mut max,
+        );
+    }
+    max
+}
+
 /// <root>/archive/threads/<thread>: where archive_thread moves a thread.
 pub(crate) fn archive_dir(root: &Path, thread: &str) -> PathBuf {
     root.join("archive/threads").join(thread)
@@ -385,6 +476,43 @@ mod tests {
             .to_string()
             .contains("already exists"));
         assert!(root.join("threads/th").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn last_active_ignores_dirs_and_diff_caches() {
+        let root = env::temp_dir().join(format!("brigd-active-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let t = root.join("th");
+        fs::create_dir_all(t.join("a/.diff/x")).unwrap();
+        let age = |p: PathBuf, secs: u64| {
+            let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+            f.set_modified(SystemTime::now() - std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        let old = 8 * 86400;
+        for f in ["state.json", "a/output.md", "a/deep.md"] {
+            fs::write(t.join(f), "x").unwrap();
+            age(t.join(f), old);
+        }
+        // A fresh file in .diff/ (and the fresh dirs holding it) is not activity.
+        fs::write(t.join("a/.diff/x/f"), "x").unwrap();
+        let stale = |t: &Path| now().saturating_sub(last_active(t)) >= ARCHIVE_AFTER;
+        assert!(stale(&t));
+        // A fresh file deep in the thread is.
+        fs::create_dir_all(t.join("a/sub/deeper")).unwrap();
+        fs::write(t.join("a/sub/deeper/f"), "x").unwrap();
+        assert!(!stale(&t));
+        age(t.join("a/sub/deeper/f"), old);
+        assert!(stale(&t));
+        // A future mtime counts as active.
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(t.join("state.json"))
+            .unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert!(!stale(&t));
         let _ = fs::remove_dir_all(&root);
     }
 

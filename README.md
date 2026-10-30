@@ -116,6 +116,18 @@ session. The next stage starts when every agent in the current one has written i
 Two editing agents may not share a worktree.
 An agent writes its result only when the task is fully done; if it cannot finish it asks you a multiple-choice question and shows as blocked (`!`). A running thread with no live agent process is marked failed.
 
+## Auto-archive
+
+The TUI archives a thread (to `~/.brigd/archive/threads/`, like the Archive menu item) once nothing has
+touched it for 7 days: its files, its agents', subagents' and stray claudes' transcripts (so resuming a
+session outside brigd counts), and any open tab, live agent or terminal. Running, queued and
+still-alive threads are never archived. It checks at startup and then hourly, and says how many it moved.
+Worktrees are left alone. To restore one:
+
+```sh
+mv ~/.brigd/archive/threads/<t> ~/.brigd/threads/ && touch ~/.brigd/threads/<t>/seen
+```
+
 ## TUI keys
 
 Sidebar focused: `j`/`k` or arrows move, `PgUp`/`PgDn` jump, `Enter` open/fold, `h`/`l` or arrows fold,

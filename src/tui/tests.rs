@@ -1137,3 +1137,47 @@ fn sidebar_drag_selects_nothing() {
     app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left), 10, 1));
     assert!(app.drag.is_none() && app.clip.is_none());
 }
+
+#[test]
+fn auto_archive_keeps_threads_in_use() {
+    let root = std::env::temp_dir().join(format!("brigd-auto-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let old = SystemTime::now() - Duration::from_secs(8 * 86400);
+    for t in ["idle", "alive", "tabbed"] {
+        let f = root.join("threads").join(t).join("state.json");
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(&f, "x").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    // A live pid under the thread (this test process) keeps it.
+    let pid = root.join("threads/alive/pid");
+    fs::write(&pid, std::process::id().to_string()).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&pid)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let mut app = App::default();
+    app.tabs.insert(
+        "tabbed".into(),
+        one_pane(vec![Tab::View {
+            path: PathBuf::new(),
+            title: String::new(),
+            text: String::new(),
+            scroll: 0,
+            rel: None,
+        }]),
+    );
+    let stale = app.stale_threads(&root, &root, crate::store::now());
+    assert_eq!(stale, ["idle"]);
+    // The open tab was touched: its week restarts.
+    assert!(root.join("threads/tabbed/seen").exists());
+    assert!(crate::store::last_active(&root.join("threads/tabbed")) >= crate::store::now() - 5);
+    let _ = fs::remove_dir_all(&root);
+}
