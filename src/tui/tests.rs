@@ -4,7 +4,7 @@ use super::flowplan::{flow_lines, SPIN};
 use super::input::key_bytes;
 use super::markdown::{diff_lines, md_text};
 use super::newt::chunk;
-use super::sidebar::{flatten, hit, layout, max_offset};
+use super::sidebar::{brick_banner, flatten, hit, layout, max_offset};
 use super::tabs::{pane_rects, Pane};
 use super::term::base64;
 use super::theme::{theme_index, THEMES};
@@ -863,6 +863,19 @@ fn master_row_pinned_above_spaces() {
     app.on_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
     app.on_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
     assert_eq!(app.confirm_delete, None);
+}
+
+#[test]
+fn master_banner_fits_width_with_label() {
+    for (w, label) in [(12, "MASTER"), (40, "? MASTER · start a task ?")] {
+        let lines = brick_banner("● ", Style::new(), false, w);
+        assert_eq!(lines.len(), 3);
+        for l in &lines {
+            assert_eq!(l.width(), w);
+        }
+        let mid: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(mid.contains(&format!("● {label}")), "{mid:?}");
+    }
 }
 
 #[test]
