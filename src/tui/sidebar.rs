@@ -331,34 +331,18 @@ impl App {
                     ));
                 }
             }
-            Kind::Master => {
-                let live = runner::live(runner::MASTER, runner::MASTER)
-                    .filter(|a| a.alive())
-                    .map(|a| a.status());
-                let (g, style) = super::agent_glyph_status(live, Status::Pending).glyph();
-                spans.push(Span::styled(g, style));
-                label = label.fg(pal().mauve).add_modifier(Modifier::BOLD);
-            }
             Kind::Output => label = label.fg(pal().sky),
             Kind::Diff => label = label.fg(pal().yellow),
             Kind::Space => label = label.fg(pal().mauve).add_modifier(Modifier::BOLD),
             Kind::Thread => label = label.fg(pal().text).add_modifier(Modifier::BOLD),
             _ => label = label.fg(pal().subtext0),
         }
-        let slash = if matches!(
-            r.kind,
-            Kind::Output | Kind::Diff | Kind::Terminal | Kind::Master
-        ) {
+        let slash = if matches!(r.kind, Kind::Output | Kind::Diff | Kind::Terminal) {
             ""
         } else {
             "/"
         };
-        let text = if r.kind == Kind::Master {
-            r.label.to_uppercase()
-        } else {
-            format!("{}{slash}", r.label)
-        };
-        spans.push(Span::styled(text, label));
+        spans.push(Span::styled(format!("{}{slash}", r.label), label));
         // Worktree name (agents) and +add -del (diffs) sit flush right, one column of padding.
         let mut right = vec![];
         if let Some(wt) = &r.worktree {
@@ -396,11 +380,85 @@ impl App {
             (true, false) => line.style(Style::new().add_modifier(Modifier::REVERSED)),
             (true, true) => line.style(Style::new().bg(pal().surface1)),
             // The space (repo) whose tabs show.
-            _ if r.kind == Kind::Master => line.style(Style::new().bg(pal().surface0)),
             _ if r.kind == Kind::Space && r.space == self.space => {
                 line.style(Style::new().bg(pal().surface0))
             }
             _ => line,
         }
     }
+
+    /// The master row's three-line banner: a brick block (half-block courses whose
+    /// mortar joints stagger) with the live status glyph and the label centered on the
+    /// middle course. Selected, the bricks light up yellow, like a hit '?' block.
+    pub(super) fn master_banner(&self, selected: bool, width: usize) -> Vec<Line<'static>> {
+        let live = runner::live(runner::MASTER, runner::MASTER)
+            .filter(|a| a.alive())
+            .map(|a| a.status());
+        let (g, gs) = super::agent_glyph_status(live, Status::Pending).glyph();
+        brick_banner(g, gs, selected, width)
+    }
+}
+
+/// See `App::master_banner`; split out so tests need no live master session.
+pub(super) fn brick_banner(
+    glyph: &str,
+    glyph_style: Style,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    const BRICK_W: usize = 6; // 5 columns of brick, then a joint
+    let brick = if selected { pal().yellow } else { pal().peach };
+    let mortar = pal().crust;
+    let joint = |x: usize, shift: usize| (x + shift) % BRICK_W == BRICK_W - 1;
+    // Top line: course A over a mortar seam; bottom: a seam under course C. Their joints
+    // line up with each other and sit half a brick off the middle course's.
+    let course = |half: &'static str, shift: usize| {
+        Line::from(
+            (0..width)
+                .map(|x| {
+                    if joint(x, shift) {
+                        Span::styled(" ", Style::new().bg(mortar))
+                    } else {
+                        Span::styled(half, Style::new().fg(brick).bg(mortar))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let gw = glyph.chars().count();
+    let label = ["? MASTER · start a task ?", "? MASTER ?", "MASTER", ""]
+        .into_iter()
+        .find(|l| gw + l.chars().count() + 2 <= width)
+        .unwrap_or("");
+    let lw = if label.is_empty() {
+        0
+    } else {
+        gw + label.chars().count()
+    };
+    let x0 = width.saturating_sub(lw) / 2;
+    let on_brick = Style::new()
+        .fg(mortar)
+        .bg(brick)
+        .add_modifier(Modifier::BOLD);
+    let wall = |x: usize| {
+        let mortar = Style::new().bg(mortar);
+        Span::styled(
+            " ",
+            if joint(x, BRICK_W / 2) {
+                mortar
+            } else {
+                on_brick
+            },
+        )
+    };
+    let mut mid: Vec<_> = (0..x0).map(wall).collect();
+    if lw > 0 {
+        mid.push(Span::styled(
+            glyph.to_string(),
+            glyph_style.fg(mortar).bg(brick),
+        ));
+        mid.push(Span::styled(label, on_brick));
+    }
+    mid.extend((x0 + lw..width).map(wall));
+    vec![course("▀", 0), Line::from(mid), course("▄", 0)]
 }
