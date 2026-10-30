@@ -2,6 +2,7 @@
 
 brigd plans a task as a staged flow of coding agents (Claude Code, codex, pi, kimi) and runs each agent in its own PTY,
 inside one TUI. Stages run in order; agents within a stage run in parallel.
+A pinned **master** session turns plain requests into background threads, so you can just say what you want.
 
 ![The brigd TUI: the spaces sidebar on the left, a colored git diff in the middle, and the Claude session of the agent that did the work on the right](docs/images/brigd-overview.png)
 
@@ -25,7 +26,7 @@ inside one TUI. Stages run in order; agents within a stage run in parallel.
 - At least one coding agent CLI, installed and logged in: [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude`), `codex`, `pi` or `kimi`.
 - Rust 1.89 or newer (`cargo`), and `git`.
 - macOS or Linux. Windows is not supported (needs a Unix PTY and `$HOME`). Agent terminals assume `zsh` (falls back to `/bin/sh`).
-- Optional: `tmux` or `herdr`. `--bg` opens the TUI in a new herdr tab or tmux window; otherwise it falls back to Terminal.app on macOS. On Linux, `--bg` needs tmux or herdr; plain `brigd` and `resume` work anywhere.
+- Optional: `herdr` or `tmux`. When no brigd TUI is open, `--bg` opens one in a new herdr tab, else a tmux window, else Terminal.app on macOS. On Linux, `--bg` needs tmux or herdr; plain `brigd` and `resume` work anywhere.
   Clipboard copy uses OSC 52 (terminal support required) and `pbcopy` on macOS.
 
 ## Install
@@ -71,6 +72,15 @@ flow JSON that `brigd <name> --flow flow.json` runs.
 plan-review-go with you; once you approve, it appends all later stages to flowmap.json. It needs the **plan-review-go** and **grill-me** skills (installed by `brigd install-skill`) and the
 **ponytail** plugin (`ponytail-review`, installed by `setup.sh`). brigd asks "Use plan-review-go? (y/N)" after you enter the task (in a terminal, and in the TUI's new-thread window); naming plan-review-go in the task still works and skips the question.
 
+## Master session
+
+The brigd-master skill runs one always-alive claude above all your repos. Say what you want
+("add retries to the api client in ~/code/foo"); it picks the repo (from `brigd ls` or a path you give), picks a thread name,
+asks "Use plan-review-go? (y/N)" and starts the thread with `--bg`, then waits for the next request. It never does the work itself.
+In the TUI it is the pinned brick-block **MASTER** row at the top of the sidebar: select it and press `Enter` to open it;
+once opened it is respawned (resumed) whenever it exits. `brigd master` runs it in a plain terminal instead.
+It needs the skill in `~/.claude/skills/` (`brigd install-skill`) and `claude` on `PATH`.
+
 ## Agents and config
 
 brigd runs claude, codex, pi or kimi agents. On first run (no `~/.brigd/config.json`) it detects the
@@ -96,18 +106,20 @@ after a nudge); non-claude flags come from docs and are unverified; kimi runs on
 |---|---|
 | `brigd <name> "task"` | plan with brigd-plan, confirm, run in the TUI |
 | `brigd <name> --flow flow.json` | run a hand-written flow |
-| `... --bg` | skip the confirm; open the TUI in a new tmux window / Terminal window and return (automatic without a TTY or inside an agent session) |
+| `... --bg` | skip the confirm and return: an open brigd TUI queues and runs it, else it opens in a new herdr tab / tmux window / Terminal window (automatic without a TTY or inside an agent session) |
 | `brigd` | open the TUI over all threads |
+| `brigd master` | the master session in this terminal (see Master session); one at a time |
 | `brigd ls` | list threads |
 | `brigd status <name>` | per-agent detail |
-| `brigd resume <name>` | continue a stopped thread in the TUI |
+| `brigd resume <name> [--bg]` | continue a stopped thread in the TUI |
+| `brigd install-skill` | install the skills (see Skills) |
 
 Run these from inside the git repo the thread should work in.
 
 **Thread names:** start with a lowercase letter, then lowercase letters, digits, `-` or `_`; at most 12 characters;
-not one of `ls`, `status`, `resume`, `install-skill`, `help`, `stray`.
+not one of `ls`, `status`, `resume`, `install-skill`, `help`, `stray`, `master`.
 
-**In the TUI**, the `+` button on a repo row (sidebar) opens the new-thread dialog: fill in a name and a task
+**In the TUI**, the `+` button on a repo row (sidebar) or the green `＋` at the top opens the new-thread dialog: fill in a name and a task
 (Tab switches field, Enter submits, Esc cancels), brigd plans it and asks you to confirm the run.
 
 **Flow basics:** stages run one after another; every agent in a stage runs in parallel, each an interactive agent
@@ -130,8 +142,8 @@ mv ~/.brigd/archive/threads/<t> ~/.brigd/threads/ && touch ~/.brigd/threads/<t>/
 
 ## TUI keys
 
-Sidebar focused: `j`/`k` or arrows move, `PgUp`/`PgDn` jump, `Enter` open/fold, `h`/`l` or arrows fold,
-`Tab` back to the tab, `q` quit. Mouse wheel scrolls; right-click a row for a menu
+Sidebar focused: `j`/`k` or arrows move, `PgUp`/`PgDn` jump, `Enter` open/fold (the master row: start it), `h`/`l` or arrows fold,
+`Tab` to the tab, `q` quit. In a viewer tab (output.md, diff): `j`/`k`, `PgUp`/`PgDn`/`Space`, `g`/`G` scroll, `Tab`/`Esc` back to the sidebar. Mouse wheel scrolls; right-click a row for a menu
 (agent: Terminate; thread: Delete, Archive).
 
 Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
@@ -158,7 +170,7 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 | `d` | delete the thread with its worktrees and `brigd/` branches (asks `y` to confirm) |
 | `a` | archive it: moved to `<root>/archive/threads`, worktrees kept |
 | `n` | new thread in the highlighted thread's repo (opens the new-thread dialog; the dir field is editable) |
-| `m` | new thread in any directory (same dialog, dir field focused); the green `＋` at the top of the sidebar does the same |
+| `m` | new thread in any directory (same dialog, dir field focused) |
 | `Ctrl-t` | send Ctrl-t to the focused agent |
 
 ## Privacy and security
@@ -174,7 +186,8 @@ under their own terms. See [SECURITY.md](SECURITY.md).
 
 ```sh
 cargo uninstall brigd
-rm -rf ~/.claude/skills/brigd-plan   # the installed skill (also ~/.agents/skills/ for codex, pi, kimi)
+# the installed skills: brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills, brigd-master
+rm -rf ~/.claude/skills/{brigd-plan,plan-review-go,grill-me,grilling,brigd-resume,find-skills,brigd-master}   # also ~/.agents/skills/ for codex, pi, kimi
 rm -rf ~/.brigd                      # thread state and config.json; optional
 ```
 
