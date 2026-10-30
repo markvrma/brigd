@@ -848,13 +848,13 @@ fn master_row_pinned_above_spaces() {
             (Kind::Space, "b")
         ]
     );
-    // The master banner is three lines, then a blank line before the first space; the
+    // The master banner is one line, then a blank line before the first space; the
     // shown space and thread are still the first real ones.
     let ys: Vec<_> = layout(&app.rows, 0, 20)
         .into_iter()
         .map(|(y, _)| y)
         .collect();
-    assert_eq!(ys, [0, 4, 5, 7]);
+    assert_eq!(ys, [0, 2, 3, 5]);
     assert_eq!(
         (app.space.as_path(), app.thread.as_str()),
         (Path::new("/a"), "t")
@@ -868,14 +868,15 @@ fn master_row_pinned_above_spaces() {
 
 #[test]
 fn master_banner_fits_width_with_label() {
-    for (w, label) in [(12, "MASTER"), (40, "? MASTER · start a task ?")] {
+    for (w, label) in [(8, "NEW"), (14, "NEW THREAD"), (40, "NEW THREAD")] {
         let lines = brick_banner("● ", Style::new(), false, w);
-        assert_eq!(lines.len(), 3);
-        for l in &lines {
-            assert_eq!(l.width(), w);
-        }
-        let mid: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(mid.contains(&format!("● {label}")), "{mid:?}");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width(), w);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains(&format!("● {label}")), "{text:?}");
+        let span = lines[0].spans.iter().find(|s| s.content == label).unwrap();
+        let m = span.style.add_modifier;
+        assert!(m.contains(Modifier::BOLD | Modifier::ITALIC));
     }
 }
 
