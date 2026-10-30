@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// The right-click popup: an agent row's Terminate, a thread row's Delete / Archive.
 /// Item `i` fills line `rect.y + i`; `sel` is the one Enter picks.
@@ -127,6 +128,29 @@ pub(super) fn stray_status(dir: &Path) -> Status {
     )
 }
 
+/// Is any `pid` file under `dir` (a flow agent's, a stray's) a running process?
+fn live_pid(dir: &Path) -> bool {
+    fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+        let Ok(t) = e.file_type() else { return false };
+        if t.is_dir() {
+            e.file_name() != ".diff" && live_pid(&e.path())
+        } else {
+            e.file_name() == "pid"
+                && fs::read_to_string(e.path())
+                    .is_ok_and(|p| p.trim().parse().is_ok_and(runner::pid_alive))
+        }
+    })
+}
+
+/// Sets `path`'s mtime to now, creating it empty if missing.
+fn touch(path: &Path) {
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|f| f.set_modified(SystemTime::now()));
+}
+
 /// The first `term-<n>` not in `taken`.
 pub(super) fn fresh_name<'a>(taken: impl Iterator<Item = &'a str>) -> String {
     let taken: HashSet<&str> = taken.collect();
@@ -235,6 +259,73 @@ impl App {
             Err(e) => self.flash(format!("delete {thread}: {e}")),
         }
         self.refresh();
+    }
+
+    /// Names of the threads under `root` to auto-archive: idle (own files and claude transcripts
+    /// under `home`) for ARCHIVE_AFTER and in no way in use. Threads in use here (an open tab or
+    /// a live agent or shell) get `seen` touched instead, so the week counts from their last use.
+    pub(super) fn stale_threads(&self, root: &Path, home: &Path, now: u64) -> Vec<String> {
+        let in_use: HashSet<String> = (self.tabs.iter())
+            .filter(|(_, p)| p.list.iter().any(|x| !x.list.is_empty()))
+            .map(|(t, _)| t.clone())
+            .chain(live_agents().into_iter().map(|a| a.thread.clone()))
+            .chain(self.live_shells().into_iter().map(|(_, t)| t))
+            .collect();
+        let mut stale = vec![];
+        for e in fs::read_dir(root.join("threads"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let (tdir, name) = (e.path(), e.file_name().to_string_lossy().into_owned());
+            if !tdir.is_dir() {
+                continue;
+            }
+            if in_use.contains(&name) {
+                touch(&tdir.join("seen"));
+                continue;
+            }
+            let idle = now.saturating_sub(
+                crate::store::last_active(&tdir)
+                    .max(crate::store::transcript_active(root, home, &tdir)),
+            );
+            if idle >= crate::store::ARCHIVE_AFTER
+                && !self.planning.contains(&name)
+                && !matches!(
+                    self.thread_status.get(&tdir),
+                    Some(Status::Running | Status::Queued)
+                )
+                && !crate::engine::executing(&name)
+                && !crate::store::archive_dir(root, &name).exists() // quietly: a name clash
+                // ponytail: a recycled pid in a stale pid file keeps its thread
+                && !live_pid(&tdir)
+            {
+                stale.push(name);
+            }
+        }
+        stale
+    }
+
+    /// Archives the threads `stale_threads` finds, if this TUI owns tui.pid (as claim_queued does),
+    /// and says how many and how to restore one.
+    pub(super) fn auto_archive(&mut self) {
+        if crate::launch::tui_pid() != Some(std::process::id()) {
+            return;
+        }
+        let (root, home) = (crate::store::root(), crate::store::home());
+        let stale = self.stale_threads(&root, &home, crate::store::now());
+        stale.iter().for_each(|t| self.archive(t));
+        // archive() flashes per thread (and may fail): count the ones that moved.
+        let n = stale
+            .iter()
+            .filter(|t| !crate::store::thread_dir(t).exists())
+            .count();
+        if n > 0 {
+            self.flash(format!(
+                "auto-archived {n} thread{}; restore: mv ~/.brigd/archive/threads/<t> ~/.brigd/threads/ && touch ~/.brigd/threads/<t>/seen",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
     }
 
     /// Runs threads `brigd resume --bg` queued, if this TUI owns tui.pid. Takes over
