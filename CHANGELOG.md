@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - New thread in any directory: the header `＋` or `C-t m`; the new-thread dialog has an editable dir field.
 - Tabs have a `×` close button and a left-side fade.
 
+- Master session: `brigd master` and a pinned brick-block MASTER row in the TUI sidebar run an always-alive claude (the `brigd-master` skill, installed by `brigd install-skill`) that turns requests into background threads. `master` is now a reserved thread name.
+- The TUI auto-archives threads idle for 7+ days (checked at startup and hourly); restore with `mv` and `touch seen` (see README).
+
 ### Changed
 
 - The source is split into modules (`store`, `flow`, `engine`, `launch`, `stray`, `diffs`, `transcript`, and `tui/` as a directory); see CONTRIBUTING.md. No user-visible change.

@@ -41,7 +41,7 @@ case ":$PATH:" in
   *) echo "warning: $cargo_bin is not on your PATH; add it to run brigd." >&2 ;;
 esac
 
-"$cargo_bin/brigd" install-skill   # brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills
+"$cargo_bin/brigd" install-skill   # brigd-plan, plan-review-go, grill-me, grilling, brigd-resume, find-skills, brigd-master
 
 # ponytail plugin (ponytail-review) for the opt-in plan-review-go path; non-fatal.
 if command -v claude >/dev/null; then
@@ -57,6 +57,7 @@ fi
 cat <<'MSG'
 
 Done. Next steps:
-  brigd demo "say hi"        # plan and run a first thread (from inside a git repo)
+  brigd                      # open the TUI; select the MASTER row and say what you want
+  brigd demo "say hi"        # or plan and run a first thread (from inside a git repo)
   /brigd-plan <task>         # inside Claude Code: returns a flow JSON
 MSG
