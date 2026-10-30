@@ -88,13 +88,9 @@ pub(super) fn layout(rows: &[Row], offset: usize, h: usize) -> Vec<(usize, usize
     out
 }
 
-/// Lines a row takes: the master row is a three-line banner, the rest one.
-pub(super) fn row_height(r: &Row) -> usize {
-    if r.kind == Kind::Master {
-        3
-    } else {
-        1
-    }
+/// Lines a row takes: one each.
+pub(super) fn row_height(_: &Row) -> usize {
+    1
 }
 
 /// The smallest offset that still shows the last row in `h` lines.
@@ -387,9 +383,9 @@ impl App {
         }
     }
 
-    /// The master row's three-line banner: a brick block (half-block courses whose
-    /// mortar joints stagger) with the live status glyph and the label centered on the
-    /// middle course. Selected, the bricks light up yellow, like a hit '?' block.
+    /// The master row's banner: one solid brick line with the live status glyph and the
+    /// bold-italic NEW THREAD label centered. Selected, the brick lights up yellow, like
+    /// a hit '?' block.
     pub(super) fn master_banner(&self, selected: bool, width: usize) -> Vec<Line<'static>> {
         let live = runner::live(runner::MASTER, runner::MASTER)
             .filter(|a| a.alive())
@@ -406,27 +402,10 @@ pub(super) fn brick_banner(
     selected: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
-    const BRICK_W: usize = 6; // 5 columns of brick, then a joint
     let brick = if selected { pal().yellow } else { pal().peach };
-    let mortar = pal().crust;
-    let joint = |x: usize, shift: usize| (x + shift) % BRICK_W == BRICK_W - 1;
-    // Top line: course A over a mortar seam; bottom: a seam under course C. Their joints
-    // line up with each other and sit half a brick off the middle course's.
-    let course = |half: &'static str, shift: usize| {
-        Line::from(
-            (0..width)
-                .map(|x| {
-                    if joint(x, shift) {
-                        Span::styled(" ", Style::new().bg(mortar))
-                    } else {
-                        Span::styled(half, Style::new().fg(brick).bg(mortar))
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-    };
+    let ink = pal().crust;
     let gw = glyph.chars().count();
-    let label = ["? MASTER · start a task ?", "? MASTER ?", "MASTER", ""]
+    let label = ["NEW THREAD", "NEW", ""]
         .into_iter()
         .find(|l| gw + l.chars().count() + 2 <= width)
         .unwrap_or("");
@@ -436,29 +415,18 @@ pub(super) fn brick_banner(
         gw + label.chars().count()
     };
     let x0 = width.saturating_sub(lw) / 2;
-    let on_brick = Style::new()
-        .fg(mortar)
-        .bg(brick)
-        .add_modifier(Modifier::BOLD);
-    let wall = |x: usize| {
-        let mortar = Style::new().bg(mortar);
-        Span::styled(
-            " ",
-            if joint(x, BRICK_W / 2) {
-                mortar
-            } else {
-                on_brick
-            },
-        )
-    };
-    let mut mid: Vec<_> = (0..x0).map(wall).collect();
+    let fill = Style::new().bg(brick);
+    let mut spans = vec![Span::styled(" ".repeat(x0), fill)];
     if lw > 0 {
-        mid.push(Span::styled(
+        spans.push(Span::styled(
             glyph.to_string(),
-            glyph_style.fg(mortar).bg(brick),
+            glyph_style.fg(ink).bg(brick),
         ));
-        mid.push(Span::styled(label, on_brick));
+        spans.push(Span::styled(
+            label,
+            fill.fg(ink).add_modifier(Modifier::BOLD | Modifier::ITALIC),
+        ));
     }
-    mid.extend((x0 + lw..width).map(wall));
-    vec![course("▀", 0), Line::from(mid), course("▄", 0)]
+    spans.push(Span::styled(" ".repeat(width - x0 - lw), fill));
+    vec![Line::from(spans)]
 }
