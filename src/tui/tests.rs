@@ -1199,3 +1199,30 @@ fn float_shell_toggles_and_survives_hide() {
     assert!(app.float.as_ref().unwrap().alive());
     app.float.as_ref().unwrap().kill();
 }
+
+#[test]
+fn float_resize_steps_and_limits() {
+    use super::theme::{parse_float_size, resize};
+    let area = (100, 40);
+    // Grow: height first, then width.
+    assert_eq!(resize((80, 28), area, true), (80, 30));
+    assert_eq!(resize((80, 39), area, true), (80, 40));
+    assert_eq!(resize((80, 40), area, true), (84, 40));
+    assert_eq!(resize((98, 40), area, true), (100, 40));
+    assert_eq!(resize((100, 40), area, true), (100, 40));
+    // Shrink: height to 10, then width to 20.
+    assert_eq!(resize((80, 28), area, false), (80, 26));
+    assert_eq!(resize((80, 11), area, false), (80, 10));
+    assert_eq!(resize((80, 10), area, false), (76, 10));
+    assert_eq!(resize((22, 10), area, false), (20, 10));
+    assert_eq!(resize((20, 10), area, false), (20, 10));
+    // Oversized cur clamps to the screen; a screen under 10 rows shrinks width only.
+    assert_eq!(resize((200, 80), area, true), (100, 40));
+    assert_eq!(resize((80, 8), (100, 8), false), (76, 8));
+    // Persisted size.
+    assert_eq!(parse_float_size("80 24\n"), Some((80, 24)));
+    assert_eq!(parse_float_size("junk"), None);
+    assert_eq!(parse_float_size("80"), None);
+    assert_eq!(parse_float_size("19 24"), None);
+    assert_eq!(parse_float_size("80 9"), None);
+}

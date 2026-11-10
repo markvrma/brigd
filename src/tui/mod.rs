@@ -54,7 +54,7 @@ use newt::{Bg, Newt};
 use sidebar::{NodeKey, Row};
 use tabs::{Tab, ThreadPanes};
 use term::{copy_to_clipboard, setup, teardown};
-use theme::{init_theme, pal};
+use theme::{init_theme, load_float_size, pal};
 use threads::{
     add_terminals, agent_glyph_status, live_agents, registry_snapshot, stray_status, Menu, Snapshot,
 };
@@ -153,6 +153,8 @@ struct App {
     float_open: bool,
     /// The popup's rect from the last draw, for the click-outside hide.
     float_rect: Rect,
+    /// The popup's (cols, rows) incl. border, set by Alt-+/- and kept in ~/.brigd/float; None = 80% x 70%.
+    float_size: Option<(u16, u16)>,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until the user quits.
@@ -163,7 +165,10 @@ pub fn run(open: Option<&str>) -> Res<()> {
     let res = (|| -> Res<()> {
         let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         term.clear()?;
-        let mut app = App::default();
+        let mut app = App {
+            float_size: load_float_size(),
+            ..App::default()
+        };
         // `brigd resume --bg` hands threads to the TUI whose pid is here.
         _ = fs::write(
             crate::launch::tui_pid_path(),
