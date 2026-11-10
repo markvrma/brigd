@@ -76,10 +76,10 @@ impl App {
         let Some(live) = self.float.clone().filter(|_| self.float_open) else {
             return;
         };
-        // Square on screen: a cell is ~twice as tall as wide, so width = 2 × height.
+        // Equal columns and rows (looks tall: a cell is ~twice as tall as wide).
         let a = f.area();
-        let h = (a.height * 7 / 10).min(a.width / 2).max(1);
-        let r = a.centered(Constraint::Length(h * 2), Constraint::Length(h));
+        let n = (a.height * 7 / 10).min(a.width).max(1);
+        let r = a.centered(Constraint::Length(n), Constraint::Length(n));
         self.float_rect = r;
         let block = Block::bordered()
             .title(" shell · C-o f hide ")
