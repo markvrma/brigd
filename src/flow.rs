@@ -30,16 +30,19 @@ const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required"
 "worktree":{"type":["string","null"]},
 "task":{"type":"string"},
 "files":{"type":"array","items":{"type":"string"}},
-"mode":{"type":"string","enum":["default","acceptEdits","auto"]}}}}}}}"#;
+"mode":{"type":"string","enum":["default","acceptEdits","auto"]},
+"loop":{"type":"object","additionalProperties":false,"required":["to","max"],
+"properties":{"to":{"type":"string"},"max":{"type":"integer","minimum":0}}}}}}}}}"#;
 
 /// Checks what the schema cannot: at least one stage, no empty stage, unique valid agent
 /// names (not "log"), a known agent, effort and mode, valid worktree keys, and at most one editing
-/// agent (WRITE_MODES) per space per stage.
+/// agent (WRITE_MODES) per space per stage. A `loop` names an agent of the stage right before
+/// it, in the same space, and an agent is in at most one loop.
 fn validate(flow: &Flow) -> Result<(), String> {
     if flow.stages.is_empty() {
         return Err("flow has no stages".into());
     }
-    let mut names = HashSet::new();
+    let (mut names, mut looped) = (HashSet::new(), HashSet::new());
     for (i, stage) in flow.stages.iter().enumerate() {
         let n = i + 1;
         if stage.is_empty() {
@@ -86,6 +89,20 @@ fn validate(flow: &Flow) -> Result<(), String> {
             };
             if *c > 1 {
                 return Err(format!("stage {n}: two editing agents ({WRITE_MODES:?}) in {space}; move one to the next stage"));
+            }
+            if let Some(l) = &a.r#loop {
+                let to = i
+                    .checked_sub(1)
+                    .and_then(|p| flow.stages[p].iter().find(|t| t.name == l.to))
+                    .ok_or_else(|| {
+                        format!("{who}: loop.to must name an agent of the stage before it")
+                    })?;
+                if to.worktree.as_deref().unwrap_or("") != wt {
+                    return Err(format!("{who}: loop.to must work in the same worktree"));
+                }
+                if !looped.insert(&a.name) || !looped.insert(&to.name) {
+                    return Err(format!("{who}: an agent can be in one loop only"));
+                }
             }
         }
     }
@@ -207,6 +224,9 @@ pub(crate) fn task_prompt(thread: &str, flow: &Flow, i: usize, a: &Agent) -> Str
          (Edit/Write, or a script or shell command). brigd shows exactly those as this agent's diffs.\n",
         output_path(thread, &a.name).display()
     );
+    if a.r#loop.is_some() {
+        p += "Include a line `VERDICT: pass` (nothing left to fix) or `VERDICT: fail` (fixes needed, listed above) in it.\n";
+    }
     p
 }
 
@@ -282,6 +302,7 @@ pub(crate) mod tests {
             task: "t".into(),
             files: vec![],
             mode: mode.into(),
+            r#loop: None,
         }
     }
 
@@ -342,6 +363,48 @@ pub(crate) mod tests {
             stages: vec![vec![agent("a", None, "plan")]]
         })
         .is_err());
+    }
+
+    #[test]
+    fn loop_rules() {
+        let flow = |rev_wt: Option<&str>, to: &str, extra: Vec<Agent>| {
+            let mut rev = agent("rev", rev_wt, "default");
+            rev.r#loop = Some(crate::store::Loop {
+                to: to.into(),
+                max: 3,
+            });
+            let mut last = vec![rev];
+            last.extend(extra);
+            Flow {
+                goal: "g".into(),
+                stages: vec![
+                    vec![agent("plan", None, "default")],
+                    vec![agent("impl", Some("x"), "acceptEdits")],
+                    last,
+                ],
+            }
+        };
+        assert!(validate(&flow(Some("x"), "impl", vec![])).is_ok());
+        let err = |f: Flow| validate(&f).unwrap_err();
+        assert!(err(flow(Some("x"), "plan", vec![])).contains("stage before")); // not adjacent
+        assert!(err(flow(Some("x"), "nope", vec![])).contains("stage before"));
+        assert!(err(flow(Some("y"), "impl", vec![])).contains("same worktree"));
+        let mut same = flow(Some("x"), "impl", vec![agent("peer", Some("x"), "default")]);
+        same.stages[2][0].r#loop.as_mut().unwrap().to = "peer".into(); // same stage
+        assert!(err(same).contains("stage before"));
+        let mut two = agent("rev2", Some("x"), "default");
+        two.r#loop = Some(crate::store::Loop {
+            to: "impl".into(),
+            max: 1,
+        });
+        assert!(err(flow(Some("x"), "impl", vec![two])).contains("one loop"));
+        // no `loop`: parses, and serialises without it; `max` defaults to 3
+        let text =
+            r#"{"goal":"g","stages":[[{"name":"a","model":"m","effort":"low","task":"t"}]]}"#;
+        let f = flow_from_json(text).unwrap();
+        assert!(!serde_json::to_string(&f).unwrap().contains("loop"));
+        let l: crate::store::Loop = serde_json::from_str(r#"{"to":"a"}"#).unwrap();
+        assert_eq!(l.max, 3);
     }
 
     #[test]
