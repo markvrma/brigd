@@ -13,13 +13,15 @@ pub(super) const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
 const TASK_WORDS: usize = 10;
 
 /// The flow as an npx-style step tree ending at crate::flow::LOG_MARK; also the plain FLOWPLAN
-/// text (flow_text). `status(agent)`: pending / running / blocked / done / failed.
+/// text (flow_text). `status(agent)`: pending / running / blocked / done / failed. `rounds(agent)`:
+/// the loop rounds it has written (engine::rounds), shown under a loop reviewer.
 /// A task shows its first TASK_WORDS words and a "..." unless `expanded(agent)`. Each task
 /// line pushes (line index, clickable columns, agent) to `hits`: the "..." when collapsed,
 /// the whole line when expanded.
 pub(super) fn plan_lines(
     flow: &Flow,
     status: impl Fn(&str) -> Status,
+    rounds: impl Fn(&str) -> u32,
     expanded: impl Fn(&str) -> bool,
     hits: &mut Vec<(usize, Range<u16>, String)>,
     frame: usize,
@@ -77,6 +79,18 @@ pub(super) fn plan_lines(
                 Span::styled(format!(" {:<w$}  ", a.name), Style::new().fg(c)),
                 guide(&meta),
             ]));
+            if let Some(l) = &a.r#loop {
+                let k = rounds(&a.name).max(rounds(&l.to));
+                let n = if k > 0 {
+                    format!("↺ loop → {} · round {k}/{}", l.to, l.max)
+                } else {
+                    format!("↺ loop → {} ×{}", l.to, l.max)
+                };
+                out.push(Line::from(vec![
+                    guide(if last { "│       " } else { "│  │    " }),
+                    Span::styled(n, Style::new().fg(c)),
+                ]));
+            }
             task_lines(&mut out, hits, a, last, c, &expanded, width);
         }
     }
@@ -88,16 +102,24 @@ pub(super) fn plan_lines(
 /// The FLOWPLAN tree (plan_lines) as plain text, every step pending, ending at LOG_MARK.
 /// What FLOWPLAN starts with and what `brigd <name>` prints.
 pub(crate) fn flow_text(flow: &Flow) -> String {
-    plan_lines(flow, |_| Status::Pending, |_| true, &mut vec![], 0, 100)
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|s| s.content.as_ref())
-                .collect::<String>()
-                + "\n"
-        })
-        .collect()
+    plan_lines(
+        flow,
+        |_| Status::Pending,
+        |_| 0,
+        |_| true,
+        &mut vec![],
+        0,
+        100,
+    )
+    .iter()
+    .map(|l| {
+        l.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            + "\n"
+    })
+    .collect()
 }
 
 /// Tree guide characters, dimmed.

@@ -360,6 +360,7 @@ fn flowplan_view_draws_step_tree() {
         ),
         files: vec![],
         mode: "default".into(),
+        r#loop: None,
     };
     let flow = crate::store::Flow {
         goal: "ship it".into(),

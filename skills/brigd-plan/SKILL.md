@@ -29,7 +29,8 @@ Return **only** the flow JSON. No prose, no code fence, no comments.
         "worktree": string | null,    // ^[a-z][a-z0-9_-]{0,18}$ or null (main repo)
         "task": string,               // self-contained instructions for this agent
         "files": [string],            // repo paths the agent should check first
-        "mode": "default" | "acceptEdits" | "auto"
+        "mode": "default" | "acceptEdits" | "auto",
+        "loop": {"to": string, "max": integer}  // optional, reviewers only; see ## Loops
       }
     ]
   ]
@@ -58,7 +59,7 @@ Example, for "find why login is slow and fix it":
     [
       {"name": "review-fix", "agent": "claude", "model": "sonnet", "effort": "medium", "worktree": "login-fix",
        "task": "Review the uncommitted diff in this worktree for correctness bugs. Report findings only.",
-       "files": [], "mode": "default"}
+       "files": [], "mode": "default", "loop": {"to": "fix-login", "max": 3}}
     ]
   ]
 }
@@ -91,6 +92,17 @@ debugging, high-stakes edits. Models (cost tier: strengths):
 
 `effort` for kimi is ignored; codex clamps `max` to `high`, pi to `xhigh`.
 Start `effort` at `low` and raise it only when the task needs real reasoning.
+
+## Loops
+- A reviewer may send work back with `"loop": {"to": "<agent>", "max": 3}`. After the
+  reviewer's stage, brigd types "fix these" into `to`'s session and "re-review" into the
+  reviewer's, up to `max` rounds, until the reviewer's verdict is pass. Both keep their sessions.
+- Prefer a loop over implement → review → fix → re-review chains of fresh agents.
+- `to` must be an agent of the stage right before the reviewer, in the same `worktree`.
+  The reviewer's `mode` is `default`. An agent is in at most one loop.
+- `max` 3 unless told otherwise. brigd adds the verdict and round rules to the prompts;
+  the tasks need not mention them.
+- A final reviewer after the loop is a normal agent in a later stage.
 
 ## Worktrees and modes
 

@@ -162,15 +162,24 @@ pub(super) fn fresh_name<'a>(taken: impl Iterator<Item = &'a str>) -> String {
 
 impl App {
     /// PAUSE: ESC to every live agent of the thread (flow agents, and the shell tabs strays
-    /// run in). RESUME: "continue" + Enter to the same set.
+    /// run in). RESUME: "continue" + Enter to the same set. A flow agent state.json calls done
+    /// or failed is left alone: it idles on (a loop may type into it later).
     pub(super) fn toggle_pause(&mut self, thread: &str) {
         let resume = self.paused.contains(thread);
         let strays = tree::stray_dirs(&crate::store::thread_dir(thread))
             .iter()
             .any(|d| !matches!(stray_status(d), Status::Off | Status::Done | Status::Failed));
+        let saved = crate::store::load(thread)
+            .map(|(_, s)| s.agents)
+            .unwrap_or_default();
         let mut targets = live_agents()
             .into_iter()
             .filter(|a| a.thread == thread)
+            .filter(|a| {
+                !saved
+                    .get(&a.agent)
+                    .is_some_and(|s| matches!(s.status, Status::Done | Status::Failed))
+            })
             .collect::<Vec<_>>();
         if strays {
             // ponytail: a shell tab is matched to the thread by $BRIGD_THREAD, not to the exact claude inside it
