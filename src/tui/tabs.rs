@@ -433,11 +433,44 @@ impl App {
             .flat_map(|t| &mut t.list)
     }
 
+    /// The terminal keys and pastes go to: the open float, else the active tab's.
+    pub(super) fn term_target(&mut self) -> Option<Arc<LiveAgent>> {
+        if self.float_open {
+            return self.float.clone();
+        }
+        match self.active_tab() {
+            Some(Tab::Term { live, .. }) => Some(live.clone()),
+            _ => None,
+        }
+    }
+
+    /// C-o f: hides the float (its shell keeps running), or shows it, spawning a shell in $HOME
+    /// when there is none or it exited. Not registered: resize_all would fight the popup size.
+    pub(super) fn toggle_float(&mut self) {
+        if self.float_open {
+            self.float_open = false;
+            return;
+        }
+        if !self.float.as_ref().is_some_and(|l| l.alive()) {
+            let mut cmd = portable_pty::CommandBuilder::new(
+                env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            );
+            // A claude typed here must not become a stray of whatever thread brigd runs in.
+            cmd.env_remove("BRIGD_THREAD");
+            cmd.env_remove("BRIGD_TERM");
+            let home = crate::store::home();
+            match LiveAgent::spawn(cmd, "", "float", &home, Path::new("")) {
+                Ok(l) => self.float = Some(Arc::new(l)),
+                Err(e) => return self.flash(format!("float: {e}")),
+            }
+        }
+        self.float_open = true;
+    }
+
     pub(super) fn send(&mut self, bytes: &[u8]) {
-        let Some(Tab::Term { live, .. }) = self.active_tab() else {
+        let Some(live) = self.term_target() else {
             return;
         };
-        let live = live.clone();
         {
             let mut p = live.parser.lock().unwrap();
             if p.screen().scrollback() > 0 {

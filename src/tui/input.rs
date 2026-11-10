@@ -98,7 +98,18 @@ impl App {
             self.quit = matches!(k.code, KeyCode::Char('y' | 'Y'));
             return;
         }
-        if self.key_prefix(k) || self.key_thread_prefix(k) {
+        if self.key_prefix(k) {
+            return;
+        }
+        // The open float takes every other key (C-t and Alt-h/l/t too).
+        if self.float_open {
+            let app_cursor = self
+                .float
+                .as_ref()
+                .is_some_and(|l| l.parser.lock().unwrap().screen().application_cursor());
+            return self.send(&key_bytes(k, app_cursor));
+        }
+        if self.key_thread_prefix(k) {
             return;
         }
         // Alt-h/l/t from anywhere; '˙'/'¬'/'†' are what macOS Option-h/l/t types without "Option as Meta".
@@ -210,6 +221,9 @@ impl App {
             self.prefix = false;
             match k.code {
                 _ if ctrl_o => self.send(&[CTRL_O]), // Ctrl-o twice sends one to claude
+                KeyCode::Char('q') => self.ask_quit(),
+                KeyCode::Char('f') => self.toggle_float(),
+                _ if self.float_open => {} // panes are hidden behind the float
                 KeyCode::Char('s') => self.focus_main = false,
                 KeyCode::Char('n') => self.cycle(1),
                 KeyCode::Char('p') => self.cycle(-1),
@@ -218,7 +232,6 @@ impl App {
                 KeyCode::Char('v') => self.split(),
                 KeyCode::Char('o') => self.other_pane(),
                 KeyCode::Char('c') => self.flash(format!("theme: {}", next_theme())),
-                KeyCode::Char('q') => self.ask_quit(),
                 _ => {}
             }
             return true;
@@ -294,6 +307,13 @@ impl App {
             x: m.column,
             y: m.row,
         };
+        if self.float_open {
+            // A press outside the popup hides it; nothing else reaches the panes or the float.
+            if matches!(m.kind, MouseEventKind::Down(_)) && !self.float_rect.contains(at) {
+                self.toggle_float();
+            }
+            return;
+        }
         if matches!(m.kind, MouseEventKind::Down(_)) {
             self.disarm_prefixes();
             if let Some(menu) = self.menu.take() {
@@ -522,10 +542,10 @@ impl App {
             }
             return;
         }
-        if self.confirm_run.is_some() || !self.focus_main {
+        if self.confirm_run.is_some() || !(self.focus_main || self.float_open) {
             return;
         }
-        let Some(Tab::Term { live, .. }) = self.active_tab() else {
+        let Some(live) = self.term_target() else {
             return;
         };
         let bracketed = live.parser.lock().unwrap().screen().bracketed_paste();
