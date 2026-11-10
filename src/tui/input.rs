@@ -3,7 +3,7 @@
 use super::sidebar::{hit, max_offset};
 use super::tabs::{Tab, CLOSE_W};
 use super::term::sel_text;
-use super::theme::next_theme;
+use super::theme::{next_theme, resize};
 use super::threads::{Act, Menu};
 use super::{App, MIN_SIDE_W, SIDE_W};
 use crate::tree::{self, Kind};
@@ -101,8 +101,17 @@ impl App {
         if self.key_prefix(k) {
             return;
         }
-        // The open float takes every other key (C-t and Alt-h/l/t too).
+        // The open float takes every other key (C-t and Alt-h/l/t too), except Alt-+/- which resize it
+        // (the shell loses readline's M-- and M-=). '≠' '±' '–' are Option-=, Option-Shift-=, Option-- without "Option as Meta".
         if self.float_open {
+            let alt = k.modifiers.contains(KeyModifiers::ALT);
+            match k.code {
+                KeyCode::Char('+' | '=') if alt => return self.resize_float(true),
+                KeyCode::Char('≠' | '±') => return self.resize_float(true),
+                KeyCode::Char('-') if alt => return self.resize_float(false),
+                KeyCode::Char('–') => return self.resize_float(false),
+                _ => {}
+            }
             let app_cursor = self
                 .float
                 .as_ref()
@@ -123,6 +132,25 @@ impl App {
             return self.side_key(k);
         }
         self.key_view(k);
+    }
+
+    /// Grows or shrinks the float one step and saves the size; no-op at a limit.
+    fn resize_float(&mut self, grow: bool) {
+        let r = self.float_rect;
+        let cur = self.float_size.unwrap_or((r.width, r.height));
+        let Ok(area) = crossterm::terminal::size() else {
+            return;
+        };
+        let cur = (cur.0.min(area.0), cur.1.min(area.1));
+        let new = resize(cur, area, grow);
+        if new == cur {
+            return;
+        }
+        self.float_size = Some(new);
+        let _ = std::fs::write(
+            crate::store::root().join("float"),
+            format!("{} {}\n", new.0, new.1),
+        ); // ponytail: best effort, like the theme
     }
 
     /// The new-thread window, unless hidden, takes every key: field editing, then the

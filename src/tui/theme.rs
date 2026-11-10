@@ -240,6 +240,40 @@ pub(super) fn next_theme() -> &'static str {
     THEMES[i].name
 }
 
+const ROW_STEP: u16 = 2;
+const COL_STEP: u16 = 4;
+const MIN_H: u16 = 10;
+const MIN_W: u16 = 20;
+
+/// "<cols> <rows>" -> the float's size; garbage or below the minimums -> None (default size).
+pub(super) fn parse_float_size(s: &str) -> Option<(u16, u16)> {
+    let mut it = s.split_whitespace().map(|n| n.parse::<u16>());
+    let (w, h) = (it.next()?.ok()?, it.next()?.ok()?);
+    (w >= MIN_W && h >= MIN_H).then_some((w, h))
+}
+
+/// ~/.brigd/float, if present and valid.
+pub(super) fn load_float_size() -> Option<(u16, u16)> {
+    parse_float_size(&fs::read_to_string(crate::store::root().join("float")).ok()?)
+}
+
+/// Alt-+ / Alt--: grow height to the screen edge, then width; shrink height to MIN_H, then width to MIN_W.
+pub(super) fn resize(cur: (u16, u16), area: (u16, u16), grow: bool) -> (u16, u16) {
+    let (mut w, mut h) = (cur.0.min(area.0), cur.1.min(area.1));
+    if grow {
+        if h < area.1 {
+            h = (h + ROW_STEP).min(area.1);
+        } else {
+            w = (w + COL_STEP).min(area.0);
+        }
+    } else if h > MIN_H {
+        h = h.saturating_sub(ROW_STEP).max(MIN_H);
+    } else if w > MIN_W {
+        w = w.saturating_sub(COL_STEP).max(MIN_W);
+    }
+    (w, h)
+}
+
 /// Agent rows/tabs are tinted by stage; avoids the status-glyph and selection colors.
 pub(super) fn stage_color(stage: Option<usize>) -> Color {
     let p = pal();
