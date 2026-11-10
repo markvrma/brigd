@@ -76,9 +76,10 @@ impl App {
         let Some(live) = self.float.clone().filter(|_| self.float_open) else {
             return;
         };
-        let r = f
-            .area()
-            .centered(Constraint::Percentage(80), Constraint::Percentage(70));
+        // Square on screen: a cell is ~twice as tall as wide, so width = 2 × height.
+        let a = f.area();
+        let h = (a.height * 7 / 10).min(a.width / 2).max(1);
+        let r = a.centered(Constraint::Length(h * 2), Constraint::Length(h));
         self.float_rect = r;
         let block = Block::bordered()
             .title(" shell · C-o f hide ")
