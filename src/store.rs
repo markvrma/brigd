@@ -26,6 +26,22 @@ pub(crate) struct Agent {
     pub(crate) files: Vec<String>,
     #[serde(default = "default_mode")]
     pub(crate) mode: String,
+    /// A reviewer's loop back to `to` (flow::validate: the stage before, same worktree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) r#loop: Option<Loop>,
+}
+
+/// After the reviewer's stage, up to `max` fix/re-review rounds between it and `to`
+/// (engine::run_loop), typed into both agents' sessions until its verdict is pass.
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct Loop {
+    pub(crate) to: String,
+    #[serde(default = "default_max")]
+    pub(crate) max: u32,
+}
+
+fn default_max() -> u32 {
+    3
 }
 
 fn default_mode() -> String {

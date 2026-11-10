@@ -135,18 +135,21 @@ fn transcript_files(home: &Path, cwd: &Path, dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// The paths under `## Files changed` (`- /abs/path` lines) in the agent's own output.md.
+/// The paths under every `## Files changed` (`- /abs/path` lines) in the agent's own output.md:
+/// a loop round appends a section of its own (engine::run_loop).
 fn reported_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(text) = fs::read_to_string(dir.join("output.md")) else {
         return vec![];
     };
-    let mut lines = text
-        .lines()
-        .skip_while(|l| l.trim() != "## Files changed")
-        .skip(1)
-        .take_while(|l| !l.starts_with('#'));
-    lines
-        .by_ref()
+    let mut on = false;
+    text.lines()
+        .filter(|l| {
+            if l.starts_with('#') {
+                on = l.trim() == "## Files changed";
+                return false;
+            }
+            on
+        })
         .filter_map(|l| l.trim().strip_prefix("- "))
         .map(|p| p.trim().trim_matches('`'))
         .filter(|p| p.starts_with('/'))
@@ -178,7 +181,7 @@ pub(crate) fn diff_paths(home: &Path, cwd: &Path, repo: &Path, dir: &Path) -> Ve
         refresh_listing(cwd, repo, dir, &sealed)
     };
     // Once the agent is done (output.md written) its diffs are saved and never recomputed.
-    let done = dir.join("output.md").exists();
+    let done = finished(dir);
     let mut views = VIEWS.lock().unwrap();
     files
         .into_iter()
@@ -239,15 +242,25 @@ fn refresh_listing(cwd: &Path, repo: &Path, dir: &Path, sealed: &Path) -> Listin
             b.zip(listed).map(|(b, l)| (b, numstat(&l, cwd))),
         );
         // done ≥10s ago (transcript settled) after a good git pass, or cwd gone: seal
-        let old = fs::metadata(dir.join("output.md"))
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= SEAL_AFTER));
+        let old = finished(dir)
+            && fs::metadata(dir.join("output.md"))
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= SEAL_AFTER));
         if (entry.1.is_some() && old) || !cwd.exists() {
             let _ = fs::create_dir_all(dir.join(".diff")).and_then(|_| fs::write(sealed, ""));
         }
     }
     // no base/listing (git failed): only the already frozen diffs can show
     entry.1.clone().unwrap_or_default()
+}
+
+/// <agent dir>/round: written while the agent works on a loop round (engine::rerun), whose
+/// output.md already exists from its first run.
+pub(crate) const ROUND: &str = "round";
+
+/// Done: output.md written and no loop round under way.
+fn finished(dir: &Path) -> bool {
+    dir.join("output.md").exists() && !dir.join(ROUND).exists()
 }
 
 /// `git diff --numstat -z --no-renames` → path → (added, removed).
@@ -421,6 +434,28 @@ mod tests {
             (2, before.clone(), Some(("2".into(), "0".into())))
         );
         assert!(!before.1.contains("LATER"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn loop_rounds_in_output() {
+        let d = tmp("rounds");
+        fs::write(
+            d.join("output.md"),
+            "r\n## Files changed\n- /a\n\n## Round 1\nfixed\n## Files changed\n- /b\n- /a\n## Other\n- /no\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reported_files(&d),
+            [
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/a")
+            ]
+        );
+        assert!(finished(&d));
+        fs::write(d.join(ROUND), "2").unwrap(); // a loop round under way: not done, nothing freezes
+        assert!(!finished(&d));
         let _ = fs::remove_dir_all(&d);
     }
 

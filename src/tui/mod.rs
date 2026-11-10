@@ -374,7 +374,9 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() / 80) as usize;
         let expanded = |a: &str| self.expanded.contains(&(path.to_path_buf(), a.to_string()));
-        let mut lines = plan_lines(flow, status, expanded, hits, frame, width);
+        // ponytail: reads loop agents' output.md every frame; fine for a few small files.
+        let rounds = |a: &str| crate::engine::rounds(&crate::store::output_path(&state.thread, a));
+        let mut lines = plan_lines(flow, status, rounds, expanded, hits, frame, width);
         // The log follows LOG_MARK; a FLOWPLAN from before the marker starts its log at the first "──" line.
         let all: Vec<&str> = text.lines().collect();
         let start = all
@@ -398,7 +400,7 @@ impl App {
     fn keep_master_alive(&self) {
         let m = crate::runner::MASTER;
         if self.master && !crate::runner::live(m, m).is_some_and(|a| a.alive()) {
-            let _ = crate::runner::resume_agent(m, m);
+            let _ = crate::runner::resume_agent(m, m, None);
         }
     }
 

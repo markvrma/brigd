@@ -165,7 +165,7 @@ impl App {
             return;
         }
         // Not live (brigd restarted, or it exited): reopen its session.
-        match runner::resume_agent(thread, agent) {
+        match runner::resume_agent(thread, agent, None) {
             Ok(live) => {
                 let b = self.pane_body(&key);
                 let _ = live.resize(b.height.max(1), b.width.max(1));

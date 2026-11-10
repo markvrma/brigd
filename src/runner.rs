@@ -380,8 +380,9 @@ pub fn master_args(dir: &Path) -> Res<Vec<String>> {
 /// Reopens an agent's saved session (`claude --resume <session>`) in its space,
 /// unless it is still live. Returns the live agent. A stray (`stray agents/<name>`,
 /// a claude typed in a brigd terminal) has no flow entry: it reopens in its saved cwd.
-/// MASTER/MASTER is the master session (master_args).
-pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
+/// MASTER/MASTER is the master session (master_args). `prompt`, if any, is typed as the
+/// resumed session's first message (a loop round, engine::rerun); the master ignores it.
+pub fn resume_agent(thread: &str, agent: &str, prompt: Option<&str>) -> Res<Arc<LiveAgent>> {
     if let Some(a) = live(thread, agent).filter(|a| a.alive()) {
         return Ok(a);
     }
@@ -427,6 +428,7 @@ pub fn resume_agent(thread: &str, agent: &str) -> Res<Arc<LiveAgent>> {
     reset_run_files(&dir);
     // ponytail: assumes --resume keeps the session id (subagent scan reads <session>/subagents); re-read it if not.
     cmd.args(["--resume", session.trim(), "--settings", &hooks_json(&dir)]);
+    cmd.args(prompt); // last, like start_agent's
     Ok(register(LiveAgent::spawn(cmd, thread, agent, &cwd, &dir)?))
 }
 
