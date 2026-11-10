@@ -13,6 +13,8 @@
 //! - Key precedence (`on_key`): new-thread window, run confirm, menu, delete confirm, quit
 //!   confirm, C-o prefix, C-t prefix, Alt-h/l/t, then the sidebar or the focused tab. Modal
 //!   state is `take()`n first and put back when the key is not for it.
+//! - The floating shell (`float`) sits above everything but the menu and modal: while open it takes
+//!   every key after the confirms and the C-o prefix, and is outside the registry.
 //! - Locks: `registry_snapshot()` copies the registry so its lock is never held across PTY
 //!   calls; a `live.parser` guard is never held across a call to another `App` method.
 //! - `refresh_with` order: terminals join the tree, then statuses, tabs, plans, `resize_all`,
@@ -146,6 +148,11 @@ struct App {
     task_btns: Vec<(Rect, (PathBuf, String))>,
     /// The master row was opened: its session is respawned whenever it exits.
     master: bool,
+    /// The floating shell (C-o f). Not in the registry: no sidebar row, pause, archive or quit prompt.
+    float: Option<Arc<crate::runner::LiveAgent>>,
+    float_open: bool,
+    /// The popup's rect from the last draw, for the click-outside hide.
+    float_rect: Rect,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until the user quits.
@@ -208,6 +215,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
             _ = fs::remove_file(crate::launch::tui_pid_path());
         }
         live_agents().iter().for_each(|a| a.kill());
+        app.float.iter().for_each(|l| l.kill());
         // A plan still running dies with brigd: free the names it reserved.
         app.planning
             .iter()
@@ -232,6 +240,10 @@ impl App {
     /// the tree before statuses are read, plans load before `resize_all`, and rows reflow last.
     fn refresh_with(&mut self, tree: Vec<Node>) {
         self.ticks += 1;
+        // `exit` typed in the float closes it.
+        if self.float_open && !self.float.as_ref().is_some_and(|l| l.alive()) {
+            self.float_open = false;
+        }
         self.tree = tree;
         let terms: Vec<_> = self
             .live_shells()

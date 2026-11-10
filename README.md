@@ -147,6 +147,7 @@ Anywhere: `Alt-h` / `Alt-l` previous/next tab, `Alt-t` new terminal tab.
 | `t` | new terminal tab |
 | `v` | split pane |
 | `o` | other pane |
+| `f` | floating shell: a popup in `$HOME` for quick cd-and-check work; press again (or click outside) to hide it, `exit` closes it |
 | `c` | cycle theme |
 | `q` | quit (asks to confirm if agents are running) |
 | `Ctrl-o` | send Ctrl-o to the focused agent |

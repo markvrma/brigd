@@ -1182,3 +1182,19 @@ fn auto_archive_keeps_threads_in_use() {
     assert!(crate::store::last_active(&root.join("threads/tabbed")) >= crate::store::now() - 5);
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn float_shell_toggles_and_survives_hide() {
+    let mut app = App::default();
+    let ctrl_o = key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    let f = key(KeyCode::Char('f'), KeyModifiers::NONE);
+    app.on_key(ctrl_o);
+    app.on_key(f);
+    assert!(app.float_open);
+    assert!(app.float.as_ref().unwrap().alive());
+    app.on_key(ctrl_o);
+    app.on_key(f);
+    assert!(!app.float_open);
+    assert!(app.float.as_ref().unwrap().alive());
+    app.float.as_ref().unwrap().kill();
+}

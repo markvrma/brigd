@@ -65,9 +65,28 @@ impl App {
             ),
             hint,
         );
+        self.draw_float(f);
         self.draw_menu(f);
         self.draw_modal(f);
         self.draw_selection(f);
+    }
+
+    /// The floating shell: a centered popup over everything drawn so far.
+    fn draw_float(&mut self, f: &mut Frame) {
+        let Some(live) = self.float.clone().filter(|_| self.float_open) else {
+            return;
+        };
+        let r = f
+            .area()
+            .centered(Constraint::Percentage(80), Constraint::Percentage(70));
+        self.float_rect = r;
+        let block = Block::bordered()
+            .title(" shell · C-o f hide ")
+            .border_style(Style::new().fg(pal().lavender));
+        let inner = block.inner(r);
+        f.render_widget(Clear, r);
+        f.render_widget(block, r);
+        render_term(f, &live, inner, true);
     }
 
     /// The "spaces" title, the divider and the tree rows; returns the shown rows as (line, row index).
@@ -194,7 +213,7 @@ impl App {
         let (spans, tab_spans) = tab_bar(tabs, focused, pill, bar);
         f.render_widget(Paragraph::new(Line::from(spans)), bar);
 
-        let cursor = self.focus_main && focused;
+        let cursor = self.focus_main && focused && !self.float_open;
         let pad = Rect::new(
             body.x + 2,
             body.y + 1,
@@ -263,7 +282,8 @@ impl App {
                 format!("{} agents running; quitting kills them. Quit? y/N", live_agents().len()),
                 Style::new().fg(pal().red).add_modifier(Modifier::BOLD),
             ),
-            _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · c theme · q quit · C-o send C-o"),
+            _ if self.prefix => Span::raw("C-o …  s sidebar · n/p next/prev tab · t terminal · w close tab · v split · o pane · f float shell · c theme · q quit · C-o send C-o"),
+            _ if self.float_open => Span::raw("keys go to the floating shell · C-o f / click outside hide (keeps running) · exit closes · C-o q quit"),
             _ if self.thread_prefix => Span::raw("C-t …  d delete · a archive · n new thread · m new thread anywhere · C-t send C-t"),
             _ if !self.focus_main => Span::raw("↑↓/jk move · Enter open/fold · ←→ fold · Tab back to tab · M-h/l tabs · M-t terminal · q quit · wheel scrolls"),
             _ if viewing => Span::raw("↑↓/jk PgUp/PgDn g/G scroll · Tab/Esc sidebar · M-h/l tabs · M-t terminal · C-o w close · C-o q quit"),

@@ -76,7 +76,8 @@ impl LiveAgent {
         drop(pair.slave); // so the reader sees EOF when the child exits
 
         // Other brigd processes read this to avoid a second claude on the same session.
-        if let Some(pid) = child.process_id() {
+        // Shell tabs and the float pass an empty dir: no pid file then.
+        if let Some(pid) = child.process_id().filter(|_| !dir.as_os_str().is_empty()) {
             let _ = fs::write(dir.join("pid"), pid.to_string());
         }
         let mut reader = pair.master.try_clone_reader()?;
