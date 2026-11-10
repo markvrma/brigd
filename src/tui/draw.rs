@@ -76,10 +76,9 @@ impl App {
         let Some(live) = self.float.clone().filter(|_| self.float_open) else {
             return;
         };
-        // Equal columns and rows (looks tall: a cell is ~twice as tall as wide).
-        let a = f.area();
-        let n = (a.height * 7 / 10).min(a.width).max(1);
-        let r = a.centered(Constraint::Length(n), Constraint::Length(n));
+        let r = f
+            .area()
+            .centered(Constraint::Percentage(80), Constraint::Percentage(70));
         self.float_rect = r;
         let block = Block::bordered()
             .title(" shell · C-o f hide ")
