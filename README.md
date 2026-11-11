@@ -97,8 +97,10 @@ cheap/mid/top tier; the planner picks the cheapest that fits each stage. Non-cla
 closest no-prompt mode (codex: workspace-write sandbox; pi and kimi have no sandbox).
 
 **Known gaps:** no resume or stray shim for non-claude agents; their diffs and reverts cover only the files
-listed in output.md's `## Files changed`; no exact blocked detection for them (a quiet agent is marked blocked
-after a nudge); non-claude flags come from docs and are unverified; kimi runs one-shot and cannot ask questions.
+listed in output.md's `## Files changed`; no blocked detection for them; non-claude flags come from docs and
+are unverified; kimi runs one-shot and cannot ask questions. An agent that ends its turn without output.md is left
+waiting (brigd moves on as soon as it writes output.md); to give up, `/exit` in its pane (the stage fails, work is kept)
+or terminate it (reverts its files). A restarted agent's old result is kept as `output_old<N>.md` and shown in the sidebar.
 
 ## Starting a thread
 

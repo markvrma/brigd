@@ -152,7 +152,7 @@ impl LiveAgent {
     }
 
     /// Idle / Working / Blocked, or Starting before the first hook fires. A non-claude agent
-    /// is only ever Working or Idle (engine::supervise marks it blocked in state.json).
+    /// is only ever Working or Idle (no blocked detection without hooks).
     pub fn status(&self) -> Status {
         if self.pty_status {
             return quiet_status(self.last_output.lock().unwrap().elapsed());

@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - New threads ask "Use plan-review-go? (y/N)" right after the task is entered (TUI window and terminal CLI); naming plan-review-go in the task skips the question.
 - An agent that cannot finish its task asks you a multiple-choice question (shown as blocked) instead of writing its result; a background check marks a "running" thread failed when no agent process is alive.
-- Multiple coding agents: claude, codex, pi and kimi. A first run writes `~/.brigd/config.json` (`agents` and the `base` agent that plans flows); each flow stage picks its `agent`, `model` and `effort`. Non-claude agents have no hooks: a quiet agent is nudged once, then shown as blocked.
+- Multiple coding agents: claude, codex, pi and kimi. A first run writes `~/.brigd/config.json` (`agents` and the `base` agent that plans flows); each flow stage picks its `agent`, `model` and `effort`. Non-claude agents have no hooks: a quiet agent shows as idle.
 - New thread in any directory: the header `＋` or `C-t m`; the new-thread dialog has an editable dir field.
 - Tabs have a `×` close button and a left-side fade.
 
@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An agent that ends its turn without output.md (e.g. while a background subagent runs) is no longer nudged and failed; brigd waits and moves on once output.md appears. A restarted agent's previous output.md is kept as output_old<N>.md.
 - `brigd install-skill` now also installs `brigd-resume` and `find-skills` (which `plan-review-go` relies on).
 - Agent diffs no longer count commits the agent pulled in (e.g. `git pull`) after it launched as its own changes.
 
