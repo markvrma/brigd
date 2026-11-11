@@ -194,6 +194,25 @@ fn dir_node(kind: Kind, label: &str, dir: &Path) -> Node {
             children.push(Node::new(Kind::Output, name, out));
         }
     }
+    // output_old<N>.md: results kept from earlier starts of this agent, in numeric N order.
+    let mut old: Vec<(u32, PathBuf)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            let k = n
+                .strip_prefix("output_old")?
+                .strip_suffix(".md")?
+                .parse()
+                .ok()?;
+            Some((k, e.path()))
+        })
+        .collect();
+    old.sort();
+    for (k, p) in old {
+        children.push(Node::new(Kind::Output, format!("output_old{k}.md"), p));
+    }
     // dot dirs (.diff, the frozen diffs) are brigd's own, not subagents
     let mut subs: Vec<PathBuf> = fs::read_dir(dir)
         .into_iter()
@@ -239,6 +258,9 @@ pub(crate) mod tests {
         fs::create_dir_all(t.join("a/sub-1234567/deep-7654321")).unwrap();
         fs::write(t.join("a/output.md"), "x").unwrap();
         fs::write(t.join("a/flow.md"), "f").unwrap();
+        for k in [10, 2, 1] {
+            fs::write(t.join(format!("a/output_old{k}.md")), "o").unwrap();
+        }
         fs::write(t.join("a/sub-1234567/output.md"), "y").unwrap();
         let flow = serde_json::json!({"goal":"g","stages":[[{"name":"a","worktree":null}],[{"name":"b","worktree":"fix"}]]});
         fs::write(t.join("flowmap.json"), flow.to_string()).unwrap();
@@ -281,15 +303,21 @@ pub(crate) mod tests {
             ),
             ("t1", 2, "a", Some(0), None)
         );
-        let outs: Vec<(Kind, &str)> = a.children[..2]
+        let outs: Vec<(Kind, &str)> = a.children[..5]
             .iter()
             .map(|c| (c.kind.clone(), c.label.as_str()))
             .collect();
         assert_eq!(
             outs,
-            [(Kind::Output, "output.md"), (Kind::Output, "flow.md")]
+            [
+                (Kind::Output, "output.md"),
+                (Kind::Output, "flow.md"),
+                (Kind::Output, "output_old1.md"),
+                (Kind::Output, "output_old2.md"),
+                (Kind::Output, "output_old10.md"),
+            ]
         );
-        let sub = &a.children[2];
+        let sub = &a.children[5];
         assert_eq!(
             (sub.kind.clone(), sub.label.as_str()),
             (Kind::Subagent, "sub-1234567")
