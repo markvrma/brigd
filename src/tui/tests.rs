@@ -10,7 +10,9 @@ use super::term::base64;
 use super::theme::{theme_index, THEMES};
 use super::threads::{fresh_name, Act};
 use super::*;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::style::Modifier;
 
 fn key(code: KeyCode, m: KeyModifiers) -> KeyEvent {
@@ -1225,4 +1227,150 @@ fn float_resize_steps_and_limits() {
     assert_eq!(parse_float_size("80"), None);
     assert_eq!(parse_float_size("19 24"), None);
     assert_eq!(parse_float_size("80 9"), None);
+}
+
+fn idle_app() -> App {
+    App {
+        idle_anim: idle::parse("fps=5 walk\nx"),
+        idle_after: Duration::ZERO, // idle as soon as there is a last_input
+        last_input: Some(Instant::now()),
+        ..App::default()
+    }
+}
+
+fn mouse(kind: MouseEventKind) -> Event {
+    Event::Mouse(MouseEvent {
+        kind,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn idle_needs_an_animation_and_a_last_input() {
+    assert!(!App::default().idle());
+    let mut app = idle_app();
+    assert!(app.idle());
+    app.idle_anim = None; // `off`
+    assert!(!app.idle());
+    let mut app = idle_app();
+    app.last_input = None;
+    assert!(!app.idle());
+    app.last_input = Some(Instant::now());
+    app.idle_after = Duration::from_secs(300);
+    assert!(!app.idle());
+}
+
+#[test]
+fn a_key_wakes_the_cover_and_is_swallowed() {
+    let view = || Tab::View {
+        path: PathBuf::new(),
+        title: String::new(),
+        text: String::new(),
+        scroll: 0,
+        rel: None,
+    };
+    let mut app = idle_app();
+    app.tabs
+        .insert(String::new(), one_pane(vec![view(), view()]));
+    (app.prefix, app.thread_prefix) = (true, true);
+    app.drag = Some((Rect::default(), Position::default(), None));
+    let alt_l = Event::Key(key(KeyCode::Char('l'), KeyModifiers::ALT));
+    app.on_event(alt_l.clone());
+    assert_eq!(
+        app.tabs[""].list[0].active, 0,
+        "the waking key must not act"
+    );
+    assert!(!(app.prefix || app.thread_prefix || app.drag.is_some()));
+    app.idle_after = Duration::from_secs(300); // awake now: the same key acts
+    app.on_event(alt_l);
+    assert_eq!(app.tabs[""].list[0].active, 1);
+}
+
+#[test]
+fn key_release_does_not_wake() {
+    let mut app = idle_app();
+    let mut k = key(KeyCode::Char('a'), KeyModifiers::NONE);
+    k.kind = KeyEventKind::Release;
+    app.on_event(Event::Key(k));
+    app.on_event(Event::Resize(80, 24));
+    assert!(app.idle());
+}
+
+#[test]
+fn clicks_and_scrolls_wake_but_motion_does_not() {
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::ScrollDown,
+    ] {
+        let mut app = idle_app();
+        app.idle_after = Duration::from_millis(50);
+        app.last_input = Instant::now().checked_sub(Duration::from_secs(1));
+        assert!(app.idle());
+        app.on_event(mouse(kind));
+        assert!(!app.idle(), "{kind:?}");
+    }
+    let mut app = idle_app();
+    let before = app.last_input;
+    app.on_event(mouse(MouseEventKind::Moved));
+    assert!(app.idle());
+    assert_eq!(app.last_input, before);
+    // Before the cover shows, motion keeps pushing it back.
+    app.idle_after = Duration::from_secs(60);
+    app.last_input = Instant::now().checked_sub(Duration::from_secs(30));
+    app.on_event(mouse(MouseEventKind::Moved));
+    assert!(app
+        .last_input
+        .is_some_and(|t| t.elapsed() < Duration::from_secs(5)));
+}
+
+#[test]
+fn a_paste_while_idle_is_dropped() {
+    let mut app = idle_app();
+    app.newt = Some(Newt {
+        focus: 1,
+        ..Default::default()
+    });
+    app.on_event(Event::Paste("lost".into()));
+    assert_eq!(app.newt.as_ref().unwrap().fields[1], "");
+    app.idle_after = Duration::from_secs(300);
+    app.on_event(Event::Paste("kept".into()));
+    assert_eq!(app.newt.as_ref().unwrap().fields[1], "kept");
+}
+
+#[test]
+fn a_new_prompt_wakes_the_cover_but_an_old_one_does_not() {
+    let mut app = idle_app();
+    app.last_input = Instant::now().checked_sub(Duration::from_secs(1));
+    app.idle_after = Duration::from_millis(50);
+    app.confirm_run = Some(("old".into(), "repo".into())); // already waiting: no wake
+    app.on_bg(Bg::Finished("x".into(), Ok(())));
+    assert!(app.idle());
+    app.confirm_run = None;
+    app.newt = Some(Newt {
+        fields: ["".into(), "t".into(), "".into()],
+        planning: true,
+        hidden: true,
+        ..Default::default()
+    });
+    app.on_bg(Bg::Failed("t".into(), "boom".into())); // the window reappears with its error
+    assert!(!app.idle());
+}
+
+#[test]
+fn draw_idle_paints_over_the_screen_and_counts_blocked_agents() {
+    let mut app = idle_app();
+    app.blocked.insert(("t".into(), "a".into()));
+    let mut term = Terminal::new(ratatui::backend::TestBackend::new(40, 6)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let rows: Vec<String> = (0..6)
+        .map(|y| {
+            (0..40)
+                .map(|x| term.backend().buffer()[(x, y)].symbol())
+                .collect()
+        })
+        .collect();
+    assert!(rows[5].contains("1 blocked · any key"), "{rows:?}");
+    assert!(rows[4].starts_with('x'), "{rows:?}"); // the sprite stands above the hint row
 }

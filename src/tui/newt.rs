@@ -4,6 +4,7 @@ use super::{App, Kind};
 use ratatui::text::Span;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::time::Instant;
 use std::{env, fs};
 
 /// Width of the new-thread window.
@@ -187,6 +188,20 @@ impl App {
     }
 
     pub(super) fn on_bg(&mut self, m: Bg) {
+        let asked = self.modal_open();
+        self.on_bg_msg(m);
+        // A prompt that just appeared wakes an idle cover (one left open before idling does not).
+        if !asked && self.modal_open() {
+            self.last_input = Some(Instant::now());
+        }
+    }
+
+    /// A window or run confirm that takes the next key.
+    fn modal_open(&self) -> bool {
+        self.newt.as_ref().is_some_and(|n| !n.hidden) || self.confirm_run.is_some()
+    }
+
+    fn on_bg_msg(&mut self, m: Bg) {
         match m {
             Bg::Failed(name, e) => {
                 self.planning.remove(&name);

@@ -69,6 +69,10 @@ impl App {
         self.draw_menu(f);
         self.draw_modal(f);
         self.draw_selection(f);
+        // The idle animation paints over the live screen, which keeps updating underneath.
+        if self.idle() {
+            self.draw_idle(f);
+        }
     }
 
     /// The floating shell: a centered popup over everything drawn so far.

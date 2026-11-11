@@ -140,6 +140,40 @@ Worktrees are left alone. To restore one:
 mv ~/.brigd/archive/threads/<t> ~/.brigd/threads/ && touch ~/.brigd/threads/<t>/seen
 ```
 
+## Idle animation
+
+After 5 minutes with no input the TUI gets an ASCII animation painted over the live screen (it keeps updating underneath): a walking monkey (the default) or
+`vines` that slowly grow until they cover the screen (`grow=300`: about 5 minutes), then keep swaying.
+The bottom row reads `N blocked · any key`. Any key, click or scroll wakes it, and the waking input is
+swallowed (it never reaches an agent). A paste while idle is dropped. Mouse motion does not wake it, but it
+does keep the cover from starting. It also wakes by itself when an agent starts needing input or a run
+prompt or new-thread window appears.
+
+**Pick one** (read once at startup): `$BRIGD_IDLE`, else the name in `~/.brigd/idle`, else `monkey`.
+A name is looked up as `~/.brigd/anims/<name>.txt`, then among the built-ins (`monkey`, `vines`, `glitch`); a name with a
+`/` is a file path. A name that matches nothing, e.g. `off`, turns the animation off. A file that exists but
+can't be read as an animation turns it off too, with `idle anim <name>: bad file` at startup.
+`$BRIGD_IDLE_AFTER=<seconds>` changes the 5 minutes, so `BRIGD_IDLE_AFTER=3 BRIGD_IDLE=vines brigd` is a quick preview.
+
+`glitch` is a damaged panel: a few muted, worn stripes, rare tears and faint cracks over the dimmed screen (subtle on purpose). It is drawn by code, so a file can say `fps=6 glitch` (add `dim`) with no frames.
+
+**File format.** Line 1 is the header: `fps=<n> walk` or `fps=<n> grow=<seconds to fill the screen>`
+(`fps` is held between 1 and 25). Add `dim` after it (`fps=5 grow=300 dim`) to dim the screen under the animation; `vines` does, `monkey` doesn't. Then optional `#` comment lines (they sit right after the header, so frame 1 can't start with `#`), then frames separated by a line that is exactly
+`---`. Tabs count as 4 spaces and trailing spaces are ignored; frames are padded to the widest and tallest, so
+draw them from the top left. `walk` moves the sprite along the bottom, one column per frame, and starts over at
+the left edge. `grow` tiles the frame over the whole screen (neighbouring tiles are out of step) and reveals it
+from the bottom up, so it has to tile seamlessly and use single-width characters.
+
+```
+fps=4 walk
+# a two-frame blob
+ o
+/|\
+---
+ o
+ |\
+```
+
 ## TUI keys
 
 Sidebar focused: `j`/`k` or arrows move, `PgUp`/`PgDn` jump, `Enter` open/fold (the master row: start it), `h`/`l` or arrows fold,

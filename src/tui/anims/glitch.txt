@@ -1,0 +1,2 @@
+fps=6 glitch dim
+# A damaged panel: a few muted worn stripes, rare tears and faint cracks over the dimmed screen. Drawn by code, so no frames.

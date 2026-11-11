@@ -23,7 +23,7 @@
 use crate::store::Status;
 use crate::tree::{self, Kind, Node};
 use crate::Res;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -40,6 +40,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod draw;
 mod flowplan;
+mod glitch;
+mod idle;
 mod input;
 mod markdown;
 mod newt;
@@ -50,6 +52,7 @@ mod theme;
 mod threads;
 pub(crate) use flowplan::flow_text;
 use flowplan::plan_lines;
+use idle::{idle_after, load_anim, Anim};
 use newt::{Bg, Newt};
 use sidebar::{NodeKey, Row};
 use tabs::{Tab, ThreadPanes};
@@ -155,6 +158,12 @@ struct App {
     float_rect: Rect,
     /// The popup's (cols, rows) incl. border, set by Alt-+/- and kept in ~/.brigd/float; None = 80% x 70%.
     float_size: Option<(u16, u16)>,
+    /// The last key, click, scroll, paste or auto-wake, set in `run`. None = never idle.
+    last_input: Option<Instant>,
+    /// How long without input before the idle animation covers the screen.
+    idle_after: Duration,
+    /// The idle animation; None = disabled.
+    idle_anim: Option<Anim>,
 }
 
 /// Opens the TUI over every thread in ~/.brigd/threads until the user quits.
@@ -165,10 +174,17 @@ pub fn run(open: Option<&str>) -> Res<()> {
     let res = (|| -> Res<()> {
         let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         term.clear()?;
+        let (idle_anim, bad) = load_anim();
         let mut app = App {
             float_size: load_float_size(),
+            idle_anim,
+            idle_after: idle_after(),
+            last_input: Some(Instant::now()),
             ..App::default()
         };
+        if let Some(m) = bad {
+            app.flash(m);
+        }
         // `brigd resume --bg` hands threads to the TUI whose pid is here.
         _ = fs::write(
             crate::launch::tui_pid_path(),
@@ -190,12 +206,7 @@ pub fn run(open: Option<&str>) -> Res<()> {
         while !app.quit {
             term.draw(|f| app.draw(f))?;
             if event::poll(POLL)? {
-                match event::read()? {
-                    Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
-                    Event::Mouse(m) => app.on_mouse(m),
-                    Event::Paste(s) => app.on_paste(&s),
-                    _ => {} // Resize: the next draw sees the new body size and resizes every PTY
-                }
+                app.on_event(event::read()?);
                 if let Some(s) = app.clip.take() {
                     copy_to_clipboard(&s);
                 }
@@ -270,13 +281,15 @@ impl App {
     }
 
     /// The agents now blocked; rings the bell when one of them wasn't before.
-    fn bell_on_new_blocked(&self, agents: &AgentStatuses) -> HashSet<(String, String)> {
+    /// An idle cover wakes too, so a prompt never sits hidden.
+    fn bell_on_new_blocked(&mut self, agents: &AgentStatuses) -> HashSet<(String, String)> {
         let blocked: HashSet<_> = agents
             .iter()
             .filter(|(_, s)| **s == Status::Blocked)
             .map(|(k, _)| k.clone())
             .collect();
         if blocked.difference(&self.blocked).next().is_some() {
+            self.last_input = Some(Instant::now());
             let _ = io::stdout()
                 .write_all(b"\x07")
                 .and_then(|_| io::stdout().flush());

@@ -7,8 +7,11 @@ use super::theme::{next_theme, resize};
 use super::threads::{Act, Menu};
 use super::{App, MIN_SIDE_W, SIDE_W};
 use crate::tree::{self, Kind};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
+use std::time::Instant;
 
 /// Ctrl-o / Ctrl-t as bytes: pressed twice, the prefix key goes through to the tab.
 const CTRL_O: u8 = 0x0f;
@@ -70,6 +73,35 @@ pub(super) fn key_bytes(k: KeyEvent, app_cursor: bool) -> Vec<u8> {
 }
 
 impl App {
+    /// Routes one terminal event. While the idle cover shows, a key, click, scroll or paste only
+    /// wakes it and is swallowed (a paste is dropped); mouse motion neither wakes nor reaches anything.
+    /// Idle is read before `last_input` is updated, or the waking key would pass through.
+    pub(super) fn on_event(&mut self, e: Event) {
+        let moved = matches!(&e, Event::Mouse(m) if m.kind == MouseEventKind::Moved);
+        let input = match &e {
+            Event::Key(k) => k.kind != KeyEventKind::Release,
+            Event::Mouse(_) | Event::Paste(_) => true,
+            _ => false, // Resize: the next draw sees the new body size and resizes every PTY
+        };
+        if self.idle() {
+            if input && !moved {
+                self.last_input = Some(Instant::now());
+                self.disarm_prefixes();
+                self.drag = None;
+            }
+            return;
+        }
+        if input {
+            self.last_input = Some(Instant::now()); // motion counts, so the cover never starts mid-use
+        }
+        match e {
+            Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+            Event::Mouse(m) => self.on_mouse(m),
+            Event::Paste(s) => self.on_paste(&s),
+            _ => {}
+        }
+    }
+
     /// Routes a key by modal precedence: the new-thread window, the run confirm, the menu, the
     /// delete and quit confirms, the C-o then C-t prefix, Alt-h/l/t, then the sidebar or the
     /// focused tab. A handler that takes the key returns true; nothing behind it sees the key.
