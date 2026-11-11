@@ -48,34 +48,20 @@ pub(super) fn paint(buf: &mut Buffer, area: Rect, tick: usize) {
     let tick = tick as u32;
     let (w, h) = (area.width as i32, area.height as i32);
     for y in 0..h {
-        // A glitch line: now and then a row (two tall) goes bright across the whole width, either
-        // shifted stripes (a tear) or random colours (noise). Everything else stays muted.
+        // A tear shifts a few rows sideways; now and then a row is pure noise.
         let tr = hash(y as u32 / 2, tick / 3);
-        let shift = (tr >> 8) as i32 % 9 - 4;
-        let (tear, noise) = (tr.is_multiple_of(20), tr % 90 == 1);
+        let shift = if tr.is_multiple_of(25) {
+            (tr >> 8) as i32 % 5 - 2
+        } else {
+            0
+        };
+        let noise = tr % 211 == 1;
         for x in 0..w {
             let n = hash(x as u32 * 977 + y as u32, tick / 2);
-            if tear || noise {
-                let band = if noise {
-                    n
-                } else {
-                    hash((x + shift).max(0) as u32 / 2, 5)
-                };
-                let (r, g, b) = PALETTE[(band % 6) as usize];
-                let c = Color::Rgb(
-                    r.saturating_mul(2),
-                    g.saturating_mul(2),
-                    b.saturating_mul(2),
-                );
-                put(
-                    buf,
-                    area,
-                    x,
-                    y,
-                    if n.is_multiple_of(7) { '▓' } else { '█' },
-                    c,
-                );
-            } else if let Some(c) = stripe(x, tick) {
+            if noise {
+                let (r, g, b) = PALETTE[(n % 6) as usize];
+                put(buf, area, x, y, '░', Color::Rgb(r, g, b));
+            } else if let Some(c) = stripe(x + shift, tick) {
                 let ch = match n % 10 {
                     0 | 1 => continue, // gaps, so the stripes look worn, not solid
                     2 => '▒',
