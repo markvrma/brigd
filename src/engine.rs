@@ -126,6 +126,7 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
             "Read {} and do the task in it.",
             adir.join("prompt.md").display()
         );
+        keep_old_output(thread, &adir);
         log(thread, &format!("start {} in {}", a.name, cwd.display()));
         record_base(&cwd, &adir);
         // A trust dialog for a new worktree shows in the agent's own terminal; the user answers it there.
@@ -320,7 +321,7 @@ fn rerun(
         if terminated() {
             return Err(format!("{} terminated", a.name).into());
         }
-        // "working" before the message: a stale idle must not count as done or nudge, and the
+        // "working" before the message: a stale idle must not count as done, and the
         // hooks' own working/idle can only come after it.
         let working = || fs::write(dir.join("status"), "working");
         Ok(match alive() {
@@ -355,6 +356,25 @@ fn rerun(
     let ok = supervise(thread, a, live, state, mark);
     let _ = fs::remove_file(dir.join(ROUND));
     Ok(ok)
+}
+
+/// A restarted agent must not finish on its previous run's result: moves `adir/output.md` to
+/// the first free `output_old<N>.md` (N >= 1). Not for rerun, whose rounds append to output.md.
+fn keep_old_output(thread: &str, adir: &Path) {
+    let out = adir.join("output.md");
+    if !out.exists() {
+        return;
+    }
+    let old = (1..)
+        .map(|n| adir.join(format!("output_old{n}.md")))
+        .find(|p| !p.exists())
+        .unwrap_or_default();
+    if fs::rename(&out, &old).is_ok() {
+        log(
+            thread,
+            &format!("kept old {} as {}", out.display(), old.display()),
+        );
+    }
 }
 
 /// Types `msg` into an agent's prompt: Ctrl-U first clears anything typed there, the Enter
@@ -397,16 +417,12 @@ fn ensure_worktree(repo: &Path, thread: &str, key: &str) -> Res<PathBuf> {
 const TICK: Duration = Duration::from_secs(1);
 /// Ticks between subagent syncs.
 const SYNC_EVERY: u32 = 5;
-/// Ticks after a nudge before idle counts again (a nudge needs a moment to show as working).
-const NUDGE_COOLDOWN: u32 = 30;
-/// Idle ticks in a row before an agent counts as stopped.
-const IDLE_DEBOUNCE: u32 = 3;
-/// Between typing the nudge and its Enter, so the Enter is not read as part of a paste.
+/// Between typing a message and its Enter, so the Enter is not read as part of a paste.
 const PASTE_GAP: Duration = Duration::from_millis(300);
 
 /// Drives one agent to completion: done = output.md exists (with `mark`) once it is idle (or
-/// exited). One nudge when it goes idle without output. Blocked prompts are left for the user. A
-/// non-claude agent (no hooks) that goes quiet again after the nudge counts as blocked.
+/// exited). An agent that goes idle without output is left waiting (it may be waiting on a
+/// background subagent); the 1s tick is the output.md poll. Blocked prompts are left for the user.
 fn supervise(
     thread: &str,
     a: &Agent,
@@ -415,26 +431,9 @@ fn supervise(
     mark: Mark,
 ) -> bool {
     let out = live.dir.join("output.md");
-    let how = if live.pty_status {
-        ""
-    } else {
-        " with AskUserQuestion"
-    };
-    let o = out.display();
-    let want = match mark {
-        None => format!("writing your result file. If the task is fully done, write your final result to {o}."),
-        Some((0, m)) => format!("a `{m}` line in your result file {o}. If the task is fully done, write it there with that line."),
-        Some((k, m)) => format!("finishing round {k}. If it is done, APPEND to {o} a `## Round {k}` section ending with a `{m}` line."),
-    };
-    let nudge = format!(
-        "You stopped without {want} \
-         If it is not done and you cannot finish it, do not write it: ask the user{how} \
-         (a few options plus free text), unless the user already told you to stop. Task: {}",
-        live.dir.join("prompt.md").display()
-    );
     let home = home();
     let sync = || transcript::sync_agent(&home, &live.cwd, &live.dir);
-    let (mut tick, mut idle_for, mut nudged_at, mut blocked) = (0u32, 0, None::<u32>, false);
+    let (mut tick, mut blocked, mut waiting) = (0u32, false, false);
     let ok = loop {
         thread::sleep(TICK);
         tick += 1;
@@ -457,11 +456,7 @@ fn supervise(
             );
             break false;
         }
-        // A quiet non-claude agent after its nudge: blocked until it prints again.
-        let quiet_after_nudge = live.pty_status
-            && status == Status::Idle
-            && nudged_at.is_some_and(|t| tick - t >= NUDGE_COOLDOWN);
-        if status == Status::Blocked || quiet_after_nudge {
+        if status == Status::Blocked {
             if !blocked {
                 blocked = true;
                 let _ = set_agent(state, &a.name, Status::Blocked);
@@ -473,29 +468,12 @@ fn supervise(
             blocked = false;
             let _ = set_agent(state, &a.name, Status::Running);
         }
-        // "starting" (e.g. a trust dialog) and "working" just wait. A nudge needs a moment to show as working.
-        if status != Status::Idle || nudged_at.is_some_and(|t| tick - t < NUDGE_COOLDOWN) {
-            idle_for = 0;
-            continue;
-        }
-        idle_for += 1;
-        // ponytail: fixed 3s debounce on idle; Stop hooks are exact, the transcript fallback is not.
-        if idle_for < IDLE_DEBOUNCE {
-            continue;
-        }
-        if nudged_at.is_some() {
-            log(
-                thread,
-                &format!("{} stopped without {}", a.name, out.display()),
-            );
-            break false;
-        }
-        nudged_at = Some(tick);
-        idle_for = 0;
-        log(thread, &format!("{} idle without output, nudging", a.name));
-        if let Err(e) = type_msg(&live, &nudge) {
-            log(thread, &format!("{}: nudge failed: {e}", a.name));
-            break false;
+        // Log once per idle spell; the agent stays Running.
+        if status == Status::Idle && !waiting {
+            waiting = true;
+            log(thread, &format!("{} idle without output, waiting", a.name));
+        } else if status != Status::Idle {
+            waiting = false;
         }
     };
     sync();
@@ -683,8 +661,25 @@ mod tests {
         assert!(!claimable(&Status::Stopped, true, false));
     }
 
+    #[test]
+    fn keeps_old_output() {
+        let d = env::temp_dir().join(format!("brigd-oldout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        keep_old_output("t", &d); // no output.md: no-op
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
+        for c in ["one", "two"] {
+            fs::write(d.join("output.md"), c).unwrap();
+            keep_old_output("t", &d);
+        }
+        assert!(!d.join("output.md").exists());
+        assert_eq!(fs::read_to_string(d.join("output_old1.md")).unwrap(), "one");
+        assert_eq!(fs::read_to_string(d.join("output_old2.md")).unwrap(), "two");
+        let _ = fs::remove_dir_all(&d);
+    }
+
     /// Runs a two-stage flow against a fake `claude` on PATH: the second agent works in a
-    /// fresh worktree and goes idle once without output, so it needs the nudge typed into its PTY.
+    /// fresh worktree and goes idle once without output; nothing is typed into its PTY, brigd waits.
     #[test]
     fn execute_with_fake_claude() {
         let t = env::temp_dir().join(format!("brigd-exec-{}", std::process::id()));
@@ -705,7 +700,7 @@ case "$d" in
   while read line; do k=$((k+1)); echo "$line" >> "$d/typed"
     printf '## Round %s\n- **VERDICT: %s**\n' $k $v >> "$d/output.md"; printf idle > "$d/status"; done; exit;;
 esac
-case "$d" in *nudge) printf idle > "$d/status"; read line; echo "$line" > "$d/nudged";; esac
+case "$d" in *waits) printf idle > "$d/status"; exec 3<&0; cat <&3 >> "$d/typed" & c=$!; sleep 2; kill $c;; esac
 echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
 "#;
         fs::write(bin.join("claude"), fake).unwrap();
@@ -737,7 +732,7 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
             goal: "g".into(),
             stages: vec![
                 vec![agent("first", None, "default")],
-                vec![agent("nudge", Some("wt"), "acceptEdits")],
+                vec![agent("waits", Some("wt"), "acceptEdits")],
             ],
         };
         let repo_s = repo.canonicalize().unwrap().to_string_lossy().into_owned();
@@ -761,13 +756,13 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
         );
         let wt = t.join(".brigd/worktrees/th/wt");
         assert_eq!(
-            fs::read_to_string(d.join("nudge/cwd")).unwrap().trim(),
+            fs::read_to_string(d.join("waits/cwd")).unwrap().trim(),
             wt.canonicalize().unwrap().to_string_lossy()
         );
-        assert!(fs::read_to_string(d.join("nudge/nudged"))
-            .unwrap()
-            .starts_with("You stopped without writing"));
-        assert!(fs::read_to_string(d.join("nudge/prompt.md"))
+        assert!(fs::read_to_string(d.join("waits/typed"))
+            .unwrap_or_default()
+            .is_empty());
+        assert!(fs::read_to_string(d.join("waits/prompt.md"))
             .unwrap()
             .contains(&d.join("first/output.md").display().to_string()));
         assert!(fs::read_to_string(d.join("first/prompt.md"))
@@ -783,28 +778,27 @@ echo result > "$d/output.md"; printf idle > "$d/status"; sleep 1
             fs::read_to_string(d.join("first/session")).unwrap().len(),
             36
         );
-        assert!(fs::read_to_string(d.join("FLOWPLAN"))
-            .unwrap()
-            .contains("nudging"));
+        let plan = fs::read_to_string(d.join("FLOWPLAN")).unwrap();
+        assert!(plan.contains("idle without output, waiting") && !plan.contains("nudg"));
 
         // reconcile: a fresh `updated` is left alone; a stale one with dead pids fails the thread.
         let (_, mut st) = load("th").unwrap();
         st.status = Status::Running;
-        st.agents.get_mut("nudge").unwrap().status = Status::Running;
+        st.agents.get_mut("waits").unwrap().status = Status::Running;
         st.updated = now();
         let fresh = serde_json::to_string(&st).unwrap();
         assert!(!reconcile("th", &mut st).unwrap());
         assert_eq!(serde_json::to_string(&st).unwrap(), fresh);
         let mut dead = Command::new("true").spawn().unwrap();
         dead.wait().unwrap();
-        for a in ["first", "nudge"] {
+        for a in ["first", "waits"] {
             fs::write(d.join(a).join("pid"), dead.id().to_string()).unwrap();
         }
         st.updated = 0;
         assert!(reconcile("th", &mut st).unwrap());
         let (_, st) = load("th").unwrap();
         assert_eq!((st.status, st.updated), (Status::Failed, 0));
-        assert_eq!(st.agents["nudge"].status, Status::Failed);
+        assert_eq!(st.agents["waits"].status, Status::Failed);
         assert_eq!(st.agents["first"].status, Status::Done);
 
         // Loops: impl and its reviewer stay alive in their PTYs; each round is typed into them.
