@@ -1,5 +1,5 @@
 //! The `glitch` idle animation: a damaged panel. Coloured vertical stripes (some bands dead and
-//! see-through), horizontal tears, flicker, and cracks radiating from an impact point. All of it
+//! see-through), horizontal tears and flicker. All of it
 //! is a pure function of (column, row, tick), so there is no state to keep.
 
 use ratatui::buffer::Buffer;
@@ -16,7 +16,6 @@ const PALETTE: [(u8, u8, u8); 6] = [
     (120, 20, 20),
     (120, 105, 0),
 ];
-const CRACK: Color = Color::Rgb(100, 105, 125);
 
 fn hash(a: u32, b: u32) -> u32 {
     let mut h = a.wrapping_mul(0x9E37_79B1) ^ b.wrapping_mul(0x85EB_CA6B).rotate_left(13);
@@ -71,36 +70,4 @@ pub(super) fn paint(buf: &mut Buffer, area: Rect, tick: usize) {
             }
         }
     }
-    cracks(buf, area, tick);
-}
-
-/// Rays out of an impact point low and left of centre; a ray blinks out now and then.
-fn cracks(buf: &mut Buffer, area: Rect, tick: u32) {
-    let (w, h) = (area.width as i32, area.height as i32);
-    let (cx, cy) = (w * 46 / 100, h * 68 / 100);
-    for k in 0..10u32 {
-        if hash(k, tick / 2).is_multiple_of(4) {
-            continue;
-        }
-        let a = k as f32 * 0.628 + (hash(k, 3) % 100) as f32 / 400.0;
-        let (dx, dy) = (a.cos(), a.sin() * 0.5); // cells are about twice as tall as wide
-        let len = 4 + (hash(k, 9) % (w.max(h) as u32 + 1)) as i32 / 2;
-        let ch = match (
-            dx.abs() * 2.0 > dy.abs() * 6.0,
-            dy.abs() * 2.0 > dx.abs() * 6.0,
-        ) {
-            (true, _) => '─',
-            (_, true) => '│',
-            _ if dx * dy > 0.0 => '\\',
-            _ => '/',
-        };
-        for i in 1..len {
-            let (x, y) = (
-                cx + (dx * i as f32).round() as i32,
-                cy + (dy * i as f32).round() as i32,
-            );
-            put(buf, area, x, y, ch, CRACK);
-        }
-    }
-    put(buf, area, cx, cy, '✶', CRACK);
 }

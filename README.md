@@ -155,7 +155,7 @@ A name is looked up as `~/.brigd/anims/<name>.txt`, then among the built-ins (`m
 can't be read as an animation turns it off too, with `idle anim <name>: bad file` at startup.
 `$BRIGD_IDLE_AFTER=<seconds>` changes the 5 minutes, so `BRIGD_IDLE_AFTER=3 BRIGD_IDLE=vines brigd` is a quick preview.
 
-`glitch` is a damaged panel: a few muted, worn stripes, rare tears and faint cracks over the dimmed screen (subtle on purpose). It is drawn by code, so a file can say `fps=6 glitch` (add `dim`) with no frames.
+`glitch` is a damaged panel: a few muted, worn stripes, rare tears over the dimmed screen (subtle on purpose). It is drawn by code, so a file can say `fps=6 glitch` (add `dim`) with no frames.
 
 **File format.** Line 1 is the header: `fps=<n> walk` or `fps=<n> grow=<seconds to fill the screen>`
 (`fps` is held between 1 and 25). Add `dim` after it (`fps=5 grow=300 dim`) to dim the screen under the animation; `vines` does, `monkey` doesn't. Then optional `#` comment lines (they sit right after the header, so frame 1 can't start with `#`), then frames separated by a line that is exactly
