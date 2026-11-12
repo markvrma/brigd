@@ -145,7 +145,7 @@ mv ~/.brigd/archive/threads/<t> ~/.brigd/threads/ && touch ~/.brigd/threads/<t>/
 ## Idle animation
 
 After 5 minutes with no input the TUI gets an ASCII animation painted over the live screen (it keeps updating underneath): a walking monkey (the default) or
-`vines` that slowly grow until they cover the screen (`grow=300`: about 5 minutes), then keep swaying.
+braille `vines` that sprout along the bottom of the screen, climb, fork and curl into tendrils until they have spread over it (`vines=300`: about 5 minutes), then keep swaying.
 The bottom row reads `N blocked · any key`. Any key, click or scroll wakes it, and the waking input is
 swallowed (it never reaches an agent). A paste while idle is dropped. Mouse motion does not wake it, but it
 does keep the cover from starting. It also wakes by itself when an agent starts needing input or a run
@@ -157,6 +157,7 @@ A name is looked up as `~/.brigd/anims/<name>.txt`, then among the built-ins (`m
 can't be read as an animation turns it off too, with `idle anim <name>: bad file` at startup.
 `$BRIGD_IDLE_AFTER=<seconds>` changes the 5 minutes, so `BRIGD_IDLE_AFTER=3 BRIGD_IDLE=vines brigd` is a quick preview.
 
+`vines` is drawn by code, like the braille field on the author's site, so a file can say `fps=15 vines=<seconds to fully grown> dim` with no frames (the `fps` is unused).
 `glitch` is a damaged panel: a few muted, worn stripes, rare tears over the dimmed screen (subtle on purpose). It is drawn by code, so a file can say `fps=6 glitch` (add `dim`) with no frames.
 
 **File format.** Line 1 is the header: `fps=<n> walk` or `fps=<n> grow=<seconds to fill the screen>`

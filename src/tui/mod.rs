@@ -50,6 +50,7 @@ mod tabs;
 mod term;
 mod theme;
 mod threads;
+mod vines;
 pub(crate) use flowplan::flow_text;
 use flowplan::plan_lines;
 use idle::{idle_after, load_anim, Anim};

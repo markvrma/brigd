@@ -6,9 +6,11 @@
 //! comment lines; then frames separated by a line that is exactly `---`. Tabs become 4 spaces,
 //! trailing spaces are ignored, and every frame is padded to the widest and tallest frame so
 //! nothing jitters. `walk` slides the sprite along the bottom; `grow` tiles the frame over the
-//! screen (so it must tile seamlessly) and reveals it from the bottom up in `secs`.
+//! screen (so it must tile seamlessly) and reveals it from the bottom up in `secs`. `fps=<n>
+//! vines=<secs>` has no frames: the braille vines (`vines.rs`) are drawn by code.
 
 use super::theme::pal;
+use super::vines;
 use super::App;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -30,6 +32,8 @@ pub(super) enum Mode {
     Walk,
     /// Seconds until the tiled frame covers the whole screen.
     Grow(u64),
+    /// Braille vines drawn by code (`vines.rs`), no frames: seconds until fully grown.
+    Vines(u64),
     /// A damaged panel, drawn by `glitch.rs`; the file needs no frames.
     Glitch,
 }
@@ -51,11 +55,21 @@ pub(super) fn parse(src: &str) -> Option<Anim> {
     let src = src.replace('\t', "    ");
     let mut lines = src.lines(); // also strips the \r of CRLF
     let mut head = lines.next()?.split_whitespace();
-    let fps = head.next()?.strip_prefix("fps=")?.parse::<u32>().ok()?;
-    let mode = match head.next()? {
+    let fps = head
+        .next()?
+        .strip_prefix("fps=")?
+        .parse::<u32>()
+        .ok()?
+        .clamp(1, MAX_FPS) as u16;
+    let m = head.next()?;
+    let secs = |key: &str| m.strip_prefix(key)?.parse::<u64>().ok().map(|n| n.max(1));
+    let mode = match m {
         "walk" => Mode::Walk,
         "glitch" => Mode::Glitch,
-        g => Mode::Grow(g.strip_prefix("grow=")?.parse::<u64>().ok()?.max(1)),
+        _ => match secs("vines=") {
+            Some(n) => Mode::Vines(n),
+            None => Mode::Grow(secs("grow=")?),
+        },
     };
     let dim = match head.next() {
         None => false,
@@ -65,9 +79,10 @@ pub(super) fn parse(src: &str) -> Option<Anim> {
     if head.next().is_some() {
         return None;
     }
-    if mode == Mode::Glitch {
+    if matches!(mode, Mode::Glitch | Mode::Vines(_)) {
+        // Drawn by code: nothing to read, but `frames` is never empty.
         return Some(Anim {
-            fps: fps.clamp(1, MAX_FPS) as u16,
+            fps,
             mode,
             dim,
             w: 1,
@@ -102,7 +117,7 @@ pub(super) fn parse(src: &str) -> Option<Anim> {
             .join("\n")
     };
     Some(Anim {
-        fps: fps.clamp(1, MAX_FPS) as u16,
+        fps,
         mode,
         dim,
         w: u16::try_from(w).ok()?,
@@ -138,6 +153,7 @@ impl Anim {
         let n = self.frame_at(t);
         match self.mode {
             Mode::Glitch => super::glitch::paint(buf, area, self.tick(t)),
+            Mode::Vines(secs) => vines::paint(buf, area, t, secs, style),
             Mode::Walk => {
                 let x = area.x + self.walk_x(area.width, t);
                 // Stands on the row above the bottom one (the hint line).
@@ -246,7 +262,7 @@ impl App {
         }
         let fg = match a.mode {
             Mode::Walk | Mode::Glitch => pal().peach,
-            Mode::Grow(_) => pal().green,
+            Mode::Grow(_) | Mode::Vines(_) => pal().green,
         };
         let t = last.elapsed().saturating_sub(self.idle_after);
         if a.dim {
@@ -283,6 +299,8 @@ mod tests {
         let a = anim("fps=8 walk\n# a comment\n# another\nab\n---\ncd\n---\nef\n");
         assert_eq!((a.fps, a.mode, a.frames.len()), (8, Mode::Walk, 3));
         assert_eq!(a.frames[0], "ab");
+        let v = anim("fps=3 vines=90"); // no frames needed
+        assert_eq!((v.fps, v.mode), (3, Mode::Vines(90)));
         let g = anim("fps=3 grow=60\n#x\nab\n");
         assert_eq!((g.fps, g.mode), (3, Mode::Grow(60)));
     }
@@ -296,6 +314,7 @@ mod tests {
             "fps=5\nab",
             "fps=5 fly\nab",
             "fps=5 grow=x\nab",
+            "fps=5 vines=x",
             "fps=5 walk extra\nab",
             "fps=5 walk dim extra\nab",
             "fps=5 walk\n",
@@ -403,8 +422,7 @@ mod tests {
         assert!((6..=8).contains(&m.frames.len()), "{}", m.frames.len());
         assert!((10..=16).contains(&m.h), "{}", m.h);
         let v = anim(builtin("vines").unwrap());
-        assert_eq!(v.mode, Mode::Grow(300));
-        assert!(v.frames.len() >= 4);
+        assert_eq!(v.mode, Mode::Vines(300));
         assert_eq!(anim(builtin("glitch").unwrap()).mode, Mode::Glitch);
         assert!(builtin("off").is_none());
     }
