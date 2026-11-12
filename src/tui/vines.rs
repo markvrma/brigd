@@ -77,8 +77,8 @@ impl Plant {
         let curl = (len * 0.45).clamp(14.0, 40.0).min(len);
         let side = if rnd(seed, 1) < 0.5 { -1.0 } else { 1.0 };
         let (amp, freq, phase) = (
-            0.25 + 0.3 * rnd(seed, 2),
-            0.03 + 0.03 * rnd(seed, 3),
+            0.35 + 0.45 * rnd(seed, 2),
+            0.04 + 0.04 * rnd(seed, 3),
             rnd(seed, 4) * TAU,
         );
         let gap = 16.0 + 10.0 * rnd(seed, 5);
