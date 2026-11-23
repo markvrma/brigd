@@ -274,6 +274,58 @@ pub fn session_args(dir: &Path) -> Res<[String; 4]> {
     ])
 }
 
+/// Mark `cwd` trusted in Claude's config so its folder-trust dialog does not show.
+/// Best effort: Err means the dialog shows as before.
+pub(crate) fn trust_dir(cfg: &Path, cwd: &Path) -> Res<()> {
+    // One writer per process: threads share the temp name and would lose each other's update.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let key = cwd.to_string_lossy().into_owned();
+    for _ in 0..5 {
+        let mtime = fs::metadata(cfg)?.modified()?;
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(cfg)?)?;
+        if v["projects"][&key]["hasTrustDialogAccepted"] == true {
+            return Ok(());
+        }
+        let root = v.as_object_mut().ok_or("config is not an object")?;
+        let projects = root.entry("projects").or_insert_with(|| serde_json::json!({}));
+        let entry = projects
+            .as_object_mut()
+            .ok_or("projects is not an object")?
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::json!({}));
+        entry
+            .as_object_mut()
+            .ok_or("project entry is not an object")?
+            .insert("hasTrustDialogAccepted".into(), true.into());
+        let tmp = cfg.with_extension(format!("brigd-{}", std::process::id()));
+        fs::write(&tmp, serde_json::to_vec_pretty(&v)?)?;
+        fs::set_permissions(&tmp, fs::metadata(cfg)?.permissions())?;
+        if fs::metadata(cfg)?.modified()? == mtime {
+            fs::rename(&tmp, cfg)?;
+            return Ok(());
+        }
+        let _ = fs::remove_file(&tmp); // claude wrote meanwhile: re-read and retry
+    }
+    Err("config kept changing".into())
+}
+
+/// The Claude config file: $CLAUDE_CONFIG_DIR/.claude.json, else ~/.claude.json.
+fn claude_config() -> PathBuf {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(d) => PathBuf::from(d).join(".claude.json"),
+        None => home().join(".claude.json"),
+    }
+}
+
+/// trust_dir on the Claude config; a failure is logged, never fatal.
+fn trust_cwd(thread: &str, cwd: &Path) {
+    // ponytail: trust only holds per git root (parent dirs do not cover a worktree), so trust cwd.
+    if let Err(e) = trust_dir(&claude_config(), cwd) {
+        crate::store::log(thread, &format!("trust {}: skipped ({e})", cwd.display()));
+    }
+}
+
 /// Starts agent `a` with `prompt` in `cwd` and registers it; <dir>/agent records which agent
 /// runs. claude: `claude <flags> --session-id <new> --settings <hooks> "<prompt>"`, the session
 /// id saved to <dir>/session. Others: agents::worker_args, with no session.
@@ -289,6 +341,7 @@ pub fn start_agent(
     let mut cmd = CommandBuilder::new(&a.agent);
     let claude = a.agent == "claude";
     if claude {
+        trust_cwd(thread, cwd);
         cmd.args(crate::flow::claude_flags(thread, a));
         cmd.args(session_args(dir)?);
         cmd.arg(prompt); // last, and flags use --flag=value so variadic options cannot swallow it
@@ -427,6 +480,7 @@ pub fn resume_agent(thread: &str, agent: &str, prompt: Option<&str>) -> Res<Arc<
     let session = fs::read_to_string(dir.join("session"))
         .map_err(|e| format!("{thread}/{agent}: no session: {e}"))?;
     reset_run_files(&dir);
+    trust_cwd(thread, &cwd);
     // ponytail: assumes --resume keeps the session id (subagent scan reads <session>/subagents); re-read it if not.
     cmd.args(["--resume", session.trim(), "--settings", &hooks_json(&dir)]);
     cmd.args(prompt); // last, like start_agent's
@@ -436,6 +490,24 @@ pub fn resume_agent(thread: &str, agent: &str, prompt: Option<&str>) -> Res<Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_dir_merges_and_is_noop_twice() {
+        let cfg = std::env::temp_dir().join(format!("brigd-trust-{}.json", std::process::id()));
+        fs::write(&cfg, r#"{"theme":"dark","projects":{"/w":{"x":1},"/o":{}}}"#).unwrap();
+        trust_dir(&cfg, Path::new("/w")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(&cfg).unwrap()).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["projects"]["/o"], serde_json::json!({}));
+        assert_eq!(v["projects"]["/w"], serde_json::json!({"x":1,"hasTrustDialogAccepted":true}));
+        let m = fs::metadata(&cfg).unwrap().modified().unwrap();
+        trust_dir(&cfg, Path::new("/w")).unwrap();
+        assert_eq!(fs::metadata(&cfg).unwrap().modified().unwrap(), m);
+        fs::write(&cfg, "{broken").unwrap();
+        assert!(trust_dir(&cfg, Path::new("/w")).is_err());
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), "{broken");
+        let _ = fs::remove_file(&cfg);
+    }
 
     #[test]
     fn live_pid_file_blocks_resume() {
