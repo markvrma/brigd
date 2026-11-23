@@ -129,7 +129,7 @@ fn run_stage(thread: &str, flow: &Flow, i: usize, state: &Mutex<State>) -> Res<b
         keep_old_output(thread, &adir);
         log(thread, &format!("start {} in {}", a.name, cwd.display()));
         record_base(&cwd, &adir);
-        // A trust dialog for a new worktree shows in the agent's own terminal; the user answers it there.
+        // runner::start_agent marks cwd trusted for claude; if that fails the trust dialog shows in the agent's terminal.
         let live = runner::start_agent(thread, a, &cwd, &adir, &prompt)?;
         set_agent(state, &a.name, Status::Running)?;
         jobs.push((a, live));
